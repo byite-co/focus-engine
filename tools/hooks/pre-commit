@@ -1,0 +1,15 @@
+#!/bin/sh
+# Blocks media files outside docs/assets/ from being committed.
+# Same rule as .github/workflows/guard-media.yml, applied to the staged files.
+# Enabled with: git config core.hooksPath tools/hooks
+set -eu
+
+offenders="$(git diff --cached --name-only --diff-filter=ACR \
+  | grep -Ei '\.(mp4|mov|avi|mkv|jpg|jpeg|png|heic|webp|bmp)$' \
+  | grep -Ev '^docs/assets/' || true)"
+
+if [ -n "$offenders" ]; then
+  echo "pre-commit: media files are only allowed under docs/assets/. Found:" >&2
+  printf '  %s\n' "$offenders" >&2
+  exit 1
+fi
