@@ -1,0 +1,71 @@
+name: spike-r1
+
+on:
+  push:
+    paths:
+      - 'android/spike-r1/**'
+      - '.github/workflows/spike-r1.yml'
+  pull_request:
+    paths:
+      - 'android/spike-r1/**'
+      - '.github/workflows/spike-r1.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: spike-r1-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: assembleDebug + unit tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android/spike-r1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          validate-wrappers: true
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" --install "platforms;android-37.2" "build-tools;37.0.0" > /dev/null
+
+      - name: Unit tests (spikecore, JVM)
+        run: ./gradlew :spikecore:test
+
+      - name: assembleDebug
+        run: ./gradlew :app:assembleDebug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: spike-r1-debug-apk
+          path: android/spike-r1/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload unit test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spike-r1-test-reports
+          path: |
+            android/spike-r1/spikecore/build/reports/tests/test
+            android/spike-r1/spikecore/build/test-results/test
+          if-no-files-found: warn
+          retention-days: 14
