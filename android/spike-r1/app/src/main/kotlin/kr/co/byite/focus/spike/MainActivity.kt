@@ -10,12 +10,17 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import android.view.View
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import androidx.core.graphics.Insets
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.Lifecycle
 
 class MainActivity : ComponentActivity() {
@@ -43,7 +48,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // targetSdk 35+ 에서는 edge-to-edge 가 강제된다. 그보다 낮은 API 에서도 같은 방식으로 창을 그리게 해
+        // 시스템 바 인셋을 아래 리스너 한 곳에서만 처리한다(API 29~34 에서 DecorView 패딩과 겹치지 않게).
+        enableEdgeToEdge()
         setContentView(R.layout.activity_main)
+        applySystemBarInsets(findViewById(R.id.root))
         prefs = SpikePrefs(this)
         device = DeviceStatusReader(this)
         permissionState = findViewById(R.id.permission_state)
@@ -67,6 +76,27 @@ class MainActivity : ComponentActivity() {
             } catch (e: Exception) {
                 Toast.makeText(this, e.javaClass.simpleName, Toast.LENGTH_SHORT).show()
             }
+        }
+    }
+
+    /**
+     * 상태바·내비게이션 바·디스플레이 컷아웃 인셋을 루트 뷰의 패딩으로 넣어 콘텐츠가 그 아래로
+     * 들어가지 않게 한다. 인셋은 회전·바 표시 상태 변화마다 다시 오므로 원래 패딩에 매번 더해
+     * 절대값으로 설정한다(누적 방지).
+     */
+    private fun applySystemBarInsets(root: View) {
+        val base = Insets.of(root.paddingLeft, root.paddingTop, root.paddingRight, root.paddingBottom)
+        ViewCompat.setOnApplyWindowInsetsListener(root) { v, insets ->
+            val bars = insets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout(),
+            )
+            v.setPadding(
+                base.left + bars.left,
+                base.top + bars.top,
+                base.right + bars.right,
+                base.bottom + bars.bottom,
+            )
+            WindowInsetsCompat.CONSUMED
         }
     }
 

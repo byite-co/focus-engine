@@ -1,4 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.Spike" parent="android:Theme.DeviceDefault.DayNight" />
+    <!--
+      액션바 없는 테마. targetSdk 35+ 에서는 edge-to-edge 가 강제되어 콘텐츠가 시스템 바와
+      프레임워크 액션바 영역까지 올라가므로, 액션바를 없애고 제목은 레이아웃 안 TextView 로 두며
+      시스템 바·컷아웃 인셋은 MainActivity 가 루트 뷰 패딩으로 처리한다.
+    -->
+    <style name="Theme.Spike" parent="android:Theme.DeviceDefault.DayNight">
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowNoTitle">true</item>
+    </style>
 </resources>
