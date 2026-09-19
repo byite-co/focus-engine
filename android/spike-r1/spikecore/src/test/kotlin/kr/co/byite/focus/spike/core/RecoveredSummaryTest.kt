@@ -3,6 +3,7 @@ package kr.co.byite.focus.spike.core
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -94,7 +95,9 @@ class RecoveredSummaryTest {
         val text = frames + "\n8000,1758260006000,24"
         val s = RecoveredSummary.build(SessionCsv.parseFrames(text), emptyList())
         assertEquals(4, s.rows)
-        assertTrue(s.lastRecord.contains("잘린 줄 1"))
-        assertTrue(s.lastRecord.contains("t_utc_ms=1758260005000"))
+        val lastRecord = s.lastRecord
+        assertNotNull(lastRecord)
+        assertTrue(lastRecord.contains("잘린 줄 1"))
+        assertTrue(lastRecord.contains("t_utc_ms=1758260005000"))
     }
 }
