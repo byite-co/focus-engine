@@ -1,0 +1,106 @@
+name: spike-r1
+
+# pull_request: 단위 테스트 + assembleDebug 만 한다. 업로드 없음.
+# main 푸시(android/spike-r1/** 변경)와 수동 실행(workflow_dispatch): 빌드 뒤 prerelease
+# `spike-r1-latest` 를 만들거나 갱신하고 APK 를 올린다. Actions 아티팩트는 쓰지 않는다
+# (조직의 아티팩트 저장 용량 한도).
+on:
+  pull_request:
+    paths:
+      - 'android/spike-r1/**'
+      - '.github/workflows/spike-r1.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'android/spike-r1/**'
+      - '.github/workflows/spike-r1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: spike-r1-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: assembleDebug + unit tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android/spike-r1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          validate-wrappers: true
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" --install "platforms;android-37.2" "build-tools;37.0.0" > /dev/null
+
+      - name: Unit tests (spikecore, JVM)
+        run: ./gradlew :spikecore:test
+
+      - name: assembleDebug
+        run: ./gradlew :app:assembleDebug
+
+      # rolling prerelease. 태그 spike-r1-latest 를 이번 커밋으로 옮기고, 이전 APK 자산을 지운 뒤
+      # 새 APK(파일명에 짧은 커밋 해시)를 올린다. 디버그 서명 키는 러너마다 새로 만들어져 빌드마다 다르다.
+      - name: Publish APK to prerelease spike-r1-latest
+        if: github.event_name != 'pull_request'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: spike-r1-latest
+        run: |
+          set -euo pipefail
+          SHA7="${GITHUB_SHA:0:7}"
+          APK="spike-r1-debug-${SHA7}.apk"
+          cp app/build/outputs/apk/debug/app-debug.apk "$APK"
+
+          git tag -f "$TAG" "$GITHUB_SHA"
+          git push -f origin "refs/tags/$TAG"
+
+          NOTES="$(cat <<NOTES_EOF
+          spike-r1 디버그 APK. 매 빌드마다 이 prerelease 의 태그와 APK 가 갱신된다.
+
+          - commit: ${GITHUB_SHA} (${GITHUB_REF_NAME})
+          - run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          - built: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          설치: 디버그 서명 키가 빌드마다 달라서 재설치 전에 기존 앱을 지운다. 앱을 지우면 세션 로그도 같이
+          지워지므로 먼저 adb pull 한다.
+
+              adb pull /sdcard/Android/data/kr.co.byite.focus.spike/files/spike-r1/ ./spike-r1-logs/
+              adb uninstall kr.co.byite.focus.spike
+              adb install ${APK}
+          NOTES_EOF
+          )"
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --prerelease \
+              --title "spike-r1 latest (${SHA7})" --notes "$NOTES"
+            gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' \
+              | grep -E '^spike-r1-debug-.*\.apk$' | grep -vx "$APK" \
+              | while read -r old; do
+                  gh release delete-asset "$TAG" "$old" --repo "$GITHUB_REPOSITORY" --yes
+                done
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --prerelease \
+              --title "spike-r1 latest (${SHA7})" --notes "$NOTES"
+          fi
+          gh release upload "$TAG" "$APK" --repo "$GITHUB_REPOSITORY" --clobber
+          echo "published $APK to release $TAG"

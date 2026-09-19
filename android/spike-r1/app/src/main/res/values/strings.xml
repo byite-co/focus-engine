@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">focus spike-r1</string>
+    <string name="btn_permissions">권한 요청</string>
+    <string name="btn_start">시작</string>
+    <string name="btn_stop">정지</string>
+    <string name="btn_copy_summary">요약 복사</string>
+    <string name="btn_battery_settings">배터리 최적화 설정 열기</string>
+    <string name="label_status">상태</string>
+    <string name="label_csv_path">CSV 파일</string>
+    <string name="label_summary">마지막 요약</string>
+    <string name="status_idle">대기 중</string>
+    <string name="notif_channel">캡처 세션</string>
+    <string name="notif_title">spike-r1 캡처 중</string>
+    <string name="toast_copied">요약을 클립보드에 복사했다</string>
+    <string name="toast_need_camera">CAMERA 권한이 필요하다</string>
+    <string name="toast_not_visible">Activity 가 보이는 상태에서만 시작한다</string>
+    <string name="toast_no_summary">복사할 요약이 없다</string>
+</resources>
