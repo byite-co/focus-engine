@@ -23,8 +23,8 @@ minSdk 29, compileSdk 37.2, targetSdk 37. 패키지명 `kr.co.byite.focus.spike`
 ## 설치
 
 1. GitHub Actions 의 `spike-r1` 워크플로에서 최신 성공 실행을 열고 `spike-r1-debug-apk`
-   아티팩트를 받는다. `android/spike-r1/**` 가 바뀔 때마다 돌고, 디버그 APK 와 단위
-   테스트 리포트를 올린다.
+   아티팩트를 받는다. `android/spike-r1/**` 를 바꾼 PR 과 main 푸시에서 돌고, 단위 테스트를
+   거쳐 디버그 APK 를 올린다. 테스트 결과는 잡 로그에 테스트별로 찍힌다.
 2. 압축을 풀고 설치한다.
 
    ```sh

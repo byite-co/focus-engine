@@ -1,7 +1,10 @@
 name: spike-r1
 
+# PR 와 main 푸시에서만 돈다. push 와 pull_request 를 둘 다 걸면 커밋마다 APK 아티팩트가
+# 두 번 올라가 Actions 아티팩트 저장 용량을 두 배로 쓴다.
 on:
   push:
+    branches: [main]
     paths:
       - 'android/spike-r1/**'
       - '.github/workflows/spike-r1.yml'
@@ -51,21 +54,11 @@ jobs:
       - name: assembleDebug
         run: ./gradlew :app:assembleDebug
 
+      # 단위 테스트 결과는 잡 로그에 테스트별로 찍힌다(testLogging). 아티팩트는 APK 하나만 올린다.
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
           name: spike-r1-debug-apk
           path: android/spike-r1/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
-          retention-days: 30
-
-      - name: Upload unit test reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: spike-r1-test-reports
-          path: |
-            android/spike-r1/spikecore/build/reports/tests/test
-            android/spike-r1/spikecore/build/test-results/test
-          if-no-files-found: warn
           retention-days: 14
