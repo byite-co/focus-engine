@@ -1,0 +1,47 @@
+# Gradle / Kotlin
+.gradle/
+build/
+.kotlin/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Android
+local.properties
+*.apk
+*.aab
+*.ap_
+*.dex
+*.keystore
+*.jks
+captures/
+.cxx/
+.externalNativeBuild/
+
+# IntelliJ / Android Studio
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# Flutter / Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+**/ios/Flutter/.last_build_id
+**/ios/Pods/
+**/ios/.symlinks/
+
+# Secrets / local config
+.env*
+
+# GT session logs: never committed (.gitkeep only)
+gt/sessions/**
+!gt/sessions/.gitkeep
+*.jsonl.local
+
+# OS
+.DS_Store
+Thumbs.db
