@@ -70,14 +70,18 @@ class GtDiff(
         // ---- confusion and per-state metrics
         val confusion = states.associateWith { e -> states.associateWith { f -> scored.count { it.point.expected == e && it.final == f } } }
         val n = scored.size
+        // v0.2.1 판정 4·9: INVALID and PAUSED leave the ratio denominators; their shares are reported apart.
+        val expectedDen = scored.count { it.point.expected !in State.RATIO_EXCLUDED }
+        val measuredDen = scored.count { it.final !in State.RATIO_EXCLUDED }
         val perState = states.associateWith { s ->
             val tp = confusion.getValue(s).getValue(s)
             val expectedS = confusion.getValue(s).values.sum()
             val measuredS = states.sumOf { e -> confusion.getValue(e).getValue(s) }
             val fp = measuredS - tp
             val fn = expectedS - tp
-            val expectedRatio = Stats.ratio(expectedS, n)
-            val measuredRatio = Stats.ratio(measuredS, n)
+            val excluded = s in State.RATIO_EXCLUDED
+            val expectedRatio = if (excluded) null else Stats.ratio(expectedS, expectedDen)
+            val measuredRatio = if (excluded) null else Stats.ratio(measuredS, measuredDen)
             StateMetrics(
                 expectedS = expectedS,
                 measuredS = measuredS,
@@ -90,6 +94,14 @@ class GtDiff(
                 measuredRatio = measuredRatio,
                 ratioErrorPp = if (expectedRatio == null || measuredRatio == null) null else (measuredRatio - expectedRatio) * 100.0,
             )
+        }
+
+        val excludedShares = State.RATIO_EXCLUDED.associateWith { s ->
+            val e = perState.getValue(s).expectedS
+            val m = perState.getValue(s).measuredS
+            val es = Stats.ratio(e, n)
+            val ms = Stats.ratio(m, n)
+            ShareStat(e, m, es, ms, if (es == null || ms == null) null else (ms - es) * 100.0)
         }
 
         // ---- detection latency (raw_state)
@@ -157,6 +169,7 @@ class GtDiff(
                 falseAway = falseAway,
                 reproducibility = reproducibility,
                 sessionEndRelMs = primary.sessionEnd?.let { it.tMonoMs - gt.startCueTMonoMs },
+                startCueTMonoMs = gt.startCueTMonoMs,
             ),
         )
 
@@ -170,9 +183,12 @@ class GtDiff(
             engineId = primary.engineId,
             parameterSetId = primary.parameterSetId,
             specVersion = primary.header.specVersion,
+            featureSchemaVersion = primary.header.featureSchemaVersion,
+            gtRules = rules,
             seconds = seconds,
             confusion = confusion,
             perState = perState,
+            excludedShares = excludedShares,
             detectionLatency = latency,
             flapping = flapping,
             falseInvalid = falseInvalid,

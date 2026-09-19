@@ -11,7 +11,7 @@ object ConsoleReport {
         appendLine("  scenario    : ${r.scenarioId} (${r.gtType})")
         appendLine("  participant : ${r.participantId}")
         appendLine("  device      : ${r.deviceModel} / ${r.osVersion}")
-        appendLine("  engine      : ${r.engineId}   params: ${r.parameterSetId}   spec: ${r.specVersion}")
+        appendLine("  engine      : ${r.engineId}   params: ${r.parameterSetId}   spec: ${r.specVersion}   schema: ${r.featureSchemaVersion}")
         val s = r.seconds
         appendLine(
             "  seconds     : records=${s.records} scored=${s.scored} reaction=${s.excludedReactionWindow} void=${s.excludedVoid} " +
@@ -28,7 +28,7 @@ object ConsoleReport {
             ),
         )
 
-        appendLine("per state")
+        appendLine("per state (ratios exclude INVALID and PAUSED from the denominator)")
         appendLine(
             table(
                 listOf("state", "exp_s", "meas_s", "precision", "recall", "exp_ratio", "meas_ratio", "err_pp"),
@@ -42,7 +42,11 @@ object ConsoleReport {
             ),
         )
 
-        appendLine("detection latency (cue -> first raw_state, ms)")
+        for ((st, sh) in r.excludedShares) {
+            appendLine("share of ${st.name.padEnd(7)}: expected ${sh.expectedS}s (${Stats.pct(sh.expectedShare)}) measured ${sh.measuredS}s (${Stats.pct(sh.measuredShare)}) diff ${sh.diffPp?.let { Stats.fmt(it, 2) } ?: "-"}pp")
+        }
+        appendLine()
+        appendLine("detection latency (cue -> first raw_state, ms; 1 s quantised)")
         if (r.detectionLatency.isEmpty()) {
             appendLine("  (no transitions)")
         } else {

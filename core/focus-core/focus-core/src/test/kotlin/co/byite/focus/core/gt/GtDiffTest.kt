@@ -52,13 +52,15 @@ class GtDiffTest {
         assertEquals(0.0, absent.ratioErrorPp)
         assertEquals(1.0, report.perState.getValue(State.PRESENT).recall)
         assertEquals(0, report.perState.getValue(State.INVALID).measuredS)
+        assertNull(report.perState.getValue(State.INVALID).expectedRatio)
+        assertEquals(0, report.excludedShares.getValue(State.INVALID).measuredS)
+        assertEquals(0.0, report.excludedShares.getValue(State.PAUSED).diffPp)
 
         val lat = assertNotNull(report.detectionLatency[State.ABSENT])
         assertEquals(2, lat.n)
         assertEquals(0, lat.missed)
         assertEquals(2_000.0, lat.medianMs)
         assertEquals(2_000, lat.p95Ms)
-        // the 2 s stand-up is an INVALID transition; the 4 returns to PRESENT are transitions too
         assertEquals(1, report.detectionLatency.getValue(State.INVALID).n)
         assertEquals(1, report.detectionLatency.getValue(State.INVALID).missed)
         assertEquals(4, report.detectionLatency.getValue(State.PRESENT).n)
@@ -73,6 +75,8 @@ class GtDiffTest {
         assertEquals(0, cmp.primary.falseAbsentS)
         assertEquals(0, cmp.primary.missedAbsentS)
         assertEquals(cmp.primary.copy(engineId = cmp.baseline.engineId), cmp.baseline)
+        assertEquals(GtRules.DEFAULT, report.gtRules)
+        assertEquals("0.2.1", report.featureSchemaVersion)
 
         val items = report.pass.items.associateBy { it.id }
         assertEquals(true, items.getValue("absent_recall").passed)
@@ -87,18 +91,18 @@ class GtDiffTest {
         assertFalse(items.getValue("phone_recall").applicable)
         assertEquals(true, report.pass.overall)
 
-        // the report serialises (enum map keys, nullable doubles) and renders
         val json = FocusJson.pretty.encodeToString(GtReport.serializer(), report)
         assertTrue(json.contains("\"ABSENT\": {"))
+        assertTrue(json.contains("\"gt_rules\": {"))
         assertEquals(report, FocusJson.pretty.decodeFromString(GtReport.serializer(), json))
         val text = ConsoleReport.render(report)
         assertTrue(text.contains("overall: PASS"), text)
         assertTrue(text.contains("confusion matrix"))
+        assertTrue(text.contains("share of INVALID"))
     }
 
     @Test
     fun missedAndFalseStatesAreCountedPerSecond() {
-        // engine that sees ABSENT 5 s late and stays ABSENT 3 s too long, plus a spurious INVALID second
         val records = Synth.stated(0, *Array(60) { State.PRESENT }) +
             Synth.stated(60, State.PRESENT, State.PRESENT, State.PRESENT, State.PRESENT, State.PRESENT, State.ABSENT, State.ABSENT, State.ABSENT, State.ABSENT, State.ABSENT) +
             Synth.stated(70, State.ABSENT, State.ABSENT, State.ABSENT, State.INVALID) + Synth.stated(74, *Array(56) { State.PRESENT })
@@ -106,10 +110,10 @@ class GtDiffTest {
         val report = diff.diff(gt, Synth.replayResult(records))
 
         val absent = report.perState.getValue(State.ABSENT)
-        assertEquals(7, absent.expectedS) // 63..69
-        assertEquals(5, absent.tp) // 65..69
-        assertEquals(2, absent.fn) // 63, 64
-        assertEquals(0, absent.fp) // 70..72 fall in the reaction window of the next cue
+        assertEquals(7, absent.expectedS)
+        assertEquals(5, absent.tp)
+        assertEquals(2, absent.fn)
+        assertEquals(0, absent.fp)
         assertEquals(5.0 / 7, absent.recall!!, 1e-9)
         assertEquals(1.0, absent.precision)
         assertEquals(2, report.confusion.getValue(State.ABSENT).getValue(State.PRESENT))
@@ -122,9 +126,36 @@ class GtDiffTest {
         assertEquals(false, report.pass.items.first { it.id == "absent_recall" }.passed)
         assertEquals(true, report.pass.items.first { it.id == "latency_absent_p95" }.passed)
         assertEquals(false, report.pass.overall)
-
-        assertEquals(2, report.baselineComparison?.let { 0 } ?: 2) // no baseline supplied
         assertNull(report.baselineComparison)
+    }
+
+    @Test
+    fun ratiosExcludeInvalidAndPausedFromTheDenominator() {
+        // 130 s: 60 s PRESENT expected, 10 s INVALID expected (short leave has 2 s, deep bow 8 s), 60 s PRESENT; measured has 4 s PAUSED and 2 s INVALID inside PRESENT runs
+        val gt = GtFile("S-synth", "T3", "scripted", Synth.T0, listOf(iv(0, 60, BehaviorCatalog.STUDY_IN_ZONE), iv(60, 70, BehaviorCatalog.DEEP_BOW_WRITING), iv(70, 130, BehaviorCatalog.STUDY_IN_ZONE)))
+        val states = Array(130) { State.PRESENT }
+        for (s in 60 until 70) states[s] = State.INVALID
+        for (s in 20 until 24) states[s] = State.PAUSED
+        states[30] = State.INVALID
+        states[31] = State.INVALID
+        val report = diff.diff(gt, Synth.replayResult(Synth.stated(0, *states)))
+        val n = report.seconds.scored
+        assertEquals(130 - 9, n)
+        val present = report.perState.getValue(State.PRESENT)
+        assertEquals(114, present.expectedS) // 57 + 57
+        assertEquals(1.0, present.expectedRatio) // 114 / (121 − 7 INVALID expected)
+        assertEquals(1.0, present.measuredRatio) // 108 / (121 − 9 INVALID − 4 PAUSED)
+        assertEquals(0.0, present.ratioErrorPp)
+        assertNull(report.perState.getValue(State.INVALID).expectedRatio)
+        assertNull(report.perState.getValue(State.PAUSED).measuredRatio)
+        val inv = report.excludedShares.getValue(State.INVALID)
+        assertEquals(7, inv.expectedS)
+        assertEquals(9, inv.measuredS)
+        assertEquals((9.0 - 7.0) / n * 100, inv.diffPp!!, 1e-9)
+        val paused = report.excludedShares.getValue(State.PAUSED)
+        assertEquals(0, paused.expectedS)
+        assertEquals(4, paused.measuredS)
+        assertEquals(true, report.pass.items.first { it.id == "ratio_error_3pp" }.passed)
     }
 
     @Test
@@ -135,7 +166,6 @@ class GtDiffTest {
         states[80] = State.INVALID
         val gt = GtFile("S-synth", "T1", "scripted", Synth.T0, listOf(iv(0, 60, BehaviorCatalog.STUDY_IN_ZONE), iv(60, 120, BehaviorCatalog.STUDY_IN_ZONE)))
         val report = diff.diff(gt, Synth.replayResult(Synth.stated(0, *states)))
-        // PRESENT→AWAY, AWAY→PRESENT, PRESENT→INVALID, INVALID→PRESENT = 4 changes in one 114 s PRESENT run
         assertEquals(4, report.flapping.changes)
         assertEquals(1, report.flapping.runs.size)
         assertEquals(114, report.flapping.scoredS)
@@ -166,7 +196,7 @@ class GtDiffTest {
         val records = Synth.stated(-2, State.PRESENT, State.PRESENT) + Synth.stated(0, *Array(20) { State.PRESENT }) + Synth.stated(30, State.PRESENT)
         val report = diff.diff(gt, Synth.replayResult(records))
         assertEquals(3, report.seconds.outsideGt)
-        assertEquals(10, report.seconds.missingRecords) // 20..29 scored, absent
+        assertEquals(10, report.seconds.missingRecords)
         assertEquals(17, report.seconds.scored)
     }
 

@@ -17,13 +17,18 @@ class ExpectedStateGeneratorTest {
 
     private fun iv(start: Long, end: Long, behavior: String, expected: State? = null) = GtInterval(start * 1000, end * 1000, behavior, expected)
 
+    /** Expected state of bucket number [bucket] (1-based) inside the interval starting at [startSec]. */
+    private fun bucket(r: ResolvedGt, startSec: Long, bucket: Int): State? = gen.expectedAt(r, startSec * 1000 + (bucket - 1) * 1000L).expected
+
     @Test
-    fun awayGraceIsPresentForFourSeconds() {
+    fun awayGraceIsPresentForFourBucketsAndAwayFromTheFifth() {
         val r = gen.resolve(gt(iv(0, 60, BehaviorCatalog.STUDY_IN_ZONE), iv(60, 70, BehaviorCatalog.LOOK_AWAY_UNREGISTERED), iv(70, 130, BehaviorCatalog.STUDY_IN_ZONE)))
-        assertEquals(State.PRESENT, gen.expectedAt(r, 60_000).expected)
+        assertEquals(State.PRESENT, bucket(r, 60, 1))
+        assertEquals(State.PRESENT, bucket(r, 60, 4))
+        assertEquals(State.AWAY, bucket(r, 60, 5))
+        assertEquals(State.AWAY, bucket(r, 60, 10))
         assertEquals(State.PRESENT, gen.expectedAt(r, 63_999).expected)
         assertEquals(State.AWAY, gen.expectedAt(r, 64_000).expected)
-        assertEquals(State.AWAY, gen.expectedAt(r, 69_999).expected)
         assertEquals(State.PRESENT, gen.expectedAt(r, 70_000).expected)
         assertEquals(State.AWAY, r.intervals[1].terminalState)
     }
@@ -45,16 +50,33 @@ class ExpectedStateGeneratorTest {
         assertEquals(State.ABSENT, gen.expectedAt(r, 60_000).expected)
         assertFalse(gen.expectedAt(r, 62_999).scored)
         assertTrue(gen.expectedAt(r, 63_000).scored)
+        assertEquals(3_000, r.intervals[1].leadExclusionMs)
     }
 
     @Test
-    fun headHiddenLowMotionPausesAt120Seconds() {
+    fun headHiddenLowMotionIsInvalidFor120BucketsAndPausedFromThe121st() {
         val r = gen.resolve(gt(iv(0, 150, BehaviorCatalog.PRONE_HEAD_OUT_OF_FRAME), iv(150, 200, BehaviorCatalog.STUDY_IN_ZONE)))
-        assertEquals(State.INVALID, gen.expectedAt(r, 119_999).expected)
-        assertEquals(State.PAUSED, gen.expectedAt(r, 120_000).expected)
-        assertEquals(State.PAUSED, gen.expectedAt(r, 149_999).expected)
-        assertEquals(State.PRESENT, gen.expectedAt(r, 150_000).expected)
+        assertEquals(State.INVALID, bucket(r, 0, 1))
+        assertEquals(State.INVALID, bucket(r, 0, 120))
+        assertEquals(State.PAUSED, bucket(r, 0, 121))
+        assertEquals(State.PAUSED, bucket(r, 0, 150))
+        assertEquals(State.PRESENT, bucket(r, 150, 1))
         assertEquals(State.PAUSED, r.intervals[0].terminalState)
+    }
+
+    @Test
+    fun cueEndingAPausedIntervalExcludesSixSeconds() {
+        val r = gen.resolve(gt(iv(0, 150, BehaviorCatalog.PRONE_HEAD_OUT_OF_FRAME), iv(150, 200, BehaviorCatalog.STUDY_IN_ZONE), iv(200, 210, BehaviorCatalog.LEAVE_SEAT)))
+        assertEquals(6_000, r.intervals[1].leadExclusionMs)
+        for (s in 150L..155L) assertEquals(Exclusion.REACTION_WINDOW, gen.expectedAt(r, s * 1000).exclusion, "t=$s")
+        assertTrue(gen.expectedAt(r, 156_000).scored)
+        assertEquals(State.PRESENT, gen.expectedAt(r, 156_000).expected)
+        // the next cue is back to the plain 3 s
+        assertEquals(3_000, r.intervals[2].leadExclusionMs)
+        assertTrue(gen.expectedAt(r, 203_000).scored)
+        // a PAUSED-terminal interval that is too short to reach PAUSED does not extend the window
+        val short = gen.resolve(gt(iv(0, 30, BehaviorCatalog.PRONE_HEAD_OUT_OF_FRAME), iv(30, 60, BehaviorCatalog.STUDY_IN_ZONE)))
+        assertEquals(3_000, short.intervals[1].leadExclusionMs)
     }
 
     @Test
@@ -62,13 +84,26 @@ class ExpectedStateGeneratorTest {
         val r = gen.resolve(gt(iv(0, 10, BehaviorCatalog.STUDY_IN_ZONE), iv(10, 12, BehaviorCatalog.LEAVE_SEAT), iv(12, 30, BehaviorCatalog.STUDY_IN_ZONE), iv(30, 40, BehaviorCatalog.LEAVE_SEAT)))
         assertEquals(State.INVALID, gen.expectedAt(r, 11_000).expected)
         assertEquals(State.ABSENT, gen.expectedAt(r, 35_000).expected)
+        // exactly three buckets confirm
+        val three = gen.resolve(gt(iv(0, 10, BehaviorCatalog.STUDY_IN_ZONE), iv(10, 13, BehaviorCatalog.LEAVE_SEAT)))
+        assertEquals(State.ABSENT, gen.expectedAt(three, 10_000).expected)
     }
 
     @Test
-    fun phoneOnFlatSurfaceIsInvalidForSixtySecondsThenPhone() {
+    fun phoneOnFlatSurfaceIsInvalidForSixtyBucketsThenPhone() {
         val r = gen.resolve(gt(iv(0, 90, BehaviorCatalog.PHONE_USE_ON_FLAT_SURFACE)))
-        assertEquals(State.INVALID, gen.expectedAt(r, 59_999).expected)
-        assertEquals(State.PHONE, gen.expectedAt(r, 60_000).expected)
+        assertEquals(State.INVALID, bucket(r, 0, 60))
+        assertEquals(State.PHONE, bucket(r, 0, 61))
+    }
+
+    @Test
+    fun shortRecalibratingIntervalIsAWarning() {
+        val short = gen.resolve(gt(iv(0, 30, BehaviorCatalog.PHONE_PICKUP_USE), iv(30, 50, BehaviorCatalog.PHONE_REDOCK_RECALIBRATING), iv(50, 80, BehaviorCatalog.STUDY_IN_ZONE)))
+        assertEquals(1, short.warnings.size)
+        assertTrue(short.warnings[0].contains("22000 ms"), short.warnings[0])
+        val ok = gen.resolve(gt(iv(0, 30, BehaviorCatalog.PHONE_PICKUP_USE), iv(30, 52, BehaviorCatalog.PHONE_REDOCK_RECALIBRATING), iv(52, 80, BehaviorCatalog.STUDY_IN_ZONE)))
+        assertTrue(ok.warnings.isEmpty())
+        assertEquals(State.INVALID, gen.expectedAt(ok, 40_000).expected)
     }
 
     @Test

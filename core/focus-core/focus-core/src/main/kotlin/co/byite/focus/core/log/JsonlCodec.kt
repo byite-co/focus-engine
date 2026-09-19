@@ -1,10 +1,14 @@
 package co.byite.focus.core.log
 
+import co.byite.focus.core.model.CalibrationSnapshot
 import co.byite.focus.core.model.IntervalRecord
 import co.byite.focus.core.model.SecondRecord
 import co.byite.focus.core.model.SessionEnd
 import co.byite.focus.core.model.SessionHeader
+import co.byite.focus.core.model.TimebaseRecord
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerializationException
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonObject
@@ -14,16 +18,18 @@ import kotlinx.serialization.json.jsonPrimitive
 class LogFormatException(message: String, cause: Throwable? = null) : RuntimeException(message, cause)
 
 /**
- * Session JSONL codec.
+ * Session JSONL codec (schema 0.2.1).
  *
- * Line 1 is the [SessionHeader]. Every later line is one object with a `type` key:
- * `second` ([SecondRecord]), `interval` ([IntervalRecord]) or `session_end` ([SessionEnd]).
- * When `type` is missing it is inferred from the keys (`t_mono_ms` → second,
- * `t_start_mono_ms` → interval). Blank lines are skipped.
+ * Line 1 is the [SessionHeader]. Every later line is one object with a `type` key: `calibration`
+ * ([CalibrationSnapshot]), `timebase` ([TimebaseRecord]), `second` ([SecondRecord]), `interval`
+ * ([IntervalRecord]) or `session_end` ([SessionEnd]). When `type` is missing it is inferred from
+ * the keys. Blank lines and unknown keys are ignored.
  */
 object JsonlCodec {
     const val TYPE_KEY: String = "type"
     const val TYPE_HEADER: String = "header"
+    const val TYPE_CALIBRATION: String = "calibration"
+    const val TYPE_TIMEBASE: String = "timebase"
     const val TYPE_SECOND: String = "second"
     const val TYPE_INTERVAL: String = "interval"
     const val TYPE_SESSION_END: String = "session_end"
@@ -38,10 +44,14 @@ object JsonlCodec {
             json.decodeFromJsonElement(SessionHeader.serializer(), parseObject(lines[0], 1))
         } catch (e: SerializationException) {
             throw LogFormatException("line 1: invalid session header: ${e.message}", e)
+        } catch (e: IllegalArgumentException) {
+            throw LogFormatException("line 1: invalid session header: ${e.message}", e)
         }
 
         val records = ArrayList<SecondRecord>()
         val intervals = ArrayList<IntervalRecord>()
+        val calibrations = ArrayList<CalibrationSnapshot>()
+        val timebase = ArrayList<TimebaseRecord>()
         var sessionEnd: SessionEnd? = null
         for (i in 1 until lines.size) {
             val lineNo = i + 1
@@ -51,6 +61,8 @@ object JsonlCodec {
                 when (type) {
                     TYPE_SECOND -> records.add(json.decodeFromJsonElement(SecondRecord.serializer(), obj))
                     TYPE_INTERVAL -> intervals.add(json.decodeFromJsonElement(IntervalRecord.serializer(), obj))
+                    TYPE_CALIBRATION -> calibrations.add(json.decodeFromJsonElement(CalibrationSnapshot.serializer(), obj))
+                    TYPE_TIMEBASE -> timebase.add(json.decodeFromJsonElement(TimebaseRecord.serializer(), obj))
                     TYPE_SESSION_END -> {
                         if (sessionEnd != null) throw LogFormatException("line $lineNo: second session_end line")
                         sessionEnd = json.decodeFromJsonElement(SessionEnd.serializer(), obj)
@@ -64,10 +76,10 @@ object JsonlCodec {
                 throw LogFormatException("line $lineNo: invalid $type record: ${e.message}", e)
             }
         }
-        return SessionLog(header, records, intervals, sessionEnd)
+        return SessionLog(header, records, intervals, sessionEnd, calibrations, timebase)
     }
 
-    /** Encode as JSONL text (each line terminated by `\n`). Records and intervals are written in time order. */
+    /** Encode as JSONL text (each line terminated by `\n`). Timed lines are written in time order. */
     fun encode(log: SessionLog): String = buildString {
         for (line in encodeLines(log)) {
             append(line)
@@ -75,27 +87,22 @@ object JsonlCodec {
         }
     }
 
+    /** One JSON line per element: header first, then calibration/timebase/interval/second lines merged by time, then session_end. */
     fun encodeLines(log: SessionLog): Sequence<String> = sequence {
-        yield(typed(TYPE_HEADER, json.encodeToJsonElement(SessionHeader.serializer(), log.header).jsonObject))
-        val records = log.records.sortedBy { it.tMonoMs }
-        val intervals = log.intervals.sortedBy { it.tStartMonoMs }
-        var ii = 0
-        for (r in records) {
-            while (ii < intervals.size && intervals[ii].tStartMonoMs < r.tMonoMs) {
-                yield(typed(TYPE_INTERVAL, json.encodeToJsonElement(IntervalRecord.serializer(), intervals[ii++]).jsonObject))
-            }
-            yield(typed(TYPE_SECOND, json.encodeToJsonElement(SecondRecord.serializer(), r).jsonObject))
-        }
-        while (ii < intervals.size) {
-            yield(typed(TYPE_INTERVAL, json.encodeToJsonElement(IntervalRecord.serializer(), intervals[ii++]).jsonObject))
-        }
-        log.sessionEnd?.let {
-            yield(typed(TYPE_SESSION_END, json.encodeToJsonElement(SessionEnd.serializer(), it).jsonObject))
-        }
+        yield(typed(TYPE_HEADER, SessionHeader.serializer(), log.header))
+        val timed = ArrayList<Triple<Long, Int, String>>()
+        log.calibrations.forEach { timed.add(Triple(it.tMonoMs, 0, typed(TYPE_CALIBRATION, CalibrationSnapshot.serializer(), it))) }
+        log.timebase.forEach { timed.add(Triple(it.tMonoMs, 1, typed(TYPE_TIMEBASE, TimebaseRecord.serializer(), it))) }
+        log.intervals.forEach { timed.add(Triple(it.tStartMonoMs, 2, typed(TYPE_INTERVAL, IntervalRecord.serializer(), it))) }
+        log.records.forEach { timed.add(Triple(it.tMonoMs, 3, typed(TYPE_SECOND, SecondRecord.serializer(), it))) }
+        timed.sortWith(compareBy({ it.first }, { it.second }))
+        for (t in timed) yield(t.third)
+        log.sessionEnd?.let { yield(typed(TYPE_SESSION_END, SessionEnd.serializer(), it)) }
     }
 
-    private fun typed(type: String, obj: JsonObject): String {
-        val withType = LinkedHashMap<String, kotlinx.serialization.json.JsonElement>(obj.size + 1)
+    private fun <T> typed(type: String, serializer: KSerializer<T>, value: T): String {
+        val obj = json.encodeToJsonElement(serializer, value).jsonObject
+        val withType = LinkedHashMap<String, JsonElement>(obj.size + 1)
         withType[TYPE_KEY] = JsonPrimitive(type)
         withType.putAll(obj)
         return json.encodeToString(JsonObject.serializer(), JsonObject(withType))
@@ -111,6 +118,8 @@ object JsonlCodec {
 
     private fun inferType(obj: JsonObject, lineNo: Int): String = when {
         "t_start_mono_ms" in obj -> TYPE_INTERVAL
+        "camera_ts_source" in obj -> TYPE_TIMEBASE
+        "calibration_id" in obj && "zones" in obj -> TYPE_CALIBRATION
         "t_mono_ms" in obj && "face_detect_ratio" in obj -> TYPE_SECOND
         "t_mono_ms" in obj && "reason" in obj -> TYPE_SESSION_END
         else -> throw LogFormatException("line $lineNo: missing 'type' and cannot infer record type")

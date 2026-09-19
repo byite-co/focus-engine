@@ -6,6 +6,7 @@ import kotlinx.serialization.Serializable
 /**
  * Lifecycle-gap interval (spec 9장 앱 lifecycle gap). Materialised on return to the foreground for
  * the span in which no per-second record was produced. Not subject to the 30 s backdate limit.
+ * Only APP_SWITCH (PHONE) and SCREEN_LOCK (PAUSED) gaps become intervals; PROCESS_DEATH closes the session instead.
  */
 @Serializable
 data class IntervalRecord(
@@ -21,6 +22,7 @@ data class IntervalRecord(
     init {
         require(tEndMonoMs >= tStartMonoMs) { "interval end $tEndMonoMs before start $tStartMonoMs" }
         require(state in State.INTERVAL_STATES) { "interval state must be PHONE or PAUSED, got $state" }
+        require(reason.state == state) { "interval state $state does not match reason $reason (${reason.state})" }
     }
 
     val durationMs: Long get() = tEndMonoMs - tStartMonoMs

@@ -60,7 +60,7 @@ class GtDiffMainTest {
         assertEquals(GtDiffMain.EXIT_OK, run("--help").first)
         val (code, out, _) = run("--print-default-params")
         assertEquals(GtDiffMain.EXIT_OK, code)
-        assertTrue(out.contains("\"parameter_set_id\": \"ps-v0.2.0-default\""))
+        assertTrue(out.contains("\"parameter_set_id\": \"ps-v0.2.1-default\""))
     }
 
     @Test

@@ -5,7 +5,8 @@ import kotlinx.serialization.Serializable
 
 /**
  * Every threshold the v0 logic layer reads, bundled under one immutable [parameterSetId]
- * (spec 9장 header `parameter_set_id`). Defaults are the spec v0.2.0 initial values.
+ * (spec 9장 header `parameter_set_id`). Defaults are the spec v0.2.0 initial values; fields marked
+ * 초기값 were introduced by CHANGELOG v0.2.1 and are provisional until the first measurements.
  * Weights for W1–W5 are out of v0 scope and intentionally absent.
  */
 @Serializable
@@ -20,9 +21,13 @@ data class ParameterSet(
     /** A lifecycle gap longer than this ends the session at the background-entry time. */
     @SerialName("lifecycle_gap_session_end_ms") val lifecycleGapSessionEndMs: Long = 600_000,
 
-    // ---- G1 (spec 3장)
-    /** A second counts as "face detected" when `face_detect_ratio` reaches this. Not in the spec; see README. */
+    // ---- Face bands (v0.2.1 판정 12, 초기값)
+    /** `face_detect_ratio` below this = G1 "얼굴 미검출" bucket. 초기값 0.2 (CHANGELOG v0.2.1). */
+    @SerialName("face_missing_max_ratio") val faceMissingMaxRatio: Double = 0.2,
+    /** `face_detect_ratio` at or above this = head pose usable for G2. Between the two bands = INVALID(face_unstable). 초기값 0.5. */
     @SerialName("face_present_min_ratio") val facePresentMinRatio: Double = 0.5,
+
+    // ---- G1 (spec 3장)
     @SerialName("absent_confirm_ms") val absentConfirmMs: Long = 3_000,
     @SerialName("absent_release_ms") val absentReleaseMs: Long = 1_000,
     @SerialName("prone_confirm_ms") val proneConfirmMs: Long = 30_000,
@@ -52,10 +57,15 @@ data class ParameterSet(
     // ---- Phone gate (spec 3장)
     @SerialName("pickup_tilt_deg") val pickupTiltDeg: Double = 15.0,
     @SerialName("pickup_accel_var_ratio") val pickupAccelVarRatio: Double = 3.0,
+    /** LIFTED or MOVING buckets needed to confirm a pickup; applies to the tilt and the variance branch alike (v0.2.1 판정 7). */
     @SerialName("pickup_confirm_ms") val pickupConfirmMs: Long = 3_000,
     @SerialName("redock_tilt_tolerance_deg") val redockTiltToleranceDeg: Double = 10.0,
-    /** INVALID for this long after pickup until re-dock is confirmed; PHONE afterwards. */
+    /** INVALID(redock_pending) from the first RESTING_OFF_DOCK bucket for this long; PHONE afterwards (v0.2.1 판정 6). */
     @SerialName("redock_pending_invalid_ms") val redockPendingInvalidMs: Long = 60_000,
+    /** Consecutive stationary time within the mount posture that confirms a re-dock. 초기값 2000 (v0.2.1 판정 6). */
+    @SerialName("redock_stationary_confirm_ms") val redockStationaryConfirmMs: Long = 2_000,
+    /** INVALID(recalibration) after a confirmed re-dock. 초기값 20000 (v0.2.1 판정 6). */
+    @SerialName("recalibration_ms") val recalibrationMs: Long = 20_000,
 
     // ---- Scene / quality proxies (spec 6장)
     @SerialName("fps_min") val fpsMin: Double = 10.0,
@@ -71,10 +81,22 @@ data class ParameterSet(
         require(maxBackdateMs >= 0) { "max_backdate_ms must not be negative" }
         require(lifecycleGapSessionEndMs > 0) { "lifecycle_gap_session_end_ms must be positive" }
         require(facePresentMinRatio in 0.0..1.0) { "face_present_min_ratio must be within 0..1" }
+        require(faceMissingMaxRatio in 0.0..facePresentMinRatio) { "face_missing_max_ratio must be within 0..face_present_min_ratio" }
+        require(pickupConfirmMs > 0 && redockStationaryConfirmMs > 0 && recalibrationMs >= 0 && redockPendingInvalidMs >= 0) { "phone gate durations must be positive" }
     }
 
+    /** Duration to bucket count helpers (v0.2.1 판정 2: "N초 연속" = N buckets). */
+    val absentConfirmBuckets: Int get() = FocusSchema.buckets(absentConfirmMs)
+    val proneConfirmBuckets: Int get() = FocusSchema.buckets(proneConfirmMs)
+    val pickupConfirmBuckets: Int get() = FocusSchema.buckets(pickupConfirmMs)
+    val awayGraceBuckets: Int get() = FocusSchema.buckets(awayGraceMs)
+    val autoPauseBuckets: Int get() = FocusSchema.buckets(autoPauseMs)
+    val redockPendingBuckets: Int get() = FocusSchema.buckets(redockPendingInvalidMs)
+    val redockStationaryConfirmBuckets: Int get() = FocusSchema.buckets(redockStationaryConfirmMs)
+    val recalibrationBuckets: Int get() = FocusSchema.buckets(recalibrationMs)
+
     companion object {
-        /** Spec v0.2.0 initial values. */
-        val DEFAULT: ParameterSet = ParameterSet(parameterSetId = "ps-v0.2.0-default")
+        /** Spec v0.2.0 initial values plus the v0.2.1 초기값 (CHANGELOG v0.2.1). */
+        val DEFAULT: ParameterSet = ParameterSet(parameterSetId = "ps-v0.2.1-default")
     }
 }

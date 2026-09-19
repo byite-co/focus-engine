@@ -1,8 +1,8 @@
 # core/focus-core
 
-순수 로직 코어(Kotlin JVM). 스펙 v0.2.0 의 기록 스키마, StateFinalizer, 로그 재생, GT 대조 도구를 담는다.
-게이트 규칙(G1·G2·폰 사용)은 아직 없고 `GateEngine` 인터페이스와 비교용 `NaiveBaselineEngine` 만 있다.
-지시문은 `directives/B-focus-core.md`, 정본은 `docs/focus/` 이다.
+순수 로직 코어(Kotlin JVM). 스펙 v0.2.0 + CHANGELOG v0.2.1 의 기록 스키마(0.2.1), StateFinalizer, 로그 재생, GT 대조 도구를 담는다.
+게이트 규칙 전체는 아직 없고 `GateEngine` 인터페이스, 비교용 `NaiveBaselineEngine`, 폰 게이트의 IMU 부분(`PhoneGateTracker`)만 있다.
+지시문은 `directives/B-focus-core.md`, 정본은 `docs/focus/`(동결), 설계 변경은 `CHANGELOG.md` v0.2.1 과 `docs/research-notes/RN-001-v0.2.1-spec-clarifications.md`.
 
 ## 구성
 
@@ -10,18 +10,18 @@
 |---|---|
 | `focus-core/` | `:focus-core` 라이브러리. Android API·`java.*` 의존 없음(`NoJavaImportTest` 가 검사). KMP 이전 대비 |
 | `gt-diff/` | `:gt-diff` JVM 전용 CLI. 파일 IO 는 여기에만 둔다 |
-| `samples/` | 합성 T2 세션 로그, GT, 기본 ParameterSet. 실측 로그가 아니다 |
+| `samples/` | 합성 T2 세션 로그(스키마 0.2.1), GT, 기본 ParameterSet. 실측 로그가 아니다 |
 
 패키지(`co.byite.focus.core`):
 
 | 패키지 | 내용 |
 |---|---|
-| `model` | `State`, `SessionHeader`, `SecondRecord`(v0 부분집합), `IntervalRecord`, `SessionEnd`, `ParameterSet`, `FocusSchema` |
-| `engine` | `GateEngine`, `GateDecision`, `NaiveBaselineEngine` |
-| `finalizer` | `StateFinalizer`: raw/final 분리, 30초 확정 버퍼, 소급, flushNow, lifecycle gap |
+| `model` | `State`(우선순위 포함), `InvalidReason`, `Event`, `SessionHeader`, `SecondRecord`(스키마 0.2.1), `IntervalRecord`, `SessionEnd`, `CalibrationSnapshot`, `TimebaseRecord`, `ParameterSet`, `BackdateRules`, `FocusSchema` |
+| `engine` | `GateEngine`·`GateDecision`, `FaceBand`(얼굴 검출 2단 임계값), `NaiveBaselineEngine`, `PhoneGateTracker`(집어 듦·재거치·재캘리브레이션 상태 기계) |
+| `finalizer` | `StateFinalizer`: raw/final 분리, 30초 확정 버퍼, 소급 덮어쓰기 표, flushNow, lifecycle gap, 프로세스 종료 복구 |
 | `log` | `JsonlCodec`, `SessionLog`, `FocusJson` |
 | `replay` | `ReplayRunner`: 로그 → 엔진 → finalizer 재실행 |
-| `gt` | GT 파서, behavior 카탈로그, expected_state 생성기, 초 단위 diff, 합격선, 콘솔 표 |
+| `gt` | GT 파서·lint, behavior 카탈로그, expected_state 생성기, 초 단위 diff, 합격선, 콘솔 표 |
 
 ## 빌드·테스트
 
@@ -34,66 +34,86 @@ cd core/focus-core
 
 JDK 17 이상. Kotlin 2.2, kotlinx-serialization 1.9, kotlin.test.
 
-## 시간·상태 규약
+## 시간·상태 규약 (v0.2.1 판정)
 
-- 모든 지속시간·윈도우·전이는 `t_mono_ms` 로 계산한다. `t_utc_ms` 는 표시용이다.
-- `t_mono_ms = t` 인 초당 레코드는 `[t, t + 1000)` 구간을 요약한다(`FocusSchema.RECORD_PERIOD_MS`).
-  스펙은 시작·끝 중 어느 쪽 시각인지 정하지 않아서 이 코드가 정한 가정이다.
-- "N초 이상 연속" 은 `(t_now − 후보 시작) + 1000 ≥ N·1000` 으로 센다. 1Hz 에서 얼굴 미검출 레코드 3개면 ABSENT 확정.
-- `raw_state` 는 그 초에 앱이 알던 상태, `final_state` 는 소급을 반영한 상태다.
-- `StateFinalizer`
-  - 레코드는 30초(`finalize_delay_ms`) 더 새로운 레코드가 오면 확정된다. 확정된 레코드는 다시 바뀌지 않는다.
-  - 엔진이 ABSENT·PRONE·PHONE 을 확정하며 `candidateStartMonoMs` 를 넘기면 `[max(후보 시작, now − max_backdate_ms), now)` 의
-    미확정 레코드가 그 상태로 바뀐다. AWAY·PAUSED 는 후보 시작 시각이 있어도 소급하지 않는다.
-  - `flushNow()` / `onBackground()` 는 미확정 레코드를 그 시점 정보로 즉시 확정한다.
-  - `onForeground(t, utc, reason)` 은 진입·복귀 시각으로 `IntervalRecord` 를 만든다(30초 제한 없음).
-    `APP_SWITCH → PHONE`, `SCREEN_LOCK → PAUSED`. 갭이 `lifecycle_gap_session_end_ms`(10분)를 넘으면 진입 시각에 세션을 종료한다.
-  - `endSession(t, utc, reason)` 은 미확정 레코드를 비우고 `SessionEnd` 를 남긴다. 프로세스 종료 복구는 마지막 기록 시각으로 이 함수를 부른다.
+번호는 CHANGELOG v0.2.1 · RN-001 의 판정 번호다.
+
+- **버킷(1)**: `t_mono_ms = t` 인 초당 레코드는 1초 버킷 `[t, t+1000)` 을 요약한다. 버킷은 세션 시작 시각(`header.t_start_mono_ms`)에 정렬하고 버킷이 끝날 때 기록한다. `t_utc_ms` 는 표시용이다.
+- **N초 연속(2)**: 조건을 만족한 버킷 N개 연속. 소급이 있는 상태(ABSENT 3, PRONE 30, PHONE 집어 듦 3)는 N번째 레코드에서 확정하고 후보 시작 = 첫 버킷 시작. 소급이 없는 상태(AWAY, PAUSED)는 처음 N개 버킷 동안 기존 분류를 유지하고 N+1번째부터 그 상태다: AWAY 는 밖 4버킷 뒤 5번째부터, 장기 이탈은 16번째부터, PAUSED 는 120버킷 뒤 121번째부터. `ParameterSet.*Buckets` 가 ms 를 버킷 수로 바꾼다.
+- **소급 덮어쓰기(3)** (`BackdateRules`):
+
+  | 소급 상태 | 덮어쓰는 raw_state |
+  |---|---|
+  | ABSENT, PRONE | PRESENT, AWAY, INVALID(face_missing_unconfirmed, head_missing, face_unstable) |
+  | PHONE | 위에 더해 INVALID(phone_shake) |
+
+  어떤 소급도 PHONE, PAUSED, 환경 INVALID(low_light, camera_occluded, fps_low, quality_proxy, redock_pending, recalibration)는 덮지 않는다. 이미 PHONE·PAUSED 로 확정된 final_state 도 덮지 않는다. 환경 INVALID 버킷은 카메라 기반 후보(ABSENT, PRONE, AWAY 유예, 머리 미검출 저움직임 카운터)를 리셋하고 IMU 집어 듦 후보는 리셋하지 않는다(`BackdateRules.resetsCameraCandidates`). 소급 범위는 최대 30초.
+- **상태와 우선순위(4)**: 상태는 7개다. `PHONE > PAUSED > INVALID(환경) > ABSENT > PRONE > AWAY > PRESENT` (`State.PRIORITY`). 자동 일시정지 중에도 초당 레코드는 계속 남기고 상태는 PAUSED(소급 없음)다. 레코드를 남길 수 없는 lifecycle gap 만 interval 로 남긴다. "세션 시간에서 뺀다"는 집계 규칙이다: PAUSED 와 INVALID 는 비율의 분모에서 빼고 초 수를 따로 보고한다.
+- **T2 2초 자리 비움(5)**: 기대 상태는 INVALID. "ABSENT 0초" 같은 금지 조건은 반응 3초를 포함한 행동 구간 전체(void 만 제외)에서 센다.
+- **폰 재거치(6)** (`PhoneGateTracker`): 거치 자세에서 벗어난 채 정지(`RESTING_OFF_DOCK`)하면 집어 듦 확정 여부와 무관하게 재거치 대기다. 그 첫 버킷부터 `redock_pending_invalid_ms`(60초)까지 INVALID(redock_pending), 이후 PHONE(소급 없음, `redock_pending_timeout` 사건). 다시 움직이면 7번 규칙으로 돌아가고 타이머는 다음 정지에서 새로 센다. 재거치 확정은 거치 자세 ±10° 안(`DOCKED`)에서 `redock_stationary_confirm_ms`(2000, 초기값) 연속 정지 또는 탭이고, 확정 뒤 `recalibration_ms`(20000, 초기값) 동안 INVALID(recalibration)다. 확정을 기다리는 정지 버킷은 INVALID(redock_pending)로 둔다(스펙에 없는 구현 가정).
+- **집어 듦(7)**: `imu_state` 가 LIFTED 또는 MOVING 인 버킷이 `pickup_confirm_ms`(3초) 만큼 연속이면 확정(기울기 분기와 분산 분기 모두 3초). 3개 미만이면 그 버킷들은 INVALID(phone_shake)이고 끝날 때 `shake` 사건. IMU 가 UNKNOWN 인 버킷은 현재 단계를 유지한다(카운터를 늘리지도 끝내지도 않음, 구현 가정).
+- **검출 지연(8)**: interval 시작 큐부터, raw_state 가 그 interval 의 최종 기대 상태로 처음 바뀐 레코드의 `t` 까지. 레코드가 1초 버킷이라 값은 1초 단위로 양자화된다.
+- **flapping·비율(9)**: flapping 의 분모는 기대 상태가 일정한 구간의 채점 초 합. 상태 비율 오차는 기대·측정 각각 INVALID 와 PAUSED 를 분모에서 뺀 비율로 계산하고, INVALID·PAUSED 비중의 차이는 `excluded_shares` 로 따로 보고한다.
+- **lifecycle gap(10, 11)**: 사유는 기기 층이 `GapReason` 으로 넘긴다. `APP_SWITCH → PHONE`, `SCREEN_LOCK → PAUSED` interval(30초 제한 없음). Android 는 화면이 꺼지거나 다른 앱을 써도 측정이 계속되므로 이 두 gap 을 내지 않는다(초당 레코드의 PHONE 으로 남는다). `PROCESS_DEATH` 는 interval 을 만들지 않고 마지막 기록 시각으로 `session_end(PROCESS_DEATH_RECOVERED)`. 갭이 `lifecycle_gap_session_end_ms`(10분)를 엄격히 초과하면 interval 없이 진입 시각에 `session_end(LIFECYCLE_GAP_TIMEOUT)`.
+- **얼굴 검출 2단(12)** (`FaceBand`): `face_detect_ratio < face_missing_max_ratio`(0.2, 초기값)면 G1 의 "얼굴 미검출" 버킷, `>= face_present_min_ratio`(0.5)여야 방향(G2)을 판정한다. 사이는 INVALID(face_unstable), `zone_status = no_head_pose`. `NaiveBaselineEngine` 의 미검출 기준은 `face_missing_max_ratio`.
+- **T7c·T5b(13)**: proxy 없이 `invalid_reason == camera_occluded` 초 수와 `redock_confirmed` 사건 수로 잰다.
+- **PAUSED 복귀(14)**: PAUSED 로 끝난 interval 다음 큐 뒤 채점 제외는 6초(반응 3 + 얼굴 재검출 `auto_resume_face_ms` 3). 합격선은 "복귀 큐 뒤 7초 안에 재개"(`GtRules.resume_within_ms`, 초기값).
 - 결정성: 시계·난수를 쓰지 않는다. 같은 로그를 재생하면 레코드·interval·SessionEnd 가 완전히 같다(`ReplayResult.sameOutcomeAs`).
 
 ## 데이터 경계
 
-로그 모델(`SessionHeader`, `SecondRecord`, `IntervalRecord`, `SessionEnd`, `ParameterSet`)의 직렬화 필드는 스칼라·enum·문자열·사건 목록뿐이다.
-`SchemaBoundaryTest` 가 `SerialDescriptor` 를 훑어 배열형 원시 데이터, 중첩 객체, 맵을 거부한다. `SecondRecord` 필드 목록도 고정 검사한다.
+로그 모델의 직렬화 필드는 스칼라·enum·문자열·사건 목록(`events`: 스칼라 객체의 목록)뿐이다. `SecondRecord` 에는 수치 배열을 두지 않는다.
+`calibration` 줄(`CalibrationSnapshot`)에 한해 이름이 정해진 고정 길이 수치 목록만 허용한다: `zones`(≤ 3), `dock_gravity_vector`(3), `bg_tile_texture_baseline`(16), `bg_tile_mask`(16).
+`SchemaBoundaryTest` 가 `SerialDescriptor` 를 훑어 이 규칙을 검사하고 `SecondRecord`·`SessionHeader`·`CalibrationSnapshot` 필드 목록을 고정한다.
 
-## 세션 JSONL 형식
+## 세션 JSONL 형식 (feature_schema_version 0.2.1)
 
 첫 줄은 세션 header, 이후 한 줄에 객체 하나. `type` 키로 구분한다(없으면 키로 추론). 빈 줄과 모르는 키는 무시한다.
+시간이 있는 줄(calibration, timebase, interval, second)은 시간 순으로 쓴다.
 
 ```jsonl
-{"type":"header","session_id":"S1","participant_id":"P1","spec_version":"0.2.0","algorithm_version":"abc123","feature_schema_version":"v0.1","parameter_set_id":"ps-v0.2.0-default","device_model":"SM-S931N","os_version":"16","camera_resolution":"640x480","nominal_fps":24,"calibration_id":"C1","calibration_snapshot_version":"1","task_mode":"VISUAL"}
-{"type":"second","t_mono_ms":4000000,"t_utc_ms":1789000000000,"raw_state":"PRESENT","final_state":"PRESENT","face_detect_ratio":0.98,"torso_match":true,"head_landmark_present":true,"head_below_shoulder":false,"yaw_mean":1.2,"pitch_mean":-7.5,"roll_mean":0.3,"zone_id":0,"pose_motion":0.05,"scene_luma":118.0,"bg_tile_texture_ratio":0.0,"jitter_j":0.4,"face_width_px":210.0,"imu_state":"DOCKED","app_state":"SCREEN_OFF","fps_actual":24.0,"power_state":"P0"}
+{"type":"header","session_id":"S1","participant_id":"P1","t_start_mono_ms":4000000,"t_start_utc_ms":1789000000000,"spec_version":"0.2.0","algorithm_version":"abc123","feature_schema_version":"0.2.1","parameter_set_id":"ps-v0.2.1-default","device_model":"SM-S931N","os_version":"16","camera_resolution":"640x480","nominal_fps":24,"calibration_id":"C1","calibration_snapshot_version":"1","task_mode":"VISUAL"}
+{"type":"calibration","calibration_id":"C1","version":"1","t_mono_ms":4000000,"zones":[{"zone_id":0,"yaw_center_deg":0.0,"pitch_center_deg":-8.0,"yaw_half_width_deg":12.0,"pitch_half_width_deg":12.0}],"torso_center_x":0.5,"torso_center_y":0.72,"torso_width":0.38,"m0_pose":0.05,"pose_jitter_floor":0.012,"m0":0.021,"jitter_floor":0.006,"jitter_j_baseline":0.41,"dock_gravity_vector":[0.12,7.21,6.63],"dock_accel_variance":0.0021,"scene_luma_baseline":118.0,"bg_tile_texture_baseline":[12.1, "…16개"],"bg_tile_mask":[true, "…16개"]}
+{"type":"timebase","t_mono_ms":4000000,"camera_ts_source":"REALTIME","camera_to_mono_offset_ns":1500000,"imu_to_mono_offset_ns":-2000}
+{"type":"second","t_mono_ms":4000000,"t_utc_ms":1789000000000,"raw_state":"PRESENT","final_state":"PRESENT","invalid_reason":null,"candidate_state":null,"candidate_start_mono_ms":null,"events":[],"face_detect_ratio":0.98,"shoulder_visibility_min":0.93,"torso_center_offset_ratio":0.04,"torso_width_ratio":1.01,"head_landmark_present":true,"head_offset_below_shoulder_ratio":-0.8,"yaw_mean":1.2,"pitch_mean":-7.5,"roll_mean":0.3,"zone_status":"in_zone","zone_id":0,"pose_motion":0.05,"scene_luma":118.0,"bg_tile_texture_ratio":0.0,"jitter_j":0.4,"face_width_px":210.0,"imu_state":"DOCKED","screen_state":"OFF","app_state":"BACKGROUND","frames_requested":24,"frames_processed":24,"frames_dropped":0,"max_frame_gap_ms":42,"gaps_over_80ms":0,"power_state":"P0"}
 {"type":"interval","t_start_mono_ms":4100000,"t_end_mono_ms":4220000,"t_start_utc_ms":1789000100000,"t_end_utc_ms":1789000220000,"state":"PHONE","reason":"APP_SWITCH"}
 {"type":"session_end","t_mono_ms":4300000,"t_utc_ms":1789000300000,"reason":"USER"}
 ```
 
-`second` 필드(v0 부분집합, `feature_schema_version = v0.1`):
+`second` 필드:
 
 | 필드 | 형 | 뜻 |
 |---|---|---|
-| `t_mono_ms`, `t_utc_ms` | long | monotonic / wall clock. 레코드는 `[t, t+1000)` 요약 |
+| `t_mono_ms`, `t_utc_ms` | long | monotonic 버킷 시작 / wall clock |
 | `raw_state`, `final_state` | enum? | `PHONE, INVALID, ABSENT, PRONE, AWAY, PRESENT, PAUSED`. 판정 전 feature 레코드는 null |
+| `invalid_reason` | enum? | `low_light, camera_occluded, fps_low, quality_proxy, phone_shake, redock_pending, recalibration, face_missing_unconfirmed, head_missing, face_unstable`. `raw_state != INVALID` 면 null |
+| `candidate_state`, `candidate_start_mono_ms` | enum?, long? | 쌓이는 중인 후보(ABSENT, PRONE, PHONE 집어 듦, AWAY 유예, PAUSED 카운터)와 첫 버킷. 둘 다 있거나 둘 다 null |
+| `events` | 사건 목록 | `{type, t_mono_ms, by?, zone_id?}`. type: `pickup_candidate, pickup_confirmed, shake, redock_confirmed{by: orientation\|tap}, redock_pending_timeout, notify_reposition, auto_pause_start, auto_resume, recalibration_start, recalibration_end, zone_added{zone_id}` |
 | `face_detect_ratio` | double | 처리 프레임 중 얼굴 검출 비율 0..1 |
-| `torso_match` | bool | Pose 상체가 캘리브레이션 torso ROI 와 일치 |
+| `shoulder_visibility_min`, `torso_center_offset_ratio`, `torso_width_ratio` | double? | 양 어깨 visibility 최솟값, 어깨 중심 편차 ÷ 캘리브레이션 어깨 폭, 어깨 폭 비율. Pose 없으면 null. 일치 여부는 엔진이 ParameterSet 으로 계산 |
 | `head_landmark_present` | bool | Pose nose/ear landmark 유효 |
-| `head_below_shoulder` | bool? | head_y > shoulder_line_y + margin. 머리 landmark 없으면 null |
+| `head_offset_below_shoulder_ratio` | double? | (head_y − shoulder_line_y) ÷ 어깨 폭, 양수가 아래. 머리 landmark 없으면 null |
 | `yaw_mean`, `pitch_mean`, `roll_mean` | double? | head pose 초 평균(도). 얼굴 없으면 null |
-| `zone_id` | int? | 작업영역 id. null = 밖 또는 판정 불가 |
-| `pose_motion` | double? | 어깨 중심 1초 변위 ÷ 어깨 폭. Pose 없으면 null |
+| `zone_status`, `zone_id` | enum, int? | `in_zone, outside, no_head_pose`. `zone_id` 는 in_zone 일 때만 |
+| `pose_motion` | double? | 어깨 중심 1초 변위 ÷ 어깨 폭 |
 | `scene_luma` | double | 전체 프레임 Y 평균 0..255 |
 | `bg_tile_texture_ratio` | double? | 배경 tile 중 texture 가 기준의 25% 미만으로 떨어진 비율. proxy 사용 불가면 null |
-| `jitter_j` | double? | 강체 잔차 j |
-| `face_width_px` | double? | 얼굴 폭 px |
+| `jitter_j`, `face_width_px` | double? | 강체 잔차 j, 얼굴 폭 px |
 | `imu_state` | enum | `DOCKED, RESTING_OFF_DOCK, MOVING, LIFTED, UNKNOWN` |
-| `app_state` | enum | `FOREGROUND, SCREEN_OFF, LOCKED, OTHER_APP` |
-| `fps_actual` | double | 실제 처리 프레임 수 |
-| `power_state` | enum | `P0, P0_PRIME, P1_PRIME, P1, P2, P3, P4, P5` (스펙 7장 P0′, P1′) |
+| `screen_state`, `app_state` | enum | `ON_UNLOCKED, ON_LOCKED, OFF` / `FOREGROUND, BACKGROUND`. 앱 기준 PHONE = ON_UNLOCKED AND BACKGROUND |
+| `frames_requested`, `frames_processed`, `frames_dropped`, `max_frame_gap_ms`, `gaps_over_80ms` | int, int, int, long?, int | 프레임 계수. `fps_actual` 은 없고 `SecondRecord.fpsActual` 이 처리 프레임 수에서 계산 |
+| `power_state` | enum | `P0, P0_PRIME, P1_PRIME, P1, P2, P3, P4, P5` |
 
-`interval` 은 lifecycle gap 한 구간: 시작·종료 `t_*_mono_ms`(+utc), `state`(PHONE 또는 PAUSED), `reason`(`APP_SWITCH`, `SCREEN_LOCK`).
-`session_end` 는 선택이며 `reason` 은 `USER, LIFECYCLE_GAP_TIMEOUT, PROCESS_DEATH_RECOVERED, UNKNOWN`.
+다른 줄:
 
-`ParameterSet` JSON 은 `parameter_set_id` 만 필수이고 나머지 임계값은 스펙 초기값이 기본이다. 전체 목록은
-`gt-diff --print-default-params` 또는 `samples/params.json`.
+- `calibration`: `calibration_id, version, t_mono_ms, zones(≤3: zone_id, yaw·pitch 중심·반폭), torso_center_x·y, torso_width(정규화), m0_pose, pose_jitter_floor, m0, jitter_floor, jitter_j_baseline, dock_gravity_vector(3), dock_accel_variance, scene_luma_baseline, bg_tile_texture_baseline(16), bg_tile_mask(16)`. 세션 시작과 재거치 재캘리브레이션 뒤.
+- `timebase`: `t_mono_ms, camera_ts_source, camera_to_mono_offset_ns, imu_to_mono_offset_ns`. 세션 시작과 1분마다.
+- `interval`: lifecycle gap 한 구간. `state` 는 `reason.state` 와 같아야 한다(`APP_SWITCH → PHONE`, `SCREEN_LOCK → PAUSED`).
+- `session_end`: `t_mono_ms, t_utc_ms, reason ∈ {USER, LIFECYCLE_GAP_TIMEOUT, PROCESS_DEATH_RECOVERED, UNKNOWN}`.
+
+재생은 로그의 `raw_state`·`final_state`·`invalid_reason`·`candidate_*` 와 게이트 사건을 버리고 다시 계산한다. 기기 사건(`zone_added`)만 입력으로 남긴다.
+
+`ParameterSet` JSON 은 `parameter_set_id` 만 필수이고 나머지 임계값은 기본값(스펙 초기값 + v0.2.1 초기값)이다. 전체 목록은 `gt-diff --print-default-params` 또는 `samples/params.json`. 기본 id 는 `ps-v0.2.1-default`.
 
 ## GT JSON 형식
 
@@ -114,24 +134,24 @@ JDK 17 이상. Kotlin 2.2, kotlinx-serialization 1.9, kotlin.test.
 ```
 
 - 각 interval 의 시작이 큐다. intervals 는 정렬·비중첩이어야 한다. 사이의 빈 구간은 채점하지 않는다.
-- `expected_state` 는 도구가 `behavior` 에서 생성한다. 파일에 적힌 값은 참고용이며 생성값과 다르면 경고만 낸다.
-  카탈로그에 없는 behavior 는 `expected_state` 가 있어야 읽을 수 있다.
-- 각 큐 뒤 3초(반응 허용)와 void 구간은 채점에서 뺀다.
+- `expected_state` 는 도구가 `behavior` 에서 생성한다. 파일에 적힌 값은 참고용이며 생성값과 다르면 경고만 낸다. 카탈로그에 없는 behavior 는 `expected_state` 가 있어야 읽을 수 있다.
+- 각 큐 뒤 3초(반응 허용)와 void 구간은 채점에서 뺀다. 직전 interval 이 PAUSED 로 끝났으면 6초를 뺀다.
+- `phone_redock_recalibrating` 구간이 `redock_stationary_confirm_ms + recalibration_ms`(22000ms)보다 짧으면 경고한다.
 
 behavior → 기대 상태(`BehaviorCatalog`, v0-plan 6장 표):
 
 | behavior | 기대 상태 | 시나리오 |
 |---|---|---|
 | `study_in_zone` | PRESENT | T1 |
-| `leave_seat`, `leave_seat_plain_background`, `leave_seat_jacket_on_chair` | 지속 ≥ `absent_confirm_ms`(3초)면 ABSENT, 아니면 INVALID(확정되지 않은 얼굴 미검출) | T2, T7c, T8 |
+| `leave_seat`, `leave_seat_plain_background`, `leave_seat_jacket_on_chair` | 지속 ≥ 3버킷이면 ABSENT, 아니면 INVALID(확정되지 않은 얼굴 미검출) | T2, T7c, T8 |
 | `deep_bow_writing` | INVALID | T3 |
 | `prone_head_visible` | PRONE | T4a |
-| `prone_head_out_of_frame` | INVALID, `auto_pause_ms`(120초)부터 PAUSED | T4b |
+| `prone_head_out_of_frame` | INVALID 120버킷, 121번째부터 PAUSED | T4b |
 | `phone_pickup_use` | PHONE | T5a |
 | `phone_redock_recalibrating` | INVALID | T5a |
-| `phone_use_on_flat_surface` | INVALID, `redock_pending_invalid_ms`(60초)부터 PHONE | T5b |
+| `phone_use_on_flat_surface` | INVALID 60버킷(구간 시작 = 정지 시작), 61번째부터 PHONE | T5b |
 | `desk_bump` | INVALID | T5c |
-| `look_away_unregistered` | 처음 `away_grace_ms`(4초) PRESENT, 이후 AWAY | T6a·b·c |
+| `look_away_unregistered` | PRESENT 4버킷, 5번째부터 AWAY | T6a·b·c |
 | `look_at_third_zone`, `eyes_only_away` | PRESENT | T6d·e |
 | `lights_off`, `camera_covered` | INVALID | T7a·b |
 | `other_app_unlocked`, `touch_screen_other_app` | PHONE | T9a·c |
@@ -150,7 +170,7 @@ gt-diff/build/install/gt-diff/bin/gt-diff \
 |---|---|
 | `--log` | 세션 JSONL (필수) |
 | `--gt` | GT JSON (필수) |
-| `--params` | ParameterSet JSON. 없으면 스펙 기본값 |
+| `--params` | ParameterSet JSON. 없으면 기본값 |
 | `--engine naive\|logged` | `naive`(기본): NaiveBaselineEngine 으로 재생. `logged`: 로그에 적힌 raw/final 을 그대로 채점(재생 없음) |
 | `--out` | 리포트 JSON 파일. 없으면 stdout |
 | `--quiet` | 콘솔 표 생략 |
@@ -161,15 +181,14 @@ gt-diff/build/install/gt-diff/bin/gt-diff \
 리포트(JSON, 콘솔 표 동일):
 
 1. `seconds`: 레코드 수, 채점 초, 반응·void·미채점 제외 수, GT 밖 레코드, 채점 구간의 누락 레코드.
-2. `confusion[expected][final]`(초), `per_state` 의 precision·recall·상태 비율 오차(측정 − 기대, %p).
-3. `detection_latency`: 기대 상태가 바뀌는 interval 마다 큐 → 첫 `raw_state` 전이까지. 중앙값, P95(nearest-rank), 미검출 수, 표본.
+2. `confusion[expected][final]`(초), `per_state` 의 precision·recall·상태 비율 오차(측정 − 기대, %p; 분모에서 INVALID·PAUSED 제외), `excluded_shares`(INVALID·PAUSED 의 기대·측정 비중과 차이).
+3. `detection_latency`: 기대 상태가 바뀌는 interval 마다 큐 → 첫 `raw_state` 전이까지. 중앙값, P95(nearest-rank), 미검출 수, 표본. 1초 양자화.
 4. `flapping`: 기대 상태가 일정한 구간 안에서 채점 초끼리 `final_state` 가 바뀐 횟수와 10분당 비율.
 5. `false_invalid`, `false_away`: 기대가 그 상태가 아닌데 그 상태인 초의 비율. `invalid_ratio_by_expected` 는 T11 자료.
 6. `reproducibility`: 같은 로그 2회 재생 일치 여부, 로그에 적힌 `final_state` 와의 일치율.
 7. `baseline_comparison`: 대상 엔진과 NaiveBaselineEngine 의 false ABSENT·false INVALID·missed ABSENT 초.
-8. `pass`: v0-plan 7장 합격선 항목별 PASS/FAIL/n/a 와 종합(`overall`: true/false/null). `scenario_id` 로 적용 항목을 고른다(`T4b` 처럼 변형 글자 허용).
-   스키마로 직접 잴 수 없는 항목은 proxy 로 계산하고 note 에 적는다: T5b 재거치 확정 0회(PHONE·INVALID 밖 구간 수), T7c camera_occluded 0초(채점 INVALID 초).
-9. `warnings`: parameter_set_id·session_id 불일치, GT 경고, 세션 종료 뒤 버린 레코드.
+8. `pass`: v0-plan 7장 합격선(v0.2.1 정오 반영) 항목별 PASS/FAIL/n/a 와 종합(`overall`: true/false/null). `scenario_id` 로 적용 항목을 고른다(`T4b` 처럼 변형 글자 허용). T7c 는 `invalid_reason == camera_occluded` 초, T5b 는 `redock_confirmed` 사건 수, T4b 재개는 7초.
+9. `gt_rules`: 이 리포트에 쓴 채점 규칙·합격선 수치. `warnings`: parameter_set_id·session_id 불일치, GT 경고·lint, 세션 종료 뒤 버린 레코드.
 
 ## 라이브러리 사용
 
@@ -182,4 +201,5 @@ val report = GtDiff(params).diff(GtParser.parse(gtText), result, baseline = resu
 println(ConsoleReport.render(report))
 ```
 
-실시간 경로도 같은 클래스를 쓴다: 초당 레코드마다 `engine.judge(record)` → `finalizer.push(record, decision)`, 백그라운드 진입에 `onBackground`, 복귀에 `onForeground`.
+실시간 경로도 같은 클래스를 쓴다: 초당 레코드마다 `engine.judge(record)` → `finalizer.push(record, decision)`, 백그라운드 진입에 `onBackground`, 복귀에 `onForeground(t, utc, reason)`, 프로세스 종료 복구에 `onForeground(…, PROCESS_DEATH)` 또는 `endSession(lastRecordMono, lastRecordUtc, PROCESS_DEATH_RECOVERED)`.
+폰 게이트는 `PhoneGateTracker.judge(t, imuState, redockTap)` 이 버킷마다 PHONE / INVALID(phone_shake, redock_pending, recalibration) / 없음 과 사건을 돌려주고, 이를 합치는 GateEngine 이 환경 INVALID 에서도 이 tracker 를 리셋하지 않는다.

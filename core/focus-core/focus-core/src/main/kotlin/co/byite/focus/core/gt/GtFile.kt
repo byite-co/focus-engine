@@ -1,6 +1,7 @@
 package co.byite.focus.core.gt
 
 import co.byite.focus.core.log.FocusJson
+import co.byite.focus.core.model.ParameterSet
 import co.byite.focus.core.model.State
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
@@ -79,5 +80,21 @@ object GtParser {
         gt.void.forEachIndexed { i, v ->
             if (v.tEndMs <= v.tStartMs) throw GtFormatException("void $i has non-positive duration (${v.tStartMs}..${v.tEndMs})")
         }
+    }
+
+    /**
+     * Non-fatal script checks that need the [ParameterSet] (v0.2.1 판정 6): a
+     * `phone_redock_recalibrating` interval must cover the stationary confirmation plus the
+     * recalibration (`redock_stationary_confirm_ms + recalibration_ms`).
+     */
+    fun lint(gt: GtFile, params: ParameterSet): List<String> {
+        val warnings = ArrayList<String>()
+        val minRecal = params.redockStationaryConfirmMs + params.recalibrationMs
+        gt.intervals.forEachIndexed { i, iv ->
+            if (iv.behavior == BehaviorCatalog.PHONE_REDOCK_RECALIBRATING && iv.durationMs < minRecal) {
+                warnings.add("interval $i (${iv.behavior}): ${iv.durationMs} ms is shorter than redock_stationary_confirm_ms + recalibration_ms = $minRecal ms")
+            }
+        }
+        return warnings
     }
 }

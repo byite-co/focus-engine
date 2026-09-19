@@ -16,10 +16,16 @@ data class GtReport(
     @SerialName("engine_id") val engineId: String,
     @SerialName("parameter_set_id") val parameterSetId: String,
     @SerialName("spec_version") val specVersion: String,
+    @SerialName("feature_schema_version") val featureSchemaVersion: String,
+    /** GT scoring rules and pass thresholds this report was computed with. */
+    @SerialName("gt_rules") val gtRules: GtRules,
     val seconds: SecondsSummary,
     /** `confusion[expected][final]` in seconds, over scored seconds. */
     val confusion: Map<State, Map<State, Int>>,
+    /** Ratios exclude INVALID and PAUSED from the denominator (v0.2.1 판정 4·9). */
     @SerialName("per_state") val perState: Map<State, StateMetrics>,
+    /** Share of INVALID and PAUSED seconds among scored seconds, expected vs measured (reported separately from the ratios). */
+    @SerialName("excluded_shares") val excludedShares: Map<State, ShareStat>,
     /** Cue → first `raw_state` transition, per target state. */
     @SerialName("detection_latency") val detectionLatency: Map<State, LatencyStats>,
     val flapping: FlappingStats,
@@ -50,6 +56,16 @@ data class SecondsSummary(
 )
 
 @Serializable
+data class ShareStat(
+    @SerialName("expected_s") val expectedS: Int,
+    @SerialName("measured_s") val measuredS: Int,
+    @SerialName("expected_share") val expectedShare: Double?,
+    @SerialName("measured_share") val measuredShare: Double?,
+    /** (measured − expected) × 100. */
+    @SerialName("diff_pp") val diffPp: Double?,
+)
+
+@Serializable
 data class StateMetrics(
     @SerialName("expected_s") val expectedS: Int,
     @SerialName("measured_s") val measuredS: Int,
@@ -58,7 +74,9 @@ data class StateMetrics(
     val fn: Int,
     val precision: Double?,
     val recall: Double?,
+    /** expected seconds ÷ expected seconds outside INVALID/PAUSED; null for INVALID and PAUSED themselves. */
     @SerialName("expected_ratio") val expectedRatio: Double?,
+    /** measured seconds ÷ measured seconds outside INVALID/PAUSED; null for INVALID and PAUSED themselves. */
     @SerialName("measured_ratio") val measuredRatio: Double?,
     /** (measured − expected) × 100. */
     @SerialName("ratio_error_pp") val ratioErrorPp: Double?,

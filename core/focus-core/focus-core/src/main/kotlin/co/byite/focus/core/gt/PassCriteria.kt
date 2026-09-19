@@ -1,5 +1,7 @@
 package co.byite.focus.core.gt
 
+import co.byite.focus.core.model.EventType
+import co.byite.focus.core.model.InvalidReason
 import co.byite.focus.core.model.ParameterSet
 import co.byite.focus.core.model.State
 import co.byite.focus.core.util.Stats
@@ -19,15 +21,16 @@ data class PassContext(
     val reproducibility: Reproducibility,
     /** Session end relative to the start cue, if the session closed. */
     val sessionEndRelMs: Long?,
+    val startCueTMonoMs: Long,
 )
 
 /**
  * v0 pass line (v0-plan 7장 v0 합격선), evaluated per scenario id. `scenario_id` may name a
  * variant (`T4b`); the base id (`T4`) decides which rows apply and the variant narrows them.
  *
- * Rows the record schema cannot support exactly are evaluated through a proxy and say so in
- * their note: T5b "재거치 확정 0회" (no re-dock event in the schema) and T7c "camera_occluded 0초"
- * (no INVALID reason in the schema).
+ * Schema 0.2.1 makes every row measurable: T7c counts `invalid_reason == camera_occluded` seconds
+ * and T5b counts `redock_confirmed` events (v0.2.1 판정 13). "0초" rows count the whole behaviour
+ * interval including the reaction window, excluding only void spans (판정 5).
  */
 class PassCriteria(
     private val params: ParameterSet,
@@ -125,12 +128,12 @@ class PassCriteria(
         }
         run {
             val ivs = res.intervalsWithBehavior(setOf(BehaviorCatalog.PHONE_USE_ON_FLAT_SURFACE))
-            val runs = ivs.ifEmptyNull { countRunsIn(ctx.aligned, ivs) { it.final != State.PHONE && it.final != State.INVALID } }
+            val confirmations = ivs.ifEmptyNull { countEventsIn(ctx, ivs, EventType.REDOCK_CONFIRMED) }
             items.add(
                 PassItem(
                     "t5b_redock_confirm_zero", "평평한 곳에 두고 사용: 재거치 확정 0회 (T5b)", base == "T5",
-                    runs?.let { it == 0 }, runs?.let { "$it run(s)" }, "== 0",
-                    if (runs == null) "no ${BehaviorCatalog.PHONE_USE_ON_FLAT_SURFACE} interval" else "proxy: runs of final_state outside {PHONE, INVALID}; the schema has no re-dock event",
+                    confirmations?.let { it == 0 }, confirmations?.let { "$it redock_confirmed event(s)" }, "== 0",
+                    if (confirmations == null) "no ${BehaviorCatalog.PHONE_USE_ON_FLAT_SURFACE} interval" else null,
                 ),
             )
         }
@@ -151,12 +154,12 @@ class PassCriteria(
             val ivs = res.intervalsWithBehavior(setOf(BehaviorCatalog.LIGHTS_OFF, BehaviorCatalog.CAMERA_COVERED))
             items.add(zeroItem("t7ab_absent_zero", "불 끄기·카메라 가림: ABSENT 0초 (T7a, T7b)", base == "T7", ivs.ifEmptyNull { countFinalIn(ctx.aligned, ivs, State.ABSENT) }, "no ${BehaviorCatalog.LIGHTS_OFF}/${BehaviorCatalog.CAMERA_COVERED} interval"))
             val plain = res.intervalsWithBehavior(setOf(BehaviorCatalog.LEAVE_SEAT_PLAIN_BACKGROUND))
-            val count = plain.ifEmptyNull { countFinalIn(ctx.aligned, plain, State.INVALID, scoredOnly = true) }
+            val count = plain.ifEmptyNull { countIn(ctx.aligned, plain) { it.record.invalidReason == InvalidReason.CAMERA_OCCLUDED } }
             items.add(
                 PassItem(
                     "t7c_occluded_zero", "매끈한 배경에서 자리 비움: camera_occluded 0초 (T7c)", base == "T7",
                     count?.let { it == 0 }, count?.let { "$it s" }, "== 0 s",
-                    if (count == null) "no ${BehaviorCatalog.LEAVE_SEAT_PLAIN_BACKGROUND} interval" else "proxy: scored INVALID seconds; the schema has no INVALID reason",
+                    if (count == null) "no ${BehaviorCatalog.LEAVE_SEAT_PLAIN_BACKGROUND} interval" else null,
                 ),
             )
         }
@@ -186,13 +189,13 @@ class PassCriteria(
             )
         }
 
-        // ---- state ratio error
+        // ---- state ratio error (INVALID and PAUSED are outside the denominator and reported as shares)
         run {
-            val worst = ctx.perState.entries.filter { it.value.ratioErrorPp != null }.maxByOrNull { abs(it.value.ratioErrorPp!!) }
+            val worst = ctx.perState.entries.filter { it.key !in State.RATIO_EXCLUDED && it.value.ratioErrorPp != null }.maxByOrNull { abs(it.value.ratioErrorPp!!) }
             val err = worst?.value?.ratioErrorPp
             items.add(
                 PassItem(
-                    "ratio_error_3pp", "상태 비율 오차: 모든 상태 ± ${Stats.fmt(rules.ratioErrorMaxPp, 1)}%p", base != "T11",
+                    "ratio_error_3pp", "상태 비율 오차: INVALID·PAUSED 제외 모든 상태 ± ${Stats.fmt(rules.ratioErrorMaxPp, 1)}%p", base != "T11",
                     err?.let { abs(it) <= rules.ratioErrorMaxPp },
                     err?.let { "max |err| = ${Stats.fmt(abs(it), 2)}%p (${worst.key})" },
                     "|err| <= ${Stats.fmt(rules.ratioErrorMaxPp, 1)}%p",
@@ -266,24 +269,28 @@ class PassCriteria(
     private fun zeroItem(id: String, description: String, applicable: Boolean, count: Int?, missingNote: String): PassItem =
         PassItem(id, description, applicable, count?.let { it == 0 }, count?.let { "$it s" }, "== 0 s", if (count == null) missingNote else null)
 
-    /** Seconds with `final == state` inside the given intervals, excluding void spans (and, optionally, every non-scored second). */
-    private fun countFinalIn(aligned: List<AlignedSecond>, intervals: List<ResolvedInterval>, state: State, scoredOnly: Boolean = false): Int {
+    /** Seconds with `final == state` inside the given intervals (whole interval, reaction window included), excluding void spans. */
+    private fun countFinalIn(aligned: List<AlignedSecond>, intervals: List<ResolvedInterval>, state: State): Int =
+        countIn(aligned, intervals) { it.final == state }
+
+    /** Seconds inside the given intervals (void excluded) satisfying [pred]. */
+    private fun countIn(aligned: List<AlignedSecond>, intervals: List<ResolvedInterval>, pred: (AlignedSecond) -> Boolean): Int {
         val idx = intervals.map { it.index }.toSet()
-        return aligned.count { it.point.intervalIndex in idx && it.final == state && it.point.exclusion != Exclusion.VOID && (!scoredOnly || it.scored) }
+        return aligned.count { it.point.intervalIndex in idx && it.point.exclusion != Exclusion.VOID && pred(it) }
     }
 
-    /** Maximal runs of consecutive records (inside the intervals, void excluded) satisfying [pred]. */
-    private fun countRunsIn(aligned: List<AlignedSecond>, intervals: List<ResolvedInterval>, pred: (AlignedSecond) -> Boolean): Int {
-        val idx = intervals.map { it.index }.toSet()
-        var runs = 0
-        var inRun = false
-        for (a in aligned) {
-            val inside = a.point.intervalIndex in idx && a.point.exclusion != Exclusion.VOID
-            val hit = inside && pred(a)
-            if (hit && !inRun) runs++
-            inRun = hit
+    /** Events of [type] whose own time falls inside the given intervals (void excluded). */
+    private fun countEventsIn(ctx: PassContext, intervals: List<ResolvedInterval>, type: EventType): Int {
+        var n = 0
+        for (a in ctx.aligned) {
+            for (e in a.record.events) {
+                if (e.type != type) continue
+                val rel = e.tMonoMs - ctx.startCueTMonoMs
+                val inside = intervals.any { rel >= it.interval.tStartMs && rel < it.interval.tEndMs }
+                if (inside && !ctx.resolved.inVoid(rel)) n++
+            }
         }
-        return runs
+        return n
     }
 
     private inline fun <T> List<ResolvedInterval>.ifEmptyNull(block: () -> T): T? = if (isEmpty()) null else block()

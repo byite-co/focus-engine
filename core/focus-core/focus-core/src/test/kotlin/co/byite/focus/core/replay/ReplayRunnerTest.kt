@@ -4,6 +4,8 @@ import co.byite.focus.core.Synth
 import co.byite.focus.core.engine.NaiveBaselineEngine
 import co.byite.focus.core.log.JsonlCodec
 import co.byite.focus.core.log.SessionLog
+import co.byite.focus.core.model.Event
+import co.byite.focus.core.model.EventType
 import co.byite.focus.core.model.GapReason
 import co.byite.focus.core.model.IntervalRecord
 import co.byite.focus.core.model.SessionEnd
@@ -13,15 +15,16 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class ReplayRunnerTest {
     private fun runner() = ReplayRunner(NaiveBaselineEngine(Synth.params), Synth.params)
 
-    private val basic: SessionLog = Synth.log(Synth.faceSegments(60 to true, 10 to false, 60 to true))
+    private val basic: SessionLog = Synth.log(Synth.faceSegments(60 to true, 10 to false, 60 to true), calibrations = listOf(Synth.calibration(0)), timebase = listOf(Synth.timebase(0)))
 
     @Test
-    fun recomputesRawAndFinalStates() {
+    fun recomputesRawFinalAndCandidateFields() {
         val result = runner().run(basic)
         assertEquals(130, result.records.size)
         assertEquals(basic.records.map { it.tMonoMs }, result.records.map { it.tMonoMs })
@@ -32,8 +35,12 @@ class ReplayRunnerTest {
         for (s in 60 until 70) assertEquals(State.ABSENT, final[s], "t=$s")
         assertEquals(State.PRESENT, final[59])
         assertEquals(State.PRESENT, final[70])
+        assertEquals(State.ABSENT, result.records[60].candidateState)
+        assertEquals(Synth.mono(60), result.records[65].candidateStartMonoMs)
+        assertNull(result.records[70].candidateState)
         assertEquals(SessionEndReason.UNKNOWN, result.sessionEnd!!.reason)
         assertEquals(Synth.mono(129), result.sessionEnd!!.tMonoMs)
+        assertEquals(Synth.utc(129), result.sessionEnd!!.tUtcMs)
     }
 
     @Test
@@ -51,9 +58,18 @@ class ReplayRunnerTest {
     }
 
     @Test
-    fun ignoresLoggedStatesAsInput() {
-        val tampered = basic.copy(records = basic.records.map { it.copy(rawState = State.PHONE, finalState = State.PHONE) })
-        assertTrue(runner().run(basic).sameOutcomeAs(runner().run(tampered)))
+    fun ignoresLoggedStatesAndGateEventsButKeepsDeviceEvents() {
+        val zone = Event.zoneAdded(Synth.mono(3), 2)
+        val gate = Event(EventType.PICKUP_CONFIRMED, Synth.mono(3))
+        val tampered = basic.copy(
+            records = basic.records.map { it.copy(rawState = State.PHONE, finalState = State.PHONE, candidateState = State.PHONE, candidateStartMonoMs = it.tMonoMs) }
+                .mapIndexed { i, r -> if (i == 3) r.copy(events = listOf(gate, zone)) else r },
+        )
+        val clean = runner().run(basic)
+        val replayed = runner().run(tampered)
+        assertEquals(clean.records.map { it.finalState }, replayed.records.map { it.finalState })
+        assertEquals(clean.records.map { it.candidateState }, replayed.records.map { it.candidateState })
+        assertEquals(listOf(zone), replayed.records[3].events)
     }
 
     @Test
