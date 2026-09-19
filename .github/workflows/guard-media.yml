@@ -1,0 +1,26 @@
+name: guard-media
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  guard-media:
+    name: No media files outside docs/assets/
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tracked files
+        shell: bash
+        run: |
+          set -euo pipefail
+          offenders="$(git ls-files \
+            | grep -Ei '\.(mp4|mov|avi|mkv|jpg|jpeg|png|heic|webp|bmp)$' \
+            | grep -Ev '^docs/assets/' || true)"
+          if [ -n "$offenders" ]; then
+            echo "::error::Media files are only allowed under docs/assets/. Found:"
+            printf '%s\n' "$offenders"
+            exit 1
+          fi
+          echo "OK: no media files outside docs/assets/"
