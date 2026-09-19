@@ -204,16 +204,26 @@ class PassCriteria(
             )
         }
 
-        // ---- reproducibility
-        items.add(
-            PassItem(
-                "reproducibility", "재현성: 같은 로그 재생 시 final_state 100% 일치", true,
-                ctx.reproducibility.replayTwiceIdentical,
-                ctx.reproducibility.replayTwiceIdentical?.let { if (it) "identical" else "differs" },
-                "identical",
-                if (ctx.reproducibility.replayTwiceIdentical == null) "replay not run (logged states used)" else null,
-            ),
-        )
+        // ---- reproducibility: replay twice identical AND logged output events reproduced (kind + t_mono_ms)
+        run {
+            val rep = ctx.reproducibility
+            val mism = rep.outputEventMismatches
+            items.add(
+                PassItem(
+                    "reproducibility", "재현성: 같은 로그 재생 시 final_state 100% 일치, 출력 사건 일치", true,
+                    rep.holds,
+                    rep.replayTwiceIdentical?.let { if (it) "replay identical" else "replay differs" }?.let { base ->
+                        if (mism == null) base else "$base, output events: ${mism} mismatch / ${rep.loggedOutputEvents} logged"
+                    },
+                    "identical, 0 event mismatch",
+                    when {
+                        rep.replayTwiceIdentical == null -> "replay not run (logged states used)"
+                        (mism ?: 0) > 0 -> "logged output events not reproduced by the replayed engine"
+                        else -> null
+                    },
+                ),
+            )
+        }
 
         // ---- T10
         run {

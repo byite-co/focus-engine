@@ -30,6 +30,7 @@ class GtDiff(
     private val generator = ExpectedStateGenerator(params, rules)
     private val passCriteria = PassCriteria(params, rules)
 
+    /** Resolve a GT that is already aligned to the session grid (see [GtParser.alignToSession]). */
     fun resolve(gt: GtFile): ResolvedGt = generator.resolve(gt)
 
     /** Align finalised records (raw and final set) to the GT. Records are sorted by `t_mono_ms`. */
@@ -54,7 +55,8 @@ class GtDiff(
         replayTwiceIdentical: Boolean? = null,
         extraWarnings: List<String> = emptyList(),
     ): GtReport {
-        val resolved = resolve(gt)
+        val alignedGt = GtParser.alignToSession(gt, primary.header.tStartMonoMs)
+        val resolved = resolve(alignedGt.file)
         val aligned = align(resolved, primary.records)
         val scored = aligned.filter { it.scored }
         val states = State.entries
@@ -63,6 +65,7 @@ class GtDiff(
         if (gt.sessionId != primary.header.sessionId) {
             warnings.add("session_id mismatch: GT '${gt.sessionId}' vs log '${primary.header.sessionId}'")
         }
+        warnings.addAll(alignedGt.warnings)
         warnings.addAll(resolved.warnings)
         warnings.addAll(primary.warnings)
         warnings.addAll(extraWarnings)
@@ -292,6 +295,20 @@ class GtDiff(
             compared++
             if (lf != r.finalState) mismatch++
         }
-        return Reproducibility(twiceIdentical, compared, mismatch, Stats.ratio(compared - mismatch, compared))
+        // output events: kind + t_mono_ms multiset, symmetric difference (v0.2.1 판정 5)
+        val loggedEvents = logged.flatMap { r -> r.outputEvents.map { it.key } }.groupingBy { it }.eachCount()
+        val replayedEvents = primary.records.flatMap { r -> r.outputEvents.map { it.key } }.groupingBy { it }.eachCount()
+        var diff = 0
+        for (k in loggedEvents.keys + replayedEvents.keys) {
+            val a = loggedEvents[k] ?: 0
+            val b = replayedEvents[k] ?: 0
+            diff += if (a > b) a - b else b - a
+        }
+        return Reproducibility(
+            twiceIdentical, compared, mismatch, Stats.ratio(compared - mismatch, compared),
+            loggedOutputEvents = loggedEvents.values.sum(),
+            replayedOutputEvents = replayedEvents.values.sum(),
+            outputEventMismatches = diff,
+        )
     }
 }

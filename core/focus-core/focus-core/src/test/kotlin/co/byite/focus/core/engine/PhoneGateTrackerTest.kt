@@ -1,6 +1,7 @@
 package co.byite.focus.core.engine
 
 import co.byite.focus.core.Synth
+import co.byite.focus.core.model.Event
 import co.byite.focus.core.model.EventType
 import co.byite.focus.core.model.ImuState
 import co.byite.focus.core.model.InvalidReason
@@ -129,25 +130,85 @@ class PhoneGateTrackerTest {
     fun tapConfirmsImmediatelyFromPickedUpOrPending() {
         val t = tracker()
         run(t, 0, ImuState.MOVING, ImuState.MOVING, ImuState.MOVING)
-        val tap = t.judge(Synth.mono(3), ImuState.RESTING_OFF_DOCK, redockTap = true)
+        val tap = t.judge(Synth.mono(3), ImuState.RESTING_OFF_DOCK, listOf(Event.userRedockTap(Synth.mono(3))))
         assertEquals(InvalidReason.RECALIBRATION, tap.invalidReason)
         assertEquals(RedockBy.TAP, tap.events.first { it.type == EventType.REDOCK_CONFIRMED }.by)
 
         val u = tracker()
         run(u, 0, *Array(5) { ImuState.RESTING_OFF_DOCK })
-        val tap2 = u.judge(Synth.mono(5), ImuState.RESTING_OFF_DOCK, redockTap = true)
+        val tap2 = u.judge(Synth.mono(5), ImuState.RESTING_OFF_DOCK, listOf(Event.userRedockTap(Synth.mono(5))))
         assertEquals(RedockBy.TAP, tap2.events.first { it.type == EventType.REDOCK_CONFIRMED }.by)
         assertNull(u.judge(Synth.mono(25), ImuState.DOCKED).state) // 20 buckets later the recalibration is over
     }
 
     @Test
-    fun motionDuringRecalibrationRestartsThePickupRule() {
+    fun motionDuringRecalibrationAbortsItAndRestartsThePickupRule() {
         val t = tracker()
         run(t, 0, ImuState.MOVING, ImuState.MOVING, ImuState.MOVING, ImuState.DOCKED, ImuState.DOCKED)
         val v = t.judge(Synth.mono(5), ImuState.LIFTED)
         assertEquals(InvalidReason.PHONE_SHAKE, v.invalidReason)
-        assertEquals(listOf(EventType.PICKUP_CANDIDATE), v.types())
+        assertEquals(listOf(EventType.RECALIBRATION_ABORTED, EventType.PICKUP_CANDIDATE), v.types())
         assertEquals(Synth.mono(5), v.candidateStartMonoMs)
+        // an off-dock rest aborts it too
+        val u = tracker()
+        run(u, 0, ImuState.MOVING, ImuState.MOVING, ImuState.MOVING, ImuState.DOCKED, ImuState.DOCKED)
+        val w = u.judge(Synth.mono(5), ImuState.RESTING_OFF_DOCK)
+        assertEquals(listOf(EventType.RECALIBRATION_ABORTED), w.types())
+        assertEquals(InvalidReason.REDOCK_PENDING, w.invalidReason)
+    }
+
+    @Test
+    fun finishAbortsAnOpenRecalibrationOnly() {
+        val t = tracker()
+        run(t, 0, ImuState.MOVING, ImuState.MOVING, ImuState.MOVING, ImuState.DOCKED, ImuState.DOCKED)
+        assertEquals(listOf(EventType.RECALIBRATION_ABORTED), t.finish(Synth.mono(5)).map { it.type })
+        assertNull(t.judge(Synth.mono(6), ImuState.DOCKED).state)
+        val u = tracker()
+        run(u, 0, ImuState.MOVING, ImuState.MOVING, ImuState.MOVING)
+        assertTrue(u.finish(Synth.mono(3)).isEmpty())
+        assertTrue(!u.hasPickupCandidate)
+    }
+
+    @Test
+    fun everyRecalibrationStartPairsWithEndOrAborted() {
+        val t = tracker()
+        val script = ArrayList<ImuState>()
+        fun add(n: Int, s: ImuState) = repeat(n) { script.add(s) }
+        add(3, ImuState.MOVING); add(2, ImuState.DOCKED); add(5, ImuState.DOCKED); add(1, ImuState.LIFTED) // abort by motion
+        add(2, ImuState.MOVING); add(2, ImuState.DOCKED); add(25, ImuState.DOCKED) // full recalibration
+        add(3, ImuState.LIFTED); add(2, ImuState.DOCKED); add(3, ImuState.DOCKED); add(1, ImuState.RESTING_OFF_DOCK) // abort by off-dock rest
+        add(3, ImuState.MOVING); add(2, ImuState.DOCKED); add(4, ImuState.DOCKED) // left open -> finish aborts
+        val events = script.mapIndexed { i, s -> t.judge(Synth.mono(i.toLong()), s) }.flatMap { it.events } + t.finish(Synth.mono(script.size.toLong()))
+        val starts = events.count { it.type == EventType.RECALIBRATION_START }
+        val ends = events.count { it.type == EventType.RECALIBRATION_END }
+        val aborted = events.count { it.type == EventType.RECALIBRATION_ABORTED }
+        assertEquals(4, starts)
+        assertEquals(1, ends)
+        assertEquals(3, aborted)
+        assertEquals(starts, ends + aborted)
+        // pairs are ordered: after each start the next recalibration event is an end or an abort
+        var open = false
+        for (e in events) {
+            when (e.type) {
+                EventType.RECALIBRATION_START -> { assertTrue(!open); open = true }
+                EventType.RECALIBRATION_END, EventType.RECALIBRATION_ABORTED -> { assertTrue(open); open = false }
+                else -> Unit
+            }
+        }
+        assertTrue(!open)
+    }
+
+    @Test
+    fun onlyAUserRedockTapInputConfirmsByTap() {
+        val t = tracker()
+        run(t, 0, ImuState.MOVING, ImuState.MOVING, ImuState.MOVING)
+        // a logged output event of a tap confirmation is not an input and must not confirm
+        val ignored = t.judge(Synth.mono(3), ImuState.RESTING_OFF_DOCK, listOf(Event.redockConfirmed(Synth.mono(3), RedockBy.TAP)))
+        assertEquals(InvalidReason.REDOCK_PENDING, ignored.invalidReason)
+        assertTrue(ignored.events.isEmpty())
+        val confirmed = t.judge(Synth.mono(4), ImuState.RESTING_OFF_DOCK, listOf(Event.zoneAdded(Synth.mono(4), 1), Event.userRedockTap(Synth.mono(4))))
+        assertEquals(RedockBy.TAP, confirmed.events.first { it.type == EventType.REDOCK_CONFIRMED }.by)
+        assertEquals(InvalidReason.RECALIBRATION, confirmed.invalidReason)
     }
 
     @Test

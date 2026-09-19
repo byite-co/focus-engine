@@ -66,7 +66,8 @@ object ConsoleReport {
         val rep = r.reproducibility
         appendLine(
             "reproducibility: replay_twice=${rep.replayTwiceIdentical?.let { if (it) "identical" else "DIFFERS" } ?: "n/a"}" +
-                (rep.loggedFinalComparedS?.let { "  logged_final match=${Stats.pct(rep.loggedFinalMatchRatio)} (${rep.loggedFinalMismatchS} mismatch / $it)" } ?: ""),
+                (rep.loggedFinalComparedS?.let { "  logged_final match=${Stats.pct(rep.loggedFinalMatchRatio)} (${rep.loggedFinalMismatchS} mismatch / $it)" } ?: "") +
+                (rep.outputEventMismatches?.let { "  output_events: $it mismatch (logged ${rep.loggedOutputEvents}, replayed ${rep.replayedOutputEvents})" } ?: ""),
         )
         appendLine()
 

@@ -57,6 +57,9 @@ JDK 17 이상. Kotlin 2.2, kotlinx-serialization 1.9, kotlin.test.
 - **lifecycle gap(10, 11)**: 사유는 기기 층이 `GapReason` 으로 넘긴다. `APP_SWITCH → PHONE`, `SCREEN_LOCK → PAUSED` interval(30초 제한 없음). Android 는 화면이 꺼지거나 다른 앱을 써도 측정이 계속되므로 이 두 gap 을 내지 않는다(초당 레코드의 PHONE 으로 남는다). `PROCESS_DEATH` 는 interval 을 만들지 않고 마지막 기록 시각으로 `session_end(PROCESS_DEATH_RECOVERED)`. 갭이 `lifecycle_gap_session_end_ms`(10분)를 엄격히 초과하면 interval 없이 진입 시각에 `session_end(LIFECYCLE_GAP_TIMEOUT)`.
 - **얼굴 검출 2단(12)** (`FaceBand`): `face_detect_ratio < face_missing_max_ratio`(0.2, 초기값)면 G1 의 "얼굴 미검출" 버킷, `>= face_present_min_ratio`(0.5)여야 방향(G2)을 판정한다. 사이는 INVALID(face_unstable), `zone_status = no_head_pose`. `NaiveBaselineEngine` 의 미검출 기준은 `face_missing_max_ratio`.
 - **T7c·T5b(13)**: proxy 없이 `invalid_reason == camera_occluded` 초 수와 `redock_confirmed` 사건 수로 잰다.
+- **사건의 입력·출력(2차 판정 5)**: 입력 사건은 사용자·기기가 만든 `user_redock_tap`, `zone_added`; 출력 사건은 게이트가 만든 나머지. 재생은 입력 사건만 엔진에 넣고 출력 사건은 다시 계산한 뒤 로그의 출력 사건과 종류·`t_mono_ms` 로 비교해 `reproducibility.output_event_mismatches` 에 남긴다. 불일치는 재현성 실패다. `redock_confirmed{by: tap}` 은 같은 버킷에 `user_redock_tap` 입력이 있을 때만 나온다(레코드 불변식).
+- **재캘리브레이션 중단(2차 판정 3)**: 재캘리브레이션 중 움직임이나 off-dock 정지는 `recalibration_aborted` 를 남기고 7번(집어 듦) 또는 6번(재거치 대기) 규칙으로 돌아간다. 세션 종료 때 `PhoneGateTracker.finish(t)` 가 열린 재캘리브레이션을 중단 처리하므로 `recalibration_start` 는 항상 `recalibration_end` 또는 `recalibration_aborted` 와 짝을 이룬다.
+- **GT 큐 정렬(2차 판정 7)**: 대본 GT 는 `start_cue_t_mono_ms == header.t_start_mono_ms` 이고 모든 큐 시각(interval 시작·끝)이 버킷 경계(1000ms 배수)여야 한다. 어긋나면 `GtParser` 가 오류를 낸다. 관찰 GT(`gt_type != scripted`)는 큐·void 시각을 가장 가까운 버킷 경계로 반올림하고 경고를 남긴다(`GtParser.alignToSession`, `GtDiff.diff` 가 호출).
 - **PAUSED 복귀(14)**: PAUSED 로 끝난 interval 다음 큐 뒤 채점 제외는 6초(반응 3 + 얼굴 재검출 `auto_resume_face_ms` 3). 합격선은 "복귀 큐 뒤 7초 안에 재개"(`GtRules.resume_within_ms`, 초기값).
 - 결정성: 시계·난수를 쓰지 않는다. 같은 로그를 재생하면 레코드·interval·SessionEnd 가 완전히 같다(`ReplayResult.sameOutcomeAs`).
 
@@ -88,7 +91,7 @@ JDK 17 이상. Kotlin 2.2, kotlinx-serialization 1.9, kotlin.test.
 | `raw_state`, `final_state` | enum? | `PHONE, INVALID, ABSENT, PRONE, AWAY, PRESENT, PAUSED`. 판정 전 feature 레코드는 null |
 | `invalid_reason` | enum? | `low_light, camera_occluded, fps_low, quality_proxy, phone_shake, redock_pending, recalibration, face_missing_unconfirmed, head_missing, face_unstable`. `raw_state != INVALID` 면 null |
 | `candidate_state`, `candidate_start_mono_ms` | enum?, long? | 쌓이는 중인 후보(ABSENT, PRONE, PHONE 집어 듦, AWAY 유예, PAUSED 카운터)와 첫 버킷. 둘 다 있거나 둘 다 null |
-| `events` | 사건 목록 | `{type, t_mono_ms, by?, zone_id?}`. type: `pickup_candidate, pickup_confirmed, shake, redock_confirmed{by: orientation\|tap}, redock_pending_timeout, notify_reposition, auto_pause_start, auto_resume, recalibration_start, recalibration_end, zone_added{zone_id}` |
+| `events` | 사건 목록 | `{type, t_mono_ms, by?, zone_id?}`. 입력(사용자·기기): `user_redock_tap`, `zone_added{zone_id}`. 출력(게이트): `pickup_candidate, pickup_confirmed, shake, redock_confirmed{by: orientation\|tap}, redock_pending_timeout, notify_reposition, auto_pause_start, auto_resume, recalibration_start, recalibration_end, recalibration_aborted`. `redock_confirmed{by: tap}` 은 같은 버킷의 `user_redock_tap` 이 필요 |
 | `face_detect_ratio` | double | 처리 프레임 중 얼굴 검출 비율 0..1 |
 | `shoulder_visibility_min`, `torso_center_offset_ratio`, `torso_width_ratio` | double? | 양 어깨 visibility 최솟값, 어깨 중심 편차 ÷ 캘리브레이션 어깨 폭, 어깨 폭 비율. Pose 없으면 null. 일치 여부는 엔진이 ParameterSet 으로 계산 |
 | `head_landmark_present` | bool | Pose nose/ear landmark 유효 |
@@ -111,7 +114,7 @@ JDK 17 이상. Kotlin 2.2, kotlinx-serialization 1.9, kotlin.test.
 - `interval`: lifecycle gap 한 구간. `state` 는 `reason.state` 와 같아야 한다(`APP_SWITCH → PHONE`, `SCREEN_LOCK → PAUSED`).
 - `session_end`: `t_mono_ms, t_utc_ms, reason ∈ {USER, LIFECYCLE_GAP_TIMEOUT, PROCESS_DEATH_RECOVERED, UNKNOWN}`.
 
-재생은 로그의 `raw_state`·`final_state`·`invalid_reason`·`candidate_*` 와 게이트 사건을 버리고 다시 계산한다. 기기 사건(`zone_added`)만 입력으로 남긴다.
+재생은 로그의 `raw_state`·`final_state`·`invalid_reason`·`candidate_*` 와 출력 사건을 버리고 다시 계산한다. 입력 사건(`user_redock_tap`, `zone_added`)만 엔진에 넣는다. 다시 계산한 출력 사건은 로그의 출력 사건과 종류·`t_mono_ms` 로 비교해 리포트에 남긴다.
 
 `ParameterSet` JSON 은 `parameter_set_id` 만 필수이고 나머지 임계값은 기본값(스펙 초기값 + v0.2.1 초기값)이다. 전체 목록은 `gt-diff --print-default-params` 또는 `samples/params.json`. 기본 id 는 `ps-v0.2.1-default`.
 
@@ -134,6 +137,8 @@ JDK 17 이상. Kotlin 2.2, kotlinx-serialization 1.9, kotlin.test.
 ```
 
 - 각 interval 의 시작이 큐다. intervals 는 정렬·비중첩이어야 한다. 사이의 빈 구간은 채점하지 않는다.
+- 대본 GT(`gt_type: scripted`)는 `start_cue_t_mono_ms` 가 로그 header 의 `t_start_mono_ms` 와 같아야 하고, 모든 `t_start_ms`·`t_end_ms` 가 1000ms 의 배수(버킷 경계)여야 한다. 어긋나면 파서가 오류를 낸다.
+- 관찰 GT(`gt_type` 이 `scripted` 가 아닌 것)는 시작 큐와 각 시각을 세션 버킷 경계로 반올림하고 리포트 `warnings` 에 남긴다. 반올림으로 interval 이 사라지면 오류.
 - `expected_state` 는 도구가 `behavior` 에서 생성한다. 파일에 적힌 값은 참고용이며 생성값과 다르면 경고만 낸다. 카탈로그에 없는 behavior 는 `expected_state` 가 있어야 읽을 수 있다.
 - 각 큐 뒤 3초(반응 허용)와 void 구간은 채점에서 뺀다. 직전 interval 이 PAUSED 로 끝났으면 6초를 뺀다.
 - `phone_redock_recalibrating` 구간이 `redock_stationary_confirm_ms + recalibration_ms`(22000ms)보다 짧으면 경고한다.
@@ -185,7 +190,7 @@ gt-diff/build/install/gt-diff/bin/gt-diff \
 3. `detection_latency`: 기대 상태가 바뀌는 interval 마다 큐 → 첫 `raw_state` 전이까지. 중앙값, P95(nearest-rank), 미검출 수, 표본. 1초 양자화.
 4. `flapping`: 기대 상태가 일정한 구간 안에서 채점 초끼리 `final_state` 가 바뀐 횟수와 10분당 비율.
 5. `false_invalid`, `false_away`: 기대가 그 상태가 아닌데 그 상태인 초의 비율. `invalid_ratio_by_expected` 는 T11 자료.
-6. `reproducibility`: 같은 로그 2회 재생 일치 여부, 로그에 적힌 `final_state` 와의 일치율.
+6. `reproducibility`: 같은 로그 2회 재생 일치 여부, 로그에 적힌 `final_state` 와의 일치율, 출력 사건 비교(`logged_output_events`, `replayed_output_events`, `output_event_mismatches` = 종류·`t_mono_ms` 다중집합의 대칭차). 합격선 `reproducibility` 는 재생 일치이고 불일치 0 일 때만 PASS.
 7. `baseline_comparison`: 대상 엔진과 NaiveBaselineEngine 의 false ABSENT·false INVALID·missed ABSENT 초.
 8. `pass`: v0-plan 7장 합격선(v0.2.1 정오 반영) 항목별 PASS/FAIL/n/a 와 종합(`overall`: true/false/null). `scenario_id` 로 적용 항목을 고른다(`T4b` 처럼 변형 글자 허용). T7c 는 `invalid_reason == camera_occluded` 초, T5b 는 `redock_confirmed` 사건 수, T4b 재개는 7초.
 9. `gt_rules`: 이 리포트에 쓴 채점 규칙·합격선 수치. `warnings`: parameter_set_id·session_id 불일치, GT 경고·lint, 세션 종료 뒤 버린 레코드.
@@ -202,4 +207,4 @@ println(ConsoleReport.render(report))
 ```
 
 실시간 경로도 같은 클래스를 쓴다: 초당 레코드마다 `engine.judge(record)` → `finalizer.push(record, decision)`, 백그라운드 진입에 `onBackground`, 복귀에 `onForeground(t, utc, reason)`, 프로세스 종료 복구에 `onForeground(…, PROCESS_DEATH)` 또는 `endSession(lastRecordMono, lastRecordUtc, PROCESS_DEATH_RECOVERED)`.
-폰 게이트는 `PhoneGateTracker.judge(t, imuState, redockTap)` 이 버킷마다 PHONE / INVALID(phone_shake, redock_pending, recalibration) / 없음 과 사건을 돌려주고, 이를 합치는 GateEngine 이 환경 INVALID 에서도 이 tracker 를 리셋하지 않는다.
+폰 게이트는 `PhoneGateTracker.judge(t, imuState, record.inputEvents)` 가 버킷마다 PHONE / INVALID(phone_shake, redock_pending, recalibration) / 없음 과 출력 사건을 돌려주고, 이를 합치는 GateEngine 이 환경 INVALID 에서도 이 tracker 를 리셋하지 않으며 세션 종료 때 `finish(t)` 를 불러 열린 재캘리브레이션을 닫는다.

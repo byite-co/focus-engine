@@ -36,12 +36,17 @@ data class PhoneGateVerdict(
  * - RESTING_OFF_DOCK starts the re-dock wait whether or not a pickup was confirmed: INVALID(redock_pending)
  *   from that first bucket for `redock_pending_invalid_ms`, then PHONE with a `redock_pending_timeout`
  *   event (no backdate). Motion returns to the pickup rule; the wait restarts at the next rest (판정 6).
- * - DOCKED (still, within ±10° of the mount posture) for `redock_stationary_confirm_ms`, or a tap,
- *   confirms the re-dock: `redock_confirmed{by}`, then INVALID(recalibration) for `recalibration_ms`
- *   bracketed by `recalibration_start` / `recalibration_end` (판정 6). Buckets waiting for the
- *   stationary confirmation are INVALID(redock_pending).
+ * - DOCKED (still, within ±10° of the mount posture) for `redock_stationary_confirm_ms`, or a
+ *   `user_redock_tap` input event, confirms the re-dock: `redock_confirmed{by}`, then
+ *   INVALID(recalibration) for `recalibration_ms` bracketed by `recalibration_start` and
+ *   `recalibration_end` (판정 6). Buckets waiting for the stationary confirmation are
+ *   INVALID(redock_pending) (구현 가정 1, 확정). `redock_confirmed{by: tap}` is raised only from a
+ *   `user_redock_tap` input event (판정 5, 2차).
+ * - Motion or an off-dock rest during recalibration raises `recalibration_aborted` and returns to
+ *   the pickup rule; [finish] aborts a recalibration still open at session end, so every
+ *   `recalibration_start` pairs with `recalibration_end` or `recalibration_aborted` (판정 3, 2차).
  * - UNKNOWN (no IMU samples) holds the current phase: it neither advances bucket counters nor ends
- *   a run; time-based waits keep running. Implementation assumption, not in the spec.
+ *   a run; time-based waits keep running (구현 가정 2, 확정).
  */
 class PhoneGateTracker(private val params: ParameterSet) {
     private sealed interface Phase {
@@ -62,9 +67,14 @@ class PhoneGateTracker(private val params: ParameterSet) {
     /** True while a pickup is being accumulated or confirmed (the IMU candidate that environmental INVALID must not reset). */
     val hasPickupCandidate: Boolean get() = phase is Phase.Motion || phase is Phase.PickedUp
 
-    fun judge(tMonoMs: Long, imu: ImuState, redockTap: Boolean = false): PhoneGateVerdict {
+    /**
+     * Judge one bucket. [inputEvents] are the bucket's input events (`user_redock_tap`, `zone_added`);
+     * output events in the list are ignored, so a logged `redock_confirmed{by: tap}` never confirms anything.
+     */
+    fun judge(tMonoMs: Long, imu: ImuState, inputEvents: List<Event> = emptyList()): PhoneGateVerdict {
+        val redockTap = inputEvents.any { it.type == EventType.USER_REDOCK_TAP }
         val moving = imu == ImuState.LIFTED || imu == ImuState.MOVING
-        val events = ArrayList<Event>(2)
+        val events = ArrayList<Event>(3)
         val verdict: PhoneGateVerdict = when (val p = phase) {
             Phase.Idle -> when {
                 moving -> startMotion(tMonoMs, events)
@@ -122,8 +132,14 @@ class PhoneGateTracker(private val params: ParameterSet) {
                 }
             }
             is Phase.Recalibrating -> when {
-                moving -> startMotion(tMonoMs, events)
-                imu == ImuState.RESTING_OFF_DOCK -> startPending(tMonoMs)
+                moving -> {
+                    events.add(Event(EventType.RECALIBRATION_ABORTED, tMonoMs))
+                    startMotion(tMonoMs, events)
+                }
+                imu == ImuState.RESTING_OFF_DOCK -> {
+                    events.add(Event(EventType.RECALIBRATION_ABORTED, tMonoMs))
+                    startPending(tMonoMs)
+                }
                 else -> {
                     val idx = (tMonoMs - p.startMs) / FocusSchema.RECORD_PERIOD_MS
                     if (idx < params.recalibrationBuckets) {
@@ -137,6 +153,16 @@ class PhoneGateTracker(private val params: ParameterSet) {
             }
         }
         return if (events.isEmpty()) verdict else verdict.copy(events = verdict.events + events)
+    }
+
+    /**
+     * Close the tracker at session end ([tMonoMs] = the last bucket). Returns `recalibration_aborted`
+     * when a recalibration was still open so the start/end pairing holds; resets to idle.
+     */
+    fun finish(tMonoMs: Long): List<Event> {
+        val out = if (phase is Phase.Recalibrating) listOf(Event(EventType.RECALIBRATION_ABORTED, tMonoMs)) else emptyList()
+        phase = Phase.Idle
+        return out
     }
 
     private fun startMotion(tMonoMs: Long, events: MutableList<Event>): PhoneGateVerdict {

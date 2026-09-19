@@ -92,7 +92,7 @@ class PassCriteriaTest {
         assertEquals("1 redock_confirmed event(s)", bad.getValue("t5b_redock_confirm_zero").measured)
 
         // an event outside the flat-surface interval does not count
-        val outside = clean.mapIndexed { i, r -> if (i == 105) r.copy(events = listOf(Event.redockConfirmed(Synth.mono(105), RedockBy.TAP))) else r }
+        val outside = clean.mapIndexed { i, r -> if (i == 105) r.copy(events = listOf(Event.userRedockTap(Synth.mono(105)), Event.redockConfirmed(Synth.mono(105), RedockBy.TAP))) else r }
         assertEquals(true, diff.diff(gt, Synth.replayResult(outside)).pass.items.first { it.id == "t5b_redock_confirm_zero" }.passed)
     }
 

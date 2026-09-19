@@ -97,6 +97,21 @@ class ModelTest {
     }
 
     @Test
+    fun eventsAreSplitIntoInputAndOutput() {
+        assertEquals(setOf(EventType.USER_REDOCK_TAP, EventType.ZONE_ADDED), EventType.INPUT)
+        assertEquals(EventType.entries.toSet() - EventType.INPUT, EventType.OUTPUT)
+        assertTrue(EventType.RECALIBRATION_ABORTED.isOutput)
+        assertEquals("""{"type":"user_redock_tap","t_mono_ms":9,"by":null,"zone_id":null}""", FocusJson.compact.encodeToString(Event.serializer(), Event.userRedockTap(9)))
+        assertEquals("""{"type":"recalibration_aborted","t_mono_ms":9,"by":null,"zone_id":null}""", FocusJson.compact.encodeToString(Event.serializer(), Event(EventType.RECALIBRATION_ABORTED, 9)))
+        val r = Synth.record(0, events = listOf(Event.userRedockTap(Synth.mono(0)), Event.redockConfirmed(Synth.mono(0), RedockBy.TAP), Event.zoneAdded(Synth.mono(0), 1)))
+        assertEquals(listOf(EventType.USER_REDOCK_TAP, EventType.ZONE_ADDED), r.inputEvents.map { it.type })
+        assertEquals(listOf(EventType.REDOCK_CONFIRMED), r.outputEvents.map { it.type })
+        // a tap confirmation without the tap input in the same bucket is rejected
+        assertFailsWith<IllegalArgumentException> { Synth.record(0, events = listOf(Event.redockConfirmed(Synth.mono(0), RedockBy.TAP))) }
+        Synth.record(0, events = listOf(Event.redockConfirmed(Synth.mono(0), RedockBy.ORIENTATION)))
+    }
+
+    @Test
     fun eventInvariantsAndNames() {
         assertFailsWith<IllegalArgumentException> { Event(EventType.SHAKE, 1, by = RedockBy.TAP) }
         assertFailsWith<IllegalArgumentException> { Event(EventType.REDOCK_CONFIRMED, 1) }

@@ -89,7 +89,16 @@ data class SecondRecord(
         require((candidateState == null) == (candidateStartMonoMs == null)) { "candidate_state and candidate_start_mono_ms go together (t=$tMonoMs)" }
         require(headLandmarkPresent || headOffsetBelowShoulderRatio == null) { "head_offset_below_shoulder_ratio needs a head landmark (t=$tMonoMs)" }
         require(framesRequested >= 0 && framesProcessed >= 0 && framesDropped >= 0 && gapsOver80Ms >= 0) { "frame counters must not be negative (t=$tMonoMs)" }
+        if (events.any { it.type == EventType.REDOCK_CONFIRMED && it.by == RedockBy.TAP }) {
+            require(events.any { it.type == EventType.USER_REDOCK_TAP }) { "redock_confirmed{by: tap} needs a user_redock_tap input event in the same bucket (t=$tMonoMs)" }
+        }
     }
+
+    /** Events the user or device produced (replay input). */
+    val inputEvents: List<Event> get() = events.filter { it.isInput }
+
+    /** Events the gates produced (recomputed on replay). */
+    val outputEvents: List<Event> get() = events.filter { it.isOutput }
 
     /** Effective processed frame rate for this bucket. */
     val fpsActual: Double get() = framesProcessed * 1000.0 / FocusSchema.RECORD_PERIOD_MS

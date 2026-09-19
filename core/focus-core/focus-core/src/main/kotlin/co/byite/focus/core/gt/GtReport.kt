@@ -134,7 +134,14 @@ data class Reproducibility(
     @SerialName("logged_final_compared_s") val loggedFinalComparedS: Int?,
     @SerialName("logged_final_mismatch_s") val loggedFinalMismatchS: Int?,
     @SerialName("logged_final_match_ratio") val loggedFinalMatchRatio: Double?,
-)
+    /** Output events (kind + t_mono_ms) in the log, in the replay, and the size of their symmetric difference. Null when replay was not run. */
+    @SerialName("logged_output_events") val loggedOutputEvents: Int? = null,
+    @SerialName("replayed_output_events") val replayedOutputEvents: Int? = null,
+    @SerialName("output_event_mismatches") val outputEventMismatches: Int? = null,
+) {
+    /** Reproducibility holds only when both replays agree and every logged output event is reproduced (v0.2.1 판정 5). */
+    val holds: Boolean? get() = replayTwiceIdentical?.let { it && (outputEventMismatches ?: 0) == 0 }
+}
 
 @Serializable
 data class BaselineMetrics(

@@ -3,6 +3,8 @@ package co.byite.focus.core.gt
 import co.byite.focus.core.Synth
 import co.byite.focus.core.engine.NaiveBaselineEngine
 import co.byite.focus.core.log.FocusJson
+import co.byite.focus.core.model.Event
+import co.byite.focus.core.model.EventType
 import co.byite.focus.core.model.State
 import co.byite.focus.core.replay.ReplayRunner
 import kotlin.test.Test
@@ -198,6 +200,34 @@ class GtDiffTest {
         assertEquals(3, report.seconds.outsideGt)
         assertEquals(10, report.seconds.missingRecords)
         assertEquals(17, report.seconds.scored)
+    }
+
+    @Test
+    fun loggedOutputEventsAreComparedWithTheReplay() {
+        val gt = GtFile("S-synth", "T1", "scripted", Synth.T0, listOf(iv(0, 4, BehaviorCatalog.STUDY_IN_ZONE)))
+        val base = Synth.stated(0, State.PRESENT, State.PRESENT, State.PRESENT, State.PRESENT)
+        val shake = Event(EventType.SHAKE, Synth.mono(2))
+        val logged = base.mapIndexed { i, r -> if (i == 2) r.copy(events = listOf(shake, Event.zoneAdded(Synth.mono(2), 1))) else r }
+        // replay reproduced the shake: only the input differs (inputs are not compared)
+        val same = base.mapIndexed { i, r -> if (i == 2) r.copy(events = listOf(shake)) else r }
+        val ok = diff.diff(gt, Synth.replayResult(same), loggedRecords = logged, replayTwiceIdentical = true)
+        assertEquals(1, ok.reproducibility.loggedOutputEvents)
+        assertEquals(1, ok.reproducibility.replayedOutputEvents)
+        assertEquals(0, ok.reproducibility.outputEventMismatches)
+        assertEquals(true, ok.reproducibility.holds)
+        assertEquals(true, ok.pass.items.first { it.id == "reproducibility" }.passed)
+        // replay produced the shake one bucket later and an extra pickup_candidate: 3 mismatches, reproducibility fails
+        val moved = base.mapIndexed { i, r -> if (i == 3) r.copy(events = listOf(Event(EventType.SHAKE, Synth.mono(3)), Event(EventType.PICKUP_CANDIDATE, Synth.mono(3)))) else r }
+        val bad = diff.diff(gt, Synth.replayResult(moved), loggedRecords = logged, replayTwiceIdentical = true)
+        assertEquals(3, bad.reproducibility.outputEventMismatches)
+        assertEquals(false, bad.reproducibility.holds)
+        val item = bad.pass.items.first { it.id == "reproducibility" }
+        assertEquals(false, item.passed)
+        assertTrue(item.measured!!.contains("3 mismatch"), item.measured)
+        assertEquals(false, bad.pass.overall)
+        assertTrue(ConsoleReport.render(bad).contains("output_events: 3 mismatch"))
+        // not run at all (logged mode) stays null
+        assertNull(diff.diff(gt, Synth.replayResult(same)).reproducibility.outputEventMismatches)
     }
 
     @Test

@@ -1,6 +1,7 @@
 package co.byite.focus.core.gt
 
 import co.byite.focus.core.log.FocusJson
+import co.byite.focus.core.model.FocusSchema
 import co.byite.focus.core.model.ParameterSet
 import co.byite.focus.core.model.State
 import kotlinx.serialization.SerialName
@@ -19,11 +20,16 @@ data class GtFile(
     val intervals: List<GtInterval>,
     val void: List<GtVoid> = emptyList(),
 ) {
+    val isScripted: Boolean get() = gtType == GT_TYPE_SCRIPTED
+
     companion object {
         const val GT_TYPE_SCRIPTED: String = "scripted"
         const val GT_TYPE_OBSERVED: String = "observed"
     }
 }
+
+/** A GT snapped to the session's bucket grid, with the rounding warnings for observed GT. */
+data class AlignedGt(val file: GtFile, val warnings: List<String>)
 
 /**
  * One scripted behaviour. Its start is the cue time. [expectedState] is optional and informational:
@@ -80,6 +86,57 @@ object GtParser {
         gt.void.forEachIndexed { i, v ->
             if (v.tEndMs <= v.tStartMs) throw GtFormatException("void $i has non-positive duration (${v.tStartMs}..${v.tEndMs})")
         }
+        if (gt.isScripted) {
+            gt.intervals.forEachIndexed { i, iv ->
+                if (iv.tStartMs % FocusSchema.RECORD_PERIOD_MS != 0L || iv.tEndMs % FocusSchema.RECORD_PERIOD_MS != 0L) {
+                    throw GtFormatException("scripted GT interval $i (${iv.behavior}) is not on the bucket grid: ${iv.tStartMs}..${iv.tEndMs} ms must be multiples of ${FocusSchema.RECORD_PERIOD_MS}")
+                }
+            }
+        }
+    }
+
+    /**
+     * Align the GT to the session's bucket grid (v0.2.1 판정 7, 2차). Scripted GT must start at
+     * `header.t_start_mono_ms` with every cue on a bucket boundary, else [GtFormatException].
+     * Observed GT is rounded to the nearest boundary with a warning per moved value.
+     */
+    fun alignToSession(gt: GtFile, sessionStartMonoMs: Long): AlignedGt {
+        validate(gt)
+        val period = FocusSchema.RECORD_PERIOD_MS
+        if (gt.isScripted) {
+            if (gt.startCueTMonoMs != sessionStartMonoMs) {
+                throw GtFormatException("scripted GT start_cue_t_mono_ms ${gt.startCueTMonoMs} must equal header.t_start_mono_ms $sessionStartMonoMs")
+            }
+            return AlignedGt(gt, emptyList())
+        }
+        val warnings = ArrayList<String>()
+        fun nearest(abs: Long): Long = sessionStartMonoMs + floorDiv(abs - sessionStartMonoMs + period / 2, period) * period
+        val cue = nearest(gt.startCueTMonoMs)
+        if (cue != gt.startCueTMonoMs) warnings.add("observed GT: start cue ${gt.startCueTMonoMs} rounded to bucket boundary $cue")
+        val intervals = gt.intervals.mapIndexed { i, iv ->
+            val start = nearest(gt.startCueTMonoMs + iv.tStartMs) - cue
+            val end = nearest(gt.startCueTMonoMs + iv.tEndMs) - cue
+            if (start != iv.tStartMs || end != iv.tEndMs) warnings.add("observed GT: interval $i (${iv.behavior}) ${iv.tStartMs}..${iv.tEndMs} rounded to $start..$end")
+            iv.copy(tStartMs = start, tEndMs = end)
+        }
+        val void = gt.void.map { v ->
+            val start = nearest(gt.startCueTMonoMs + v.tStartMs) - cue
+            val end = nearest(gt.startCueTMonoMs + v.tEndMs) - cue
+            if (start != v.tStartMs || end != v.tEndMs) warnings.add("observed GT: void ${v.tStartMs}..${v.tEndMs} rounded to $start..$end")
+            v.copy(tStartMs = start, tEndMs = end)
+        }
+        val aligned = gt.copy(startCueTMonoMs = cue, intervals = intervals, void = void)
+        try {
+            validate(aligned)
+        } catch (e: GtFormatException) {
+            throw GtFormatException("observed GT is invalid after rounding to the bucket grid: ${e.message}", e)
+        }
+        return AlignedGt(aligned, warnings)
+    }
+
+    private fun floorDiv(a: Long, b: Long): Long {
+        val q = a / b
+        return if ((a % b != 0L) && ((a < 0) != (b < 0))) q - 1 else q
     }
 
     /**

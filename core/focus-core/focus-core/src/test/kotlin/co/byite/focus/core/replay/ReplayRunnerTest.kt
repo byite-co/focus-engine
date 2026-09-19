@@ -58,18 +58,19 @@ class ReplayRunnerTest {
     }
 
     @Test
-    fun ignoresLoggedStatesAndGateEventsButKeepsDeviceEvents() {
+    fun ignoresLoggedStatesAndOutputEventsButKeepsInputEvents() {
         val zone = Event.zoneAdded(Synth.mono(3), 2)
+        val tap = Event.userRedockTap(Synth.mono(3))
         val gate = Event(EventType.PICKUP_CONFIRMED, Synth.mono(3))
         val tampered = basic.copy(
             records = basic.records.map { it.copy(rawState = State.PHONE, finalState = State.PHONE, candidateState = State.PHONE, candidateStartMonoMs = it.tMonoMs) }
-                .mapIndexed { i, r -> if (i == 3) r.copy(events = listOf(gate, zone)) else r },
+                .mapIndexed { i, r -> if (i == 3) r.copy(events = listOf(gate, zone, tap)) else r },
         )
         val clean = runner().run(basic)
         val replayed = runner().run(tampered)
         assertEquals(clean.records.map { it.finalState }, replayed.records.map { it.finalState })
         assertEquals(clean.records.map { it.candidateState }, replayed.records.map { it.candidateState })
-        assertEquals(listOf(zone), replayed.records[3].events)
+        assertEquals(listOf(zone, tap), replayed.records[3].events)
     }
 
     @Test
