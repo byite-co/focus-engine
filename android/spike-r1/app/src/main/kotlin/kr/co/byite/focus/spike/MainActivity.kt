@@ -29,6 +29,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var btnStart: Button
     private lateinit var btnStop: Button
     private val ui = Handler(Looper.getMainLooper())
+    private var recovering = false
 
     private val requestPermissions =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { refresh() }
@@ -71,8 +72,38 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        maybeRecover()
         refresh()
         ui.post(refreshTick)
+    }
+
+    /**
+     * 마지막 세션이 정상 정지 요약 없이 끝났으면(프로세스 사망 등) CSV 로 요약을 다시 계산해 보여 준다.
+     * 서비스가 살아 있으면(같은 프로세스에서 Activity 만 재생성) 아무것도 하지 않는다.
+     */
+    private fun maybeRecover() {
+        if (recovering || SpikeStatus.running || !prefs.sessionActive) return
+        recovering = true
+        val csvPath = prefs.lastCsvPath
+        val sid = prefs.activeSessionId
+        Thread {
+            val text = try {
+                SessionRecovery.recover(csvPath, sid)
+            } catch (e: Exception) {
+                "${SessionRecovery.PREFIX}\n복원 실패: ${e.javaClass.simpleName}: ${e.message}\n종료 사유: killed"
+            }
+            ui.post {
+                prefs.lastSummary = text
+                prefs.lastRecoveredSessionId = sid
+                // 복원 중에 새 세션이 시작됐으면 새 세션의 플래그를 건드리지 않는다.
+                if (prefs.activeSessionId == sid) {
+                    prefs.sessionActive = false
+                    prefs.activeSessionId = null
+                }
+                recovering = false
+                refresh()
+            }
+        }.start()
     }
 
     override fun onPause() {
@@ -89,6 +120,7 @@ class MainActivity : ComponentActivity() {
 
     /** camera 타입 FGS 는 앱이 보이는 상태에서만 시작할 수 있다. 버튼 탭 = RESUMED 이지만 한 번 더 확인한다. */
     private fun startCapture() {
+        if (recovering) return
         if (!hasCamera()) {
             Toast.makeText(this, R.string.toast_need_camera, Toast.LENGTH_SHORT).show()
             return
@@ -97,6 +129,7 @@ class MainActivity : ComponentActivity() {
             Toast.makeText(this, R.string.toast_not_visible, Toast.LENGTH_SHORT).show()
             return
         }
+        prefs.lastRecoveredSessionId = null
         ContextCompat.startForegroundService(this, CaptureService.startIntent(this))
         ui.postDelayed({ refresh() }, 300)
     }
@@ -117,17 +150,18 @@ class MainActivity : ComponentActivity() {
         permissionState.text = "CAMERA ${if (cam) "허용" else "거부"} · 알림 ${if (hasNotifications()) "허용" else "거부"} · " +
             "배터리 최적화 예외 ${if (device.isIgnoringBatteryOptimizations()) "예" else "아니오"}"
         val running = SpikeStatus.running
-        btnStart.isEnabled = cam && !running
+        btnStart.isEnabled = cam && !running && !recovering
         btnStop.isEnabled = running
 
-        val abnormal = !running && prefs.sessionActive
+        val recovered = prefs.lastRecoveredSessionId
         status.text = when {
             running -> "실행 중 (세션 ${SpikeStatus.sessionId})\n${SpikeStatus.line}"
-            abnormal -> "이전 세션 ${prefs.activeSessionId} 이 정상 정지되지 않았다. 서비스가 죽었을 수 있다.\n" +
-                "CSV 마지막 행 시각이 종료 시각의 근사값이다 (flush 30초 단위)."
+            recovering -> "이전 세션 ${prefs.activeSessionId} 이 정상 정지되지 않았다. CSV 로 요약을 복원하는 중"
+            recovered != null -> "이전 세션 $recovered 은 서비스가 죽어 정상 정지 요약이 없다. 아래 요약은 CSV 로 다시 계산한 것이다 (종료 사유 killed).\n" +
+                "마지막 기록 시각까지만 반영되고, flush 주기(30초) 안의 행은 잃었을 수 있다."
             else -> SpikeStatus.line.ifBlank { getString(R.string.status_idle) }
         }
         csvPath.text = if (running) SpikeStatus.csvPath else prefs.lastCsvPath
-        if (!running) summary.text = prefs.lastSummary ?: ""
+        if (!running && !recovering) summary.text = prefs.lastSummary ?: ""
     }
 }

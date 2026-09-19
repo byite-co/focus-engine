@@ -27,17 +27,4 @@ class DeviceStatusReader(context: Context) {
     )
 
     fun isIgnoringBatteryOptimizations(): Boolean = pm.isIgnoringBatteryOptimizations(packageName)
-
-    companion object {
-        fun thermalName(status: Int): String = when (status) {
-            PowerManager.THERMAL_STATUS_NONE -> "NONE"
-            PowerManager.THERMAL_STATUS_LIGHT -> "LIGHT"
-            PowerManager.THERMAL_STATUS_MODERATE -> "MODERATE"
-            PowerManager.THERMAL_STATUS_SEVERE -> "SEVERE"
-            PowerManager.THERMAL_STATUS_CRITICAL -> "CRITICAL"
-            PowerManager.THERMAL_STATUS_EMERGENCY -> "EMERGENCY"
-            PowerManager.THERMAL_STATUS_SHUTDOWN -> "SHUTDOWN"
-            else -> "UNKNOWN($status)"
-        }
-    }
 }

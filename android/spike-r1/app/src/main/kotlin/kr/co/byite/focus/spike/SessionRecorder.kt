@@ -3,8 +3,10 @@ package kr.co.byite.focus.spike
 import android.os.Handler
 import android.os.SystemClock
 import android.util.Log
+import kr.co.byite.focus.spike.core.Fmt
 import kr.co.byite.focus.spike.core.FrameStats
-import kr.co.byite.focus.spike.core.FrameSummary
+import kr.co.byite.focus.spike.core.RowTimeline
+import kr.co.byite.focus.spike.core.SpikeSummary
 import kr.co.byite.focus.spike.core.TimebaseEstimator
 import kr.co.byite.focus.spike.core.TimebaseSample
 import java.io.BufferedWriter
@@ -44,6 +46,7 @@ class SessionRecorder(
     private val stats = FrameStats()
     private val resultStats = FrameStats() // Camera2 capture result 스트림 (분석기 backpressure 와 무관)
     private val timebase = TimebaseEstimator()
+    private val timeline = RowTimeline() // 초당 행 기준 누락된 초 (프레임 0인 행 + 행 없는 초)
 
     private lateinit var header: SessionHeader
     private var startMonoMs = 0L
@@ -56,9 +59,6 @@ class SessionRecorder(
     private var lastYMean: Double? = null
     private var lastFrameCbNs = 0L
     private var lastFlushMonoMs = 0L
-    private var rows = 0L
-    private var rowsMissed = 0L
-    private var lastRowMonoMs = 0L
     private var rowsScreenOff = 0L
     private var rowsIdle = 0L
     private var maxThermal = 0
@@ -88,7 +88,6 @@ class SessionRecorder(
         this.header = header
         startMonoMs = SystemClock.elapsedRealtime()
         startUtcMs = System.currentTimeMillis()
-        lastRowMonoMs = startMonoMs
         lastFlushMonoMs = startMonoMs
         started = true
         val ds = device.read()
@@ -141,7 +140,7 @@ class SessionRecorder(
         if (yMean != null) lastYMean = yMean
         timebase.onFrame(captureTsNs, callbackNs)?.let { writeTimebase(it) }
         if (gapNs > FrameStats.DEFAULT_LONG_GAP_THRESHOLD_NS) {
-            event("long_gap gap_ms=${fmt1(gapNs / 1e6)} total_frames=${stats.summary().totalFrames}")
+            event("long_gap gap_ms=${Fmt.f1(gapNs / 1e6)} total_frames=${stats.summary().totalFrames}")
         }
     }
 
@@ -187,23 +186,21 @@ class SessionRecorder(
         if (ds.batteryPct != null) lastBattery = ds.batteryPct
         if (!ds.isInteractive) rowsScreenOff++
         if (ds.isDeviceIdle) rowsIdle++
-        val sinceLast = tMono - lastRowMonoMs
-        if (rows > 0 && sinceLast > 1500) {
-            val missed = sinceLast / 1000 - 1
-            rowsMissed += missed
-            event("row_gap since_last_row_ms=$sinceLast missed_rows=$missed")
+        val lastRowMono = timeline.lastTMonoMs
+        val missedBefore = timeline.onRow(tMono, iv.frames)
+        if (missedBefore > 0) {
+            event("row_gap since_last_row_ms=${tMono - (lastRowMono ?: tMono)} missed_seconds=$missedBefore")
         }
-        lastRowMonoMs = tMono
-        rows++
+        val rows = timeline.rows
 
         val line = buildString(160) {
             append(tMono).append(',')
             append(tUtc).append(',')
             append(iv.frames).append(',')
-            append(fmt1(iv.maxGapMs)).append(',')
+            append(Fmt.f1(iv.maxGapMs)).append(',')
             append(iv.gapsOverThreshold).append(',')
-            append(iv.callbackLatencyMeanMs?.let { fmt1(it) } ?: "").append(',')
-            append(y?.let { fmt1(it) } ?: "").append(',')
+            append(iv.callbackLatencyMeanMs?.let { Fmt.f1(it) } ?: "").append(',')
+            append(y?.let { Fmt.f1(it) } ?: "").append(',')
             append(ds.thermalStatus).append(',')
             append(ds.batteryPct ?: "").append(',')
             append(ds.batteryCurrentUa ?: "").append(',')
@@ -219,8 +216,8 @@ class SessionRecorder(
 
         val s = stats.summary()
         val lastFrameAgoMs = if (lastFrameCbNs > 0) (SystemClock.elapsedRealtimeNanos() - lastFrameCbNs) / 1_000_000 else -1
-        SpikeStatus.line = "행 $rows · 프레임 ${s.totalFrames} (${fmt1(s.avgFps)} fps) · 이번 초 ${iv.frames}f 최대갭 ${fmt1(iv.maxGapMs)}ms\n" +
-            ">80ms 갭 ${s.gapsOverThreshold} (${fmtPct(s.gapsOverThresholdRatio)}) · >1s 갭 ${s.gapsOverLong} · 누락 초 ${s.missingSeconds}\n" +
+        SpikeStatus.line = "행 $rows · 프레임 ${s.totalFrames} (${Fmt.f1(s.avgFps)} fps) · 이번 초 ${iv.frames}f 최대갭 ${Fmt.f1(iv.maxGapMs)}ms\n" +
+            ">80ms 갭 ${s.gapsOverThreshold} (${Fmt.pct(s.gapsOverThresholdRatio)}) · >1s 갭 ${s.gapsOverLong} · 누락 초 ${timeline.missingSeconds}\n" +
             "마지막 프레임 ${lastFrameAgoMs}ms 전 · 화면 ${if (ds.isInteractive) "on" else "off"} · idle ${ds.isDeviceIdle} · thermal ${ds.thermalStatus} · 배터리 ${ds.batteryPct}%"
     }
 
@@ -289,37 +286,45 @@ class SessionRecorder(
     }
 
     private fun buildSummary(reason: String): String {
-        val s: FrameSummary = stats.summary()
+        val s = stats.summary()
         val r = resultStats.summary()
         val tb = timebase.summary()
         val endMono = SystemClock.elapsedRealtime()
-        val lengthS = (endMono - startMonoMs) / 1000.0
-        val passGap = s.gapsOverThresholdRatio < 0.01
-        val passLong = s.gapsOverLong == 0L
-        val passMissing = s.missingSeconds == 0L
-        val pass = passGap && passLong && passMissing
-        fun mark(b: Boolean) = if (b) "OK" else "FAIL"
-        return buildString {
-            appendLine("spike-r1 요약  세션 ${header.sessionId}")
-            appendLine("기기: ${header.deviceModel}, ${header.osVersion}, app ${header.appVersion}")
-            appendLine("카메라: id=${header.cameraId} ${header.resolution}, fps 요청 ${header.fpsSelected} / 결과 ${fpsEffective ?: "미확인"} (변경 ${fpsRangeChanges}회), frame_duration ${frameDurationNs?.let { fmt1(it / 1e6) + "ms" } ?: "미확인"} (변경 ${frameDurationChanges}회)")
-            appendLine("timestamp source: ${header.timestampSource}, 배터리 최적화 예외: ${header.batteryOptimizationIgnored}")
-            appendLine("종료 사유: $reason, 세션 길이 ${fmt1(lengthS)}s, 시작 ${localTime(startUtcMs)}")
-            appendLine("총 프레임: ${s.totalFrames}, 평균 fps ${"%.2f".format(Locale.US, s.avgFps)}")
-            appendLine("80ms 초과 갭: ${s.gapsOverThreshold} / ${s.gapCount} (${fmtPct(s.gapsOverThresholdRatio)})")
-            appendLine("1초 초과 갭: ${s.gapsOverLong}")
-            appendLine("최대 갭: ${fmt1(s.maxGapMs)} ms")
-            appendLine("누락된 초 (프레임 0인 1초 버킷): ${s.missingSeconds}")
-            appendLine("초당 행: $rows, 행 누락(틱 지연): $rowsMissed, 화면 off 행 $rowsScreenOff, idle 행 $rowsIdle")
-            appendLine("배터리: ${startBattery ?: "?"}% → ${lastBattery ?: "?"}%")
-            appendLine("최고 thermal status: $maxThermal (${DeviceStatusReader.thermalName(maxThermal)})")
-            appendLine(
-                "offset: ${tb.offsetNs?.let { fmt3(it / 1e6) + " ms" } ?: "미확정"}, drift: 마지막 ${tb.lastDriftNs?.let { fmt3(it / 1e6) + " ms" } ?: "없음"}, " +
-                    "최대 |drift| ${tb.maxAbsDriftNs?.let { fmt3(it / 1e6) + " ms" } ?: "없음"} (재측정 ${tb.remeasureCount}회)",
-            )
-            appendLine("capture result 스트림: ${r.totalFrames}개, 80ms 초과 갭 ${r.gapsOverThreshold}, 최대 갭 ${fmt1(r.maxGapMs)} ms, 실패 $captureFailures, 비단조 ${s.nonMonotonic}")
-            append("판정: ${if (pass) "합격" else "불합격"}  [80ms 초과 갭 <1%: ${mark(passGap)}] [1초 초과 갭 0: ${mark(passLong)}] [누락된 초 0: ${mark(passMissing)}] [서비스 생존: 사람이 확인]")
-        }
+        val summary = SpikeSummary(
+            sessionId = header.sessionId,
+            device = "${header.deviceModel}, ${header.osVersion}, app ${header.appVersion}",
+            camera = "id=${header.cameraId} ${header.resolution}, fps 요청 ${header.fpsSelected} / 결과 ${fpsEffective ?: "미확인"} (변경 ${fpsRangeChanges}회), " +
+                "frame_duration ${frameDurationNs?.let { Fmt.f1(it / 1e6) + "ms" } ?: "미확인"} (변경 ${frameDurationChanges}회)",
+            timestampSource = header.timestampSource,
+            batteryOptimizationIgnored = header.batteryOptimizationIgnored.toString(),
+            reason = reason,
+            startLocal = localTime(startUtcMs),
+            lengthS = (endMono - startMonoMs) / 1000.0,
+            lastRecord = null,
+            totalFrames = s.totalFrames,
+            avgFps = s.avgFps,
+            gapsOver80 = s.gapsOverThreshold,
+            gapCount = s.gapCount,
+            gapsOverLong = s.gapsOverLong,
+            gapsOverLongIsLowerBound = false,
+            maxGapMs = s.maxGapMs,
+            zeroFrameRows = timeline.zeroFrameRows,
+            rowGapSeconds = timeline.rowGapSeconds,
+            frameBucketMissing = s.missingSeconds,
+            rows = timeline.rows,
+            screenOffRows = rowsScreenOff,
+            idleRows = rowsIdle,
+            batteryStart = startBattery,
+            batteryEnd = lastBattery,
+            maxThermal = maxThermal,
+            offsetMs = tb.offsetNs?.let { it / 1e6 },
+            lastDriftMs = tb.lastDriftNs?.let { it / 1e6 },
+            maxAbsDriftMs = tb.maxAbsDriftNs?.let { it / 1e6 },
+            remeasureCount = tb.remeasureCount,
+            resultStreamLine = "capture result 스트림: ${r.totalFrames}개, 80ms 초과 갭 ${r.gapsOverThreshold}, 최대 갭 ${Fmt.f1(r.maxGapMs)} ms, 실패 $captureFailures, 비단조 ${s.nonMonotonic}",
+            serviceSurvived = reason == CaptureService.REASON_USER_STOP,
+        )
+        return summary.render()
     }
 
     companion object {
@@ -328,9 +333,6 @@ class SessionRecorder(
         const val CSV_COLUMNS =
             "t_mono_ms,t_utc_ms,frames,max_gap_ms,gaps_over_80ms,cb_latency_ms_mean,y_mean,thermal_status,battery_pct,battery_current_ua,is_interactive,is_device_idle"
 
-        fun fmt1(v: Double): String = String.format(Locale.US, "%.1f", v)
-        fun fmt3(v: Double): String = String.format(Locale.US, "%.3f", v)
-        fun fmtPct(ratio: Double): String = String.format(Locale.US, "%.3f%%", ratio * 100)
         fun localTime(utcMs: Long): String =
             SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSXXX", Locale.US).format(Date(utcMs))
     }

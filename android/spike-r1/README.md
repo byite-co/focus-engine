@@ -22,13 +22,17 @@ minSdk 29, compileSdk 37.2, targetSdk 37. 패키지명 `kr.co.byite.focus.spike`
 
 ## 설치
 
-1. GitHub Actions 의 `spike-r1` 워크플로에서 최신 성공 실행을 열고 `spike-r1-debug-apk`
-   아티팩트를 받는다. `android/spike-r1/**` 를 바꾼 PR 과 main 푸시에서 돌고, 단위 테스트를
-   거쳐 디버그 APK 를 올린다. 테스트 결과는 잡 로그에 테스트별로 찍힌다.
-2. 압축을 풀고 설치한다.
+1. GitHub Releases 의 prerelease **`spike-r1-latest`** 에서 `spike-r1-debug-<커밋해시>.apk` 를 받는다.
+   `android/spike-r1/**` 변경이 main 에 푸시될 때와 Actions 에서 `spike-r1` 워크플로를 수동
+   실행(Run workflow)할 때 갱신된다. 태그와 APK 가 매 빌드마다 바뀌는 rolling prerelease 다.
+   PR 에서는 단위 테스트와 assembleDebug 만 하고 올리지 않는다.
+2. 디버그 서명 키가 CI 빌드마다 달라서 이미 설치돼 있으면 먼저 지운다. 앱을 지우면 앱 전용
+   저장소의 세션 로그도 같이 지워지므로 그 전에 `adb pull` 한다.
 
    ```sh
-   adb install -r app-debug.apk
+   adb pull /sdcard/Android/data/kr.co.byite.focus.spike/files/spike-r1/ ./spike-r1-logs/
+   adb uninstall kr.co.byite.focus.spike
+   adb install spike-r1-debug-<해시>.apk
    ```
 
 3. 앱을 열고 `권한 요청` 으로 CAMERA 와 알림 권한을 허용한다.
@@ -39,6 +43,7 @@ minSdk 29, compileSdk 37.2, targetSdk 37. 패키지명 `kr.co.byite.focus.spike`
 ```sh
 cd android/spike-r1
 ./gradlew :spikecore:test :app:assembleDebug
+# → app/build/outputs/apk/debug/app-debug.apk
 ```
 
 ## 실측 절차 (사람이 수행, 각 30분)
@@ -78,13 +83,22 @@ cd android/spike-r1
 
 - 80ms 초과 갭 < 1%
 - 1초 넘는 갭 0
-- 누락된 초 0 (프레임이 하나도 없는 1초 버킷이 없음)
+- 누락된 초 0
 - 서비스 생존 (30분 뒤 `정지` 를 눌렀을 때 앱이 살아 있고 요약이 나온다)
 
-요약 마지막 줄에 앞의 세 항목을 자동으로 판정해 적는다. 서비스 생존은 사람이 확인한다.
-앱을 다시 열었을 때 "이전 세션이 정상 정지되지 않았다" 가 보이면 서비스가 죽은 것이다.
-그때는 `frames.csv` 의 마지막 행 시각이 종료 시각의 근사값이다 (flush 가 30초 단위라
-최대 30초가 잘릴 수 있다).
+"누락된 초" 는 초당 행 기준으로 센다: 프레임이 0인 행 수 + 행 자체가 없는 초 수. 행이 없는
+초는 연속한 두 행의 `t_mono_ms` 차이가 1.5초를 넘을 때 반올림(차이/1초) − 1 로 센다.
+카메라가 멈춘 구간(프레임 0)과 프로세스가 멈춰 행도 못 쓴 구간을 둘 다 잡기 위한 정의다.
+실시간 요약에는 참고로 프레임 capture timestamp 1초 버킷 기준 값도 같이 적는다.
+
+요약 마지막 줄에 네 항목을 판정해 적는다. 서비스 생존은 `정지` 로 정상 종료됐을 때만 OK 다.
+
+**서비스가 죽었을 때.** 앱을 다시 열면 마지막 세션이 정상 정지 요약 없이 끝난 것을 감지해
+`frames.csv` 와 `timebase.csv` 로 요약을 다시 계산해 보여 준다. 종료 사유는 `killed`, 마지막
+기록 시각(마지막 행의 시각과 세션 시작 뒤 경과 초)이 함께 나오고, `요약 복사` 도 이 요약을
+복사한다. 복원한 요약은 세션 디렉터리의 `summary.txt` 에도 쓴다. flush 가 30초 단위라 마지막
+최대 30초의 행은 잃었을 수 있고, 갭 총수와 capture result 스트림은 CSV 에 없어 비어 있으며
+1초 초과 갭은 행별 `max_gap_ms` 로 센 하한이다.
 
 R2 는 요약의 `fps 요청 / 결과` 와 `frame_duration`, `평균 fps` 로 본다. 요청 [24,24] 에
 결과 [24,24], frame_duration 41.7ms, 평균 fps 23.9~24.0 이면 고정된 것이다. 지원 fps
@@ -104,7 +118,7 @@ R3 는 헤더의 `timestamp_source` 와 요약의 `offset`·`drift`, `timebase.c
   frames.csv     초당 1행
   timebase.csv   offset·drift (처음 100프레임, 이후 1분마다 100프레임)
   events.log     카메라 상태, 첫 프레임, fps 범위 변화, 1초 초과 갭, 행 누락
-  summary.txt    정지 시 요약 (화면과 같은 내용)
+  summary.txt    정지 시 요약 (화면과 같은 내용). 서비스가 죽었으면 다음 실행 때 CSV 로 복원한 요약
 ```
 
 ```sh
@@ -148,8 +162,8 @@ stabilization, start_t_mono_ms, start_t_utc_ms, start_local`.
 ## 알려진 한계
 
 - 화면이 꺼진 뒤 이 앱을 다시 열려면 잠금을 풀어야 한다. 정지 전까지 세션은 계속된다.
-- 요약의 `서비스 생존` 은 자동 판정하지 않는다.
-- 프로세스가 강제 종료되면 마지막 flush(최대 30초) 이후의 행과 요약 파일이 남지 않는다.
-  그 경우 앱을 다시 열면 비정상 종료 안내가 뜬다.
+- 프로세스가 강제 종료되면 마지막 flush(최대 30초) 이후의 행은 남지 않는다. 다음 실행 때
+  CSV 로 요약을 복원하지만, 그 요약은 마지막 기록 시각까지만 반영한다.
 - 24fps 도 30fps 도 지원 목록에 없으면 fps 범위를 지정하지 않고 HAL 기본값으로 돈다.
   헤더 `fps_selected` 에 `unset` 으로 남는다.
+- 앱을 지우면 세션 로그도 지워진다. 재설치 전에 `adb pull` 한다.

@@ -36,7 +36,13 @@ class SpikePrefs(context: Context) {
             p.edit().putString(KEY_ACTIVE_ID, v).commit()
         }
 
+    /** 마지막으로 CSV 재계산으로 복원한 세션. 다음 세션을 시작하면 지운다. */
+    var lastRecoveredSessionId: String?
+        get() = p.getString(KEY_RECOVERED_ID, null)
+        set(v) = p.edit().putString(KEY_RECOVERED_ID, v).apply()
+
     private companion object {
+        const val KEY_RECOVERED_ID = "last_recovered_session_id"
         const val KEY_SUMMARY = "last_summary"
         const val KEY_CSV = "last_csv_path"
         const val KEY_ACTIVE = "session_active"
