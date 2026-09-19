@@ -24,3 +24,7 @@ jobs:
             exit 1
           fi
           echo "OK: no media files outside docs/assets/"
+
+      - name: Verify frozen spec hashes (docs/focus)
+        shell: bash
+        run: sha256sum -c docs/focus/SHA256SUMS
