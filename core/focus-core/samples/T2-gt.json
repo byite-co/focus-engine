@@ -1,0 +1,50 @@
+{
+  "session_id": "S-sample-T2",
+  "scenario_id": "T2",
+  "gt_type": "scripted",
+  "start_cue_t_mono_ms": 4000000,
+  "intervals": [
+    {
+      "t_start_ms": 0,
+      "t_end_ms": 60000,
+      "behavior": "study_in_zone"
+    },
+    {
+      "t_start_ms": 60000,
+      "t_end_ms": 62000,
+      "behavior": "leave_seat"
+    },
+    {
+      "t_start_ms": 62000,
+      "t_end_ms": 122000,
+      "behavior": "study_in_zone"
+    },
+    {
+      "t_start_ms": 122000,
+      "t_end_ms": 132000,
+      "behavior": "leave_seat"
+    },
+    {
+      "t_start_ms": 132000,
+      "t_end_ms": 192000,
+      "behavior": "study_in_zone"
+    },
+    {
+      "t_start_ms": 192000,
+      "t_end_ms": 252000,
+      "behavior": "leave_seat"
+    },
+    {
+      "t_start_ms": 252000,
+      "t_end_ms": 312000,
+      "behavior": "study_in_zone"
+    }
+  ],
+  "void": [
+    {
+      "t_start_ms": 40000,
+      "t_end_ms": 45000,
+      "reason": "observer note: participant adjusted the chair"
+    }
+  ]
+}
