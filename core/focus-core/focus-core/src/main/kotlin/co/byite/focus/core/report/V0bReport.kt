@@ -16,8 +16,13 @@ data class V0bOverall(
     val algorithmVersion: String,
     /** "1280x720 (16:9) @ 24fps" — the resolution CameraX actually chose, never the requested one. */
     val camera: String,
+    /** "id 1 (FRONT)" from the header; empty in older logs. */
+    val cameraIdLine: String,
+    /** Fold state of a foldable over the session ("펼침 100%", "폴더블 아님", "접힘 상태 미상"). */
+    val foldLine: String,
     val preset: String,
     val gapThresholdMs: Int,
+    val longGapThresholdMs: Int,
     val endReason: String,
     /** Session length in seconds: `session_end.t_mono_ms − header.t_start_mono_ms`, or up to the last record when there is no end line. */
     val sessionLengthS: Double,
@@ -31,6 +36,7 @@ data class V0bOverall(
     val processedFps: Double?,
     val gapsOver80Ms: Long,
     val gapsOverThreshold: Long,
+    val gapsOverLongThreshold: Long,
     val maxFrameGapMs: Long?,
     /** Face Landmarker ms: frame-weighted mean, nearest-rank p95 of the per-second means, max of the per-second max. */
     val faceInferMsMean: Double?,
@@ -118,6 +124,13 @@ data class PoseCounts(
     }
 }
 
+/** Weighted mean, nearest-rank p95 of the per-second means, and max of the per-second max of one timed stage. */
+data class StageStat(val mean: Double?, val p95OfSecondMeans: Double?, val max: Double?) {
+    companion object {
+        val EMPTY = StageStat(null, null, null)
+    }
+}
+
 /**
  * Comparison statistics of one class of seconds (directive D 정정 1 3번, 정정 2 4번, 정정 3 5번): the screen-off row,
  * the screen-on row, the warm-up line (first 60 s) and the transition line (first 5 s after a screen-state change).
@@ -130,27 +143,36 @@ data class V0bRow(
     val gapsOverThreshold: Long,
     /** `gaps_over_threshold ÷ frames_processed` (every processed frame after the first begins one interval). */
     val gapRatio: Double?,
+    val gapsOverLongThreshold: Long,
     val maxFrameGapMs: Long?,
-    val faceInferMsMean: Double?,
-    val faceInferMsP95OfSecondMeans: Double?,
-    val faceInferMsMax: Double?,
-    val frameTotalMsMean: Double?,
-    val frameTotalMsP95OfSecondMeans: Double?,
-    val frameTotalMsMax: Double?,
-    val stageWrapMsMean: Double?,
-    val stageFacePostMsMean: Double?,
-    val stageSceneMsMean: Double?,
-    val poseFrameCopyMsMean: Double?,
-    val poseFrameCopyMsP95OfSecondMeans: Double?,
-    val poseFrameCopyMsMax: Double?,
-    val poseInferMsMean: Double?,
-    val poseInferMsMax: Double?,
+    /** Cause → count of the gaps over the threshold, in [V0bRawRecord.GAP_CAUSE_ORDER] order. */
+    val gapCauses: Map<String, Long>,
+    val faceInfer: StageStat,
+    val frameTotal: StageStat,
+    val wrap: StageStat,
+    val facePost: StageStat,
+    val scene: StageStat,
+    val enqueue: StageStat,
+    val poseFrameCopy: StageStat,
+    val poseInfer: StageStat,
     val poseWaitMsMean: Double?,
     val pose: PoseCounts,
     val meanCurrentUa: Double?,
     val meanPowerMw: Double?,
     val maxThermalStatus: Int?,
-)
+) {
+    val faceInferMsMean: Double? get() = faceInfer.mean
+    val faceInferMsP95OfSecondMeans: Double? get() = faceInfer.p95OfSecondMeans
+    val faceInferMsMax: Double? get() = faceInfer.max
+    val frameTotalMsMean: Double? get() = frameTotal.mean
+    val stageWrapMsMean: Double? get() = wrap.mean
+    val poseFrameCopyMsMean: Double? get() = poseFrameCopy.mean
+    val poseInferMsMean: Double? get() = poseInfer.mean
+    val poseInferMsMax: Double? get() = poseInfer.max
+
+    /** Gap causes sorted by count, zeros dropped: the "상위 원인" of the summary. */
+    val topGapCauses: List<Pair<String, Long>> get() = gapCauses.entries.filter { it.value > 0 }.sortedByDescending { it.value }.map { it.key to it.value }
+}
 
 /** Preset pass mark on the screen-off row (정정 1 3번, 정정 2 4번). [pass] is null when the off row is empty. */
 data class V0bPass(
@@ -160,13 +182,17 @@ data class V0bPass(
     val processedFps: Double?,
     val gapRatio: Double?,
     val dropRatio: Double?,
+    /** Gaps over the long threshold (200 ms; E 417 ms) on the off row; must be 0 (원래 지시문 D 1번). */
+    val longGaps: Long,
+    val longGapThresholdMs: Int,
     val offMeanPowerMw: Double?,
     val offMaxThermalStatus: Int?,
 ) {
     val fpsOk: Boolean? get() = processedFps?.let { it >= fpsMin }
     val gapOk: Boolean? get() = gapRatio?.let { it < GAP_RATIO_MAX } ?: if (offSeconds > 0) true else null
     val dropOk: Boolean? get() = dropRatio?.let { it < DROP_RATIO_MAX }
-    val pass: Boolean? get() = if (offSeconds == 0) null else (fpsOk == true && gapOk == true && dropOk == true)
+    val longGapOk: Boolean? get() = if (offSeconds == 0) null else longGaps == 0L
+    val pass: Boolean? get() = if (offSeconds == 0) null else (fpsOk == true && gapOk == true && dropOk == true && longGapOk == true)
 
     companion object {
         const val FPS_MIN_EVERY_FRAME: Double = 23.5
@@ -189,11 +215,19 @@ data class ScreenSegment(
     val meanPowerMw: Double?,
 )
 
-/** One 10-second window of the trend table (directive D "10초 추이 표"). */
+/**
+ * One window of the trend table (원래 지시문 D 4번 "10초 단위 추이 표": yaw·pitch·roll 평균, face 비율, 처리 fps; at most
+ * [V0bReport.TREND_MAX_ROWS] rows, so the window grows in 10 s steps for long sessions).
+ */
 data class TrendRow(
     val startS: Long,
     val seconds: Int,
     val processedFps: Double?,
+    /** Applied-sample-weighted face_detect_ratio. */
+    val faceDetectRatio: Double?,
+    val yawMean: Double?,
+    val pitchMean: Double?,
+    val rollMean: Double?,
     val dropRatio: Double?,
     val gapsOverThreshold: Long,
     val faceInferMsMean: Double?,
@@ -248,6 +282,8 @@ data class V0bSummary(
     val rows: List<V0bRow>,
     val pass: V0bPass,
     val screenSegments: List<ScreenSegment>,
+    /** Trend window length in seconds (10, or a multiple of 10 that keeps the table within [V0bReport.TREND_MAX_ROWS]). */
+    val trendWindowS: Long,
     val trend: List<TrendRow>,
     val segments: List<V0bSegment>,
     val notes: List<String>,
@@ -278,6 +314,11 @@ object V0bReport {
     /** 정정 3: the first 5 s after a screen-state change are a transition, excluded from the on/off rows. */
     const val TRANSITION_MS: Long = 5_000L
     const val TREND_WINDOW_MS: Long = 10_000L
+    /** 원래 지시문 D 4번: 최대 60행, 넘으면 간격을 늘린다. */
+    const val TREND_MAX_ROWS: Int = 60
+    /** Fold-state bands of the hinge angle (degrees): closed below 30, half-opened below 150, flat otherwise. */
+    const val HINGE_CLOSED_MAX_DEG: Double = 30.0
+    const val HINGE_HALF_MAX_DEG: Double = 150.0
     const val COUNTER_CHECK_SKIPPED = "계수 검증 생략(비정상 종료)"
     const val COUNTER_MISMATCH_PREFIX = "계수 불일치: "
     const val COUNTER_OK = "계수 보존식: 이상 없음"
@@ -310,8 +351,11 @@ object V0bReport {
             device = "${h.deviceModel}, Android ${h.osVersion}",
             algorithmVersion = h.algorithmVersion,
             camera = cameraLine(h),
+            cameraIdLine = h.cameraId?.let { id -> "id $id (${h.lensFacing ?: "?"})" } ?: "",
+            foldLine = foldLine(h, raws),
             preset = presetLine(h),
             gapThresholdMs = h.frameGapThresholdMs,
+            longGapThresholdMs = h.frameLongGapThresholdMs,
             endReason = end?.reason?.name ?: "없음 (session_end 줄 없음)",
             sessionLengthS = lengthMs / 1000.0,
             records = records.size,
@@ -321,6 +365,7 @@ object V0bReport {
             processedFps = all.processedFps,
             gapsOver80Ms = records.sumOf { it.gapsOver80Ms.toLong() },
             gapsOverThreshold = all.gapsOverThreshold,
+            gapsOverLongThreshold = all.gapsOverLongThreshold,
             maxFrameGapMs = all.maxFrameGapMs,
             faceInferMsMean = all.faceInferMsMean,
             faceInferMsP95OfSecondMeans = all.faceInferMsP95OfSecondMeans,
@@ -343,12 +388,14 @@ object V0bReport {
         val warmup = rowStats(ROW_WARMUP, rows.filter { it.warmup })
         val transition = rowStats(ROW_TRANSITION, rows.filter { !it.warmup && it.transition })
         val pass = V0bPass(
-            preset = h.capturePreset ?: "(프리셋 없음)",
+            preset = h.capturePreset ?: "(없음)",
             offSeconds = off.seconds,
             fpsMin = V0bPass.FPS_MIN_EVERY_FRAME / h.frameProcessDivisor,
             processedFps = off.processedFps,
             gapRatio = off.gapRatio,
             dropRatio = off.frames.dropRatio,
+            longGaps = off.gapsOverLongThreshold,
+            longGapThresholdMs = h.frameLongGapThresholdMs,
             offMeanPowerMw = off.meanPowerMw,
             offMaxThermalStatus = off.maxThermalStatus,
         )
@@ -364,12 +411,14 @@ object V0bReport {
             groups.getValue(label).add(row.s to row.r)
         }
         val segments = order.map { label -> segment(label, groups.getValue(label)) }
+        val trendWindowMs = trendWindowMs(rows, h.tStartMonoMs)
         return V0bSummary(
             overall = overall,
             rows = listOf(off, on, warmup, transition),
             pass = pass,
             screenSegments = screenSegments(rows, h.tStartMonoMs),
-            trend = trend(rows, h.tStartMonoMs),
+            trendWindowS = trendWindowMs / 1000L,
+            trend = trend(rows, h.tStartMonoMs, trendWindowMs),
             segments = segments,
             notes = notes,
             stop = stop,
@@ -394,40 +443,56 @@ object V0bReport {
         }
     }
 
+    /** Weighted mean / p95 of per-second means / max of per-second max, accumulated over rows. */
+    private class StageAcc {
+        val means = ArrayList<Double>()
+        var weighted = 0.0
+        var n = 0L
+        var max: Double? = null
+        fun add(mean: Double?, max: Double?, weight: Int) {
+            if (mean != null && weight > 0) {
+                means.add(mean)
+                weighted += mean * weight
+                n += weight
+            }
+            max?.let { this.max = maxOf(this.max ?: it, it) }
+        }
+        fun stat(): StageStat = StageStat(if (n > 0) weighted / n else null, Stats.percentileNearestRankOf(means, 0.95), max)
+    }
+
     private fun rowStats(name: String, rows: List<Row>): V0bRow {
         val secs = rows.map { it.s }
         val raws = rows.mapNotNull { it.r }
         val frames = FrameCounts.of(rows.map { it.s to it.r })
-        val faceMeans = ArrayList<Double>(); var faceW = 0.0; var faceN = 0L; var faceMax: Double? = null
-        val totalMeans = ArrayList<Double>(); var totalW = 0.0; var totalN = 0L; var totalMax: Double? = null
-        var wrapW = 0.0; var postW = 0.0
-        var sceneW = 0.0; var sceneN = 0L
-        val copyMeans = ArrayList<Double>(); var copyW = 0.0; var copyN = 0L; var copyMax: Double? = null
-        var poseW = 0.0; var poseN = 0L; var poseMax: Double? = null; var waitW = 0.0
+        val face = StageAcc(); val total = StageAcc(); val wrap = StageAcc(); val post = StageAcc(); val scene = StageAcc()
+        val enqueue = StageAcc(); val copy = StageAcc(); val pose = StageAcc()
+        var waitW = 0.0; var waitN = 0L
         val currents = ArrayList<Double>(); val powers = ArrayList<Double>()
         var thermal: Int? = null
+        val causes = LongArray(V0bRawRecord.GAP_CAUSE_ORDER.size)
         for (row in rows) {
             val s = row.s
             val r = row.r ?: continue
-            r.faceInferMsMean?.let { faceMeans.add(it); faceW += it * s.framesProcessed; faceN += s.framesProcessed }
-            r.faceInferMsMax?.let { faceMax = maxOf(faceMax ?: it, it) }
-            r.frameTotalMsMean?.let { totalMeans.add(it); totalW += it * s.framesSampleApplied; totalN += s.framesSampleApplied }
-            r.frameTotalMsMax?.let { totalMax = maxOf(totalMax ?: it, it) }
-            r.stageWrapMsMean?.let { wrapW += it * s.framesSampleApplied }
-            r.stageFacePostMsMean?.let { postW += it * s.framesSampleApplied }
-            r.stageSceneMsMean?.let { sceneW += it * r.sceneSamples; sceneN += r.sceneSamples }
-            r.poseFrameCopyMsMean?.let { copyMeans.add(it); copyW += it * r.poseRequested; copyN += r.poseRequested }
-            r.poseFrameCopyMsMax?.let { copyMax = maxOf(copyMax ?: it, it) }
-            r.poseInferMsMean?.let { poseW += it * r.poseSamples; poseN += r.poseSamples }
-            r.poseInferMsMax?.let { poseMax = maxOf(poseMax ?: it, it) }
-            r.poseWaitMsMean?.let { waitW += it * r.poseSamples }
+            face.add(r.faceInferMsMean, r.faceInferMsMax, s.framesProcessed)
+            total.add(r.frameTotalMsMean, r.frameTotalMsMax, s.framesSampleApplied)
+            wrap.add(r.stageWrapMsMean, r.stageWrapMsMax, s.framesSampleApplied)
+            post.add(r.stageFacePostMsMean, r.stageFacePostMsMax, s.framesSampleApplied)
+            scene.add(r.stageSceneMsMean, r.stageSceneMsMax, r.sceneSamples)
+            enqueue.add(r.stageEnqueueMsMean, r.stageEnqueueMsMax, s.framesSampleApplied)
+            copy.add(r.poseFrameCopyMsMean, r.poseFrameCopyMsMax, r.poseRequested)
+            pose.add(r.poseInferMsMean, r.poseInferMsMax, r.poseSamples)
+            r.poseWaitMsMean?.let { waitW += it * r.poseSamples; waitN += r.poseSamples }
             r.batteryCurrentUa?.let { i ->
                 currents.add(i.toDouble())
                 r.batteryVoltageMv?.let { v -> powers.add(abs(i.toDouble()) * v / 1_000_000.0) }
             }
             thermal = maxOf(thermal ?: r.thermalStatus, r.thermalStatus)
+            var i = 0
+            for ((_, c) in r.gapCauses) causes[i++] += c
         }
         val gaps = secs.sumOf { it.gapsOverThreshold.toLong() }
+        val causeMap = LinkedHashMap<String, Long>()
+        V0bRawRecord.GAP_CAUSE_ORDER.forEachIndexed { i, k -> causeMap[k] = causes[i] }
         return V0bRow(
             name = name,
             seconds = secs.size,
@@ -435,22 +500,18 @@ object V0bReport {
             processedFps = if (secs.isNotEmpty()) frames.processed.toDouble() / secs.size else null,
             gapsOverThreshold = gaps,
             gapRatio = if (frames.processed > 0) gaps.toDouble() / frames.processed else null,
+            gapsOverLongThreshold = secs.sumOf { it.gapsOverLongThreshold.toLong() },
             maxFrameGapMs = secs.mapNotNull { it.maxFrameGapMs }.maxOrNull(),
-            faceInferMsMean = if (faceN > 0) faceW / faceN else null,
-            faceInferMsP95OfSecondMeans = Stats.percentileNearestRankOf(faceMeans, 0.95),
-            faceInferMsMax = faceMax,
-            frameTotalMsMean = if (totalN > 0) totalW / totalN else null,
-            frameTotalMsP95OfSecondMeans = Stats.percentileNearestRankOf(totalMeans, 0.95),
-            frameTotalMsMax = totalMax,
-            stageWrapMsMean = if (totalN > 0) wrapW / totalN else null,
-            stageFacePostMsMean = if (totalN > 0) postW / totalN else null,
-            stageSceneMsMean = if (sceneN > 0) sceneW / sceneN else null,
-            poseFrameCopyMsMean = if (copyN > 0) copyW / copyN else null,
-            poseFrameCopyMsP95OfSecondMeans = Stats.percentileNearestRankOf(copyMeans, 0.95),
-            poseFrameCopyMsMax = copyMax,
-            poseInferMsMean = if (poseN > 0) poseW / poseN else null,
-            poseInferMsMax = poseMax,
-            poseWaitMsMean = if (poseN > 0) waitW / poseN else null,
+            gapCauses = causeMap,
+            faceInfer = face.stat(),
+            frameTotal = total.stat(),
+            wrap = wrap.stat(),
+            facePost = post.stat(),
+            scene = scene.stat(),
+            enqueue = enqueue.stat(),
+            poseFrameCopy = copy.stat(),
+            poseInfer = pose.stat(),
+            poseWaitMsMean = if (waitN > 0) waitW / waitN else null,
             pose = PoseCounts.of(raws),
             meanCurrentUa = Stats.meanOf(currents),
             meanPowerMw = Stats.meanOf(powers),
@@ -487,15 +548,30 @@ object V0bReport {
         return out
     }
 
-    private fun trend(rows: List<Row>, tStart: Long): List<TrendRow> {
+    /** 10 s, or the smallest multiple of 10 s that keeps the session within [TREND_MAX_ROWS] rows. */
+    private fun trendWindowMs(rows: List<Row>, tStart: Long): Long {
+        val last = rows.lastOrNull()?.s?.tMonoMs ?: return TREND_WINDOW_MS
+        val spanMs = last - tStart + FocusSchema.RECORD_PERIOD_MS
+        val windows = (spanMs + TREND_WINDOW_MS - 1) / TREND_WINDOW_MS
+        val factor = (windows + TREND_MAX_ROWS - 1) / TREND_MAX_ROWS
+        return TREND_WINDOW_MS * factor.coerceAtLeast(1L)
+    }
+
+    private fun trend(rows: List<Row>, tStart: Long, windowMs: Long): List<TrendRow> {
         val byWindow = LinkedHashMap<Long, ArrayList<Row>>()
-        for (row in rows) byWindow.getOrPut((row.s.tMonoMs - tStart) / TREND_WINDOW_MS) { ArrayList() }.add(row)
+        for (row in rows) byWindow.getOrPut((row.s.tMonoMs - tStart) / windowMs) { ArrayList() }.add(row)
         return byWindow.entries.sortedBy { it.key }.map { (w, list) ->
             val st = rowStats("w", list)
+            val secs = list.map { it.s }
+            val applied = secs.sumOf { it.framesSampleApplied.toLong() }
             TrendRow(
-                startS = w * TREND_WINDOW_MS / 1000L,
+                startS = w * windowMs / 1000L,
                 seconds = list.size,
                 processedFps = st.processedFps,
+                faceDetectRatio = if (applied > 0) secs.sumOf { it.faceDetectRatio * it.framesSampleApplied } / applied else null,
+                yawMean = Stats.meanOf(secs.mapNotNull { it.yawMean }),
+                pitchMean = Stats.meanOf(secs.mapNotNull { it.pitchMean }),
+                rollMean = Stats.meanOf(secs.mapNotNull { it.rollMean }),
                 dropRatio = st.frames.dropRatio,
                 gapsOverThreshold = st.gapsOverThreshold,
                 faceInferMsMean = st.faceInferMsMean,
@@ -506,6 +582,25 @@ object V0bReport {
                 screenOnSeconds = list.count { it.screenOn == true },
             )
         }
+    }
+
+    /** Fold state over the session from the per-second hinge angle (원래 지시문 D 4번). */
+    fun foldLine(h: SessionHeader, raws: List<V0bRawRecord>): String {
+        if (h.foldable == false) return "폴더블 아님"
+        val angles = raws.mapNotNull { it.hingeAngleDeg }
+        if (angles.isEmpty()) return if (h.foldable == true) "접힘 상태 미상 (hinge 값 없음)" else "-"
+        var flat = 0; var half = 0; var closed = 0
+        for (a in angles) when {
+            a < HINGE_CLOSED_MAX_DEG -> closed++
+            a < HINGE_HALF_MAX_DEG -> half++
+            else -> flat++
+        }
+        val n = angles.size.toDouble()
+        val parts = ArrayList<String>()
+        if (flat > 0) parts.add("펼침 ${Stats.pct(flat / n, 0)}")
+        if (half > 0) parts.add("반접힘 ${Stats.pct(half / n, 0)}")
+        if (closed > 0) parts.add("접힘 ${Stats.pct(closed / n, 0)}")
+        return parts.joinToString(", ") + " (hinge 평균 ${Stats.fmt(Stats.meanOf(angles), 0)}°)"
     }
 
     private fun segment(label: String, rows: List<Pair<SecondRecord, V0bRawRecord?>>): V0bSegment {
@@ -565,8 +660,8 @@ object V0bReport {
             } else {
                 for (m in s.stop.mismatches) appendLine(COUNTER_MISMATCH_PREFIX + m)
             }
-            appendLine("focus-engine V0-A/B 요약  세션 ${o.sessionId}")
-            appendLine("기기: ${o.device}  엔진 ${o.algorithmVersion}  카메라 ${o.camera}(CameraX 실제 선택)  프리셋 ${o.preset}")
+            appendLine("focus-engine V0-A/B 요약  세션 ${o.sessionId}  프리셋 ${o.preset}")
+            appendLine("기기: ${o.device}  엔진 ${o.algorithmVersion}  카메라 ${if (o.cameraIdLine.isNotEmpty()) o.cameraIdLine + " " else ""}${o.camera}(CameraX 실제 선택)  접힘 상태: ${o.foldLine}")
             appendLine("종료: ${o.endReason}, 세션 길이 ${f(o.sessionLengthS)}s, 초당 레코드 ${o.records}")
             val fr = o.frames
             appendLine(
@@ -577,7 +672,7 @@ object V0bReport {
                 "드롭 ${fr.dropped} = 백프레셔 ${fr.backpressureDrops} + 미처리(예상 밖) ${fr.unprocessedUnexpected} (Face 추론 오류 ${fr.faceInferenceErrors}, Face 이전 오류 ${fr.preFaceErrors}) " +
                     "+ Face 이후 실패 ${fr.postFaceFailed} + 표본 늦어 폐기 ${fr.sampleLateDropped}; 드롭 비율 ${Stats.pct(fr.dropRatio)} (÷ 요청−건너뜀 ${fr.targeted}), 처리 fps ${f(o.processedFps, 2)}",
             )
-            appendLine("갭 > ${o.gapThresholdMs}ms: ${o.gapsOverThreshold} (80ms 초과 ${o.gapsOver80Ms}), 최대 갭 ${o.maxFrameGapMs?.let { "$it ms" } ?: "-"}")
+            appendLine("갭 > ${o.gapThresholdMs}ms: ${o.gapsOverThreshold} (80ms 초과 ${o.gapsOver80Ms}), 갭 > ${o.longGapThresholdMs}ms: ${o.gapsOverLongThreshold}, 최대 갭 ${o.maxFrameGapMs?.let { "$it ms" } ?: "-"}")
             appendLine("누락된 초: ${o.missingSeconds} (레코드 없는 초 ${o.missingRecords} + 프레임 0인 초 ${o.zeroFrameRecords})")
             appendLine("Face 추론 ms: 평균 ${f(o.faceInferMsMean)}, p95 ${f(o.faceInferMsP95OfSecondMeans)} (초당 평균 기준), 최대 ${f(o.faceInferMsMax)}")
             val p = o.pose
@@ -589,23 +684,29 @@ object V0bReport {
             appendLine("배터리: ${o.batteryStartPct ?: "?"}% → ${o.batteryEndPct ?: "?"}%, 평균 전류 ${f(o.meanCurrentUa, 0)} µA, 추정 평균 전력 ${f(o.meanPowerMw)} mW")
             appendLine("화면 off 행 ${o.screenOffSeconds}, idle 행 ${o.idleSeconds}, timebase 줄 ${o.timebaseLines}")
 
-            appendLine("[비교 통계] 워밍업 ${WARMUP_MS / 1000}s 와 화면 상태 전환 뒤 ${TRANSITION_MS / 1000}s 는 on/off 행에서 제외")
-            appendLine("행 | 초 | fps | 드롭%(백프레셔/미처리/Face후/늦음) | 갭>${o.gapThresholdMs}ms % | Face ms 평균/p95/최대 | 사이클 ms 평균/p95/최대 | wrap/post/scene ms | pose copy 평균/p95/최대 | Pose ms 평균/최대 대기 | mA | mW | thermal")
+            fun st(x: StageStat, d: Int = 1): String = "${f(x.mean, d)}/${f(x.p95OfSecondMeans, d)}/${f(x.max, d)}"
+            appendLine("[비교 통계] 워밍업 ${WARMUP_MS / 1000}s 와 화면 상태 전환 뒤 ${TRANSITION_MS / 1000}s 는 on/off 행에서 제외; ms 는 평균/p95(초당 평균 기준)/최대")
+            appendLine("행 | 초 | fps | 드롭%(백프레셔/미처리/Face후/늦음) | 갭>${o.gapThresholdMs}ms %(수) | 갭>${o.longGapThresholdMs}ms | 최대 갭 | Face ms | 사이클 ms | mA | mW | thermal")
             for (r in s.rows) {
                 val rf = r.frames
                 appendLine(
                     "${r.name} | ${r.seconds} | ${f(r.processedFps, 2)} | ${Stats.pct(rf.dropRatio)} (${rf.backpressureDrops}/${rf.unprocessedUnexpected}/${rf.postFaceFailed}/${rf.sampleLateDropped}) | " +
-                        "${Stats.pct(r.gapRatio, 2)} (${r.gapsOverThreshold}) | ${f(r.faceInferMsMean)}/${f(r.faceInferMsP95OfSecondMeans)}/${f(r.faceInferMsMax)} | " +
-                        "${f(r.frameTotalMsMean)}/${f(r.frameTotalMsP95OfSecondMeans)}/${f(r.frameTotalMsMax)} | ${f(r.stageWrapMsMean, 2)}/${f(r.stageFacePostMsMean, 2)}/${f(r.stageSceneMsMean, 2)} | " +
-                        "${f(r.poseFrameCopyMsMean, 2)}/${f(r.poseFrameCopyMsP95OfSecondMeans, 2)}/${f(r.poseFrameCopyMsMax, 2)} | ${f(r.poseInferMsMean)}/${f(r.poseInferMsMax)} 대기 ${f(r.poseWaitMsMean)} | " +
+                        "${Stats.pct(r.gapRatio, 2)} (${r.gapsOverThreshold}) | ${r.gapsOverLongThreshold} | ${r.maxFrameGapMs?.let { "$it ms" } ?: "-"} | ${st(r.faceInfer)} | ${st(r.frameTotal)} | " +
                         "${mA(r.meanCurrentUa)} | ${f(r.meanPowerMw, 0)} | ${r.maxThermalStatus ?: "-"}",
                 )
+                appendLine(
+                    "    단계 ms: 변환·전처리 ${st(r.wrap, 2)}  face_post ${st(r.facePost, 2)}  scene ${st(r.scene, 2)}  큐 적재 ${st(r.enqueue, 3)}  Pose 복사 ${st(r.poseFrameCopy, 2)}  " +
+                        "Pose 추론 ${st(r.poseInfer)} 대기 ${f(r.poseWaitMsMean)}",
+                )
+                val causes = r.topGapCauses
+                appendLine("    갭>${o.gapThresholdMs}ms 원인: " + if (causes.isEmpty()) "없음" else causes.joinToString(", ") { (k, v) -> "$k $v" })
             }
             val ps = s.pass
             val verdict = when (ps.pass) { true -> "합격"; false -> "불합격"; null -> "판정 불가(화면 off 행 없음)" }
             appendLine(
                 "합격(프리셋 ${ps.preset}, 화면 off 행 기준): $verdict — fps ${f(ps.processedFps, 2)} ≥ ${f(ps.fpsMin, 2)} ${ok(ps.fpsOk)}, " +
-                    "갭 초과 ${Stats.pct(ps.gapRatio, 2)} < 1% ${ok(ps.gapOk)}, 드롭 ${Stats.pct(ps.dropRatio, 2)} < 1% ${ok(ps.dropOk)} · " +
+                    "갭 초과 ${Stats.pct(ps.gapRatio, 2)} < 1% ${ok(ps.gapOk)}, 드롭 ${Stats.pct(ps.dropRatio, 2)} < 1% ${ok(ps.dropOk)}, " +
+                    "${ps.longGapThresholdMs}ms 초과 갭 ${ps.longGaps} = 0 ${ok(ps.longGapOk)} · " +
                     "화면 off 평균 전력 ${f(ps.offMeanPowerMw, 0)} mW, 최고 thermal ${ps.offMaxThermalStatus?.let { "$it (${thermalName(it)})" } ?: "-"}",
             )
 
@@ -614,9 +715,12 @@ object V0bReport {
                 appendLine("${g.startS}-${g.endS} | ${if (g.screenOn) "on" else "off"} | ${g.seconds}(${g.excludedSeconds}) | ${f(g.faceInferMsMean)}/${f(g.faceInferMsP95OfSecondMeans)} | ${Stats.pct(g.dropRatio)} | ${f(g.meanPowerMw, 0)}")
             }
 
-            appendLine("[10초 추이] t(s) | 초 | fps | 드롭% | 갭>${o.gapThresholdMs}ms | Face ms | 사이클 ms | Pose ms | thermal | mA | 화면 on 초")
+            appendLine("[${s.trendWindowS}초 추이] t(s) | 초 | fps | face% | yaw/pitch/roll° | 드롭% | 갭>${o.gapThresholdMs}ms | Face ms | 사이클 ms | Pose ms | thermal | mA | 화면 on 초")
             for (t in s.trend) {
-                appendLine("${t.startS} | ${t.seconds} | ${f(t.processedFps, 1)} | ${Stats.pct(t.dropRatio)} | ${t.gapsOverThreshold} | ${f(t.faceInferMsMean)} | ${f(t.frameTotalMsMean)} | ${f(t.poseInferMsMean)} | ${t.maxThermalStatus ?: "-"} | ${mA(t.meanCurrentUa)} | ${t.screenOnSeconds}")
+                appendLine(
+                    "${t.startS} | ${t.seconds} | ${f(t.processedFps, 1)} | ${Stats.pct(t.faceDetectRatio, 0)} | ${f(t.yawMean)}/${f(t.pitchMean)}/${f(t.rollMean)} | ${Stats.pct(t.dropRatio)} | ${t.gapsOverThreshold} | " +
+                        "${f(t.faceInferMsMean)} | ${f(t.frameTotalMsMean)} | ${f(t.poseInferMsMean)} | ${t.maxThermalStatus ?: "-"} | ${mA(t.meanCurrentUa)} | ${t.screenOnSeconds}",
+                )
             }
 
             for (g in s.segments) {

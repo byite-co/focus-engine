@@ -39,10 +39,19 @@ data class SessionHeader(
     @SerialName("face_blendshapes") val faceBlendshapes: Boolean? = null,
     /** PerformanceHintManager target for the Face analysis thread (preset G); null when no hint session. */
     @SerialName("perf_hint_target_ms") val perfHintTargetMs: Int? = null,
+    /** Threshold of `gaps_over_long_threshold`: 200 ms for every-frame presets, 5 × expected interval otherwise (417 ms for E at 24 fps). */
+    @SerialName("frame_long_gap_threshold_ms") val frameLongGapThresholdMs: Int = 200,
+    /** Camera2 id of the camera in use; null in older logs. */
+    @SerialName("camera_id") val cameraId: String? = null,
+    /** Lens facing ("FRONT", "BACK", "EXTERNAL"); null in older logs. */
+    @SerialName("lens_facing") val lensFacing: String? = null,
+    /** True when the device exposes a hinge-angle sensor (foldable); false when it does not; null in older logs. */
+    val foldable: Boolean? = null,
 ) {
     init {
         require(frameProcessDivisor >= 1) { "frame_process_divisor must be >= 1" }
         require(frameGapThresholdMs > 0) { "frame_gap_threshold_ms must be positive" }
+        require(frameLongGapThresholdMs >= frameGapThresholdMs) { "frame_long_gap_threshold_ms must not be below frame_gap_threshold_ms" }
         perfHintTargetMs?.let { require(it > 0) { "perf_hint_target_ms must be positive" } }
     }
 

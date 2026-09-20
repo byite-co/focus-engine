@@ -55,12 +55,15 @@ data class CameraFacts(
     val requestedHeight: Int,
     /** Preset id to report: the preset's own id, or "C2" when C fell back to 640×480. */
     val presetId: String,
+    /** "FRONT", "BACK" or "EXTERNAL" (`LENS_FACING`). */
+    val lensFacing: String,
     val nominalFps: Int,
     val fpsSelected: String,
     val fpsAvailable: String,
     val timestampSource: String,
     val stabilization: String,
     val gapThresholdMs: Int,
+    val longGapThresholdMs: Int,
     val perfHint: String,
 )
 
@@ -131,6 +134,8 @@ class CameraPipeline(
     private var faceErrors = 0L
     private var postFaceErrors = 0L
     private var fpsEffective: String? = null
+    /** Duration of the previous frame's final ProcessedFrame post, charged to the next frame's "큐 적재" stage. */
+    private var carriedEnqueueNs = 0L
 
     /** Camera-side facts, set by [bind]; width/height re-confirmed by the first frame. */
     @Volatile var facts: CameraFacts? = null
@@ -266,6 +271,12 @@ class CameraPipeline(
             listener.onEvent("camera_state ${st.type}${if (err != null) " error=${err.code} ${err.cause?.message ?: ""}" else ""}")
         }
         val res = analysis.resolutionInfo?.resolution
+        val lensFacing = when (c2.getCameraCharacteristic(CameraCharacteristics.LENS_FACING)) {
+            CameraMetadata.LENS_FACING_FRONT -> "FRONT"
+            CameraMetadata.LENS_FACING_BACK -> "BACK"
+            CameraMetadata.LENS_FACING_EXTERNAL -> "EXTERNAL"
+            else -> "unknown"
+        }
         facts = CameraFacts(
             cameraId = c2.cameraId,
             width = res?.width ?: choice.size.width,
@@ -273,12 +284,14 @@ class CameraPipeline(
             requestedWidth = choice.size.width,
             requestedHeight = choice.size.height,
             presetId = choice.presetId,
+            lensFacing = lensFacing,
             nominalFps = nominalFps,
             fpsSelected = selected?.let { "[${it.lower},${it.upper}]" } ?: "unset(no [24,24] or [30,30])",
             fpsAvailable = ranges.joinToString(prefix = "[", postfix = "]") { "[${it.lower},${it.upper}]" },
             timestampSource = tb.cameraSourceName,
             stabilization = "video=OFF ois=${if (oisOff) "OFF" else "n/a"}",
             gapThresholdMs = preset.gapThresholdMs(nominalFps),
+            longGapThresholdMs = preset.longGapThresholdMs(nominalFps),
             perfHint = if (hintSession != null) "target ${preset.perfHintTargetMs}ms" else "none",
         )
         return true
@@ -339,7 +352,11 @@ class CameraPipeline(
                 sessionStartMs = tsMs
                 listener.onSessionStart(tsMs, image.width, image.height)
             }
+            var enqueueNs = carriedEnqueueNs
+            carriedEnqueueNs = 0L
+            val tq0 = SystemClock.elapsedRealtimeNanos()
             listener.onFrameReceived(captureNs)
+            enqueueNs += SystemClock.elapsedRealtimeNanos() - tq0
             val fp = face
             val worker = poseWorker
             val rule = skipRule
@@ -385,20 +402,28 @@ class CameraPipeline(
                 }
                 val bucket = (tsMs - sessionStartMs) / 1000L
                 val poseDue = bucket > lastPoseBucket || (!f.detected && captureNs - lastPoseNs >= POSE_FAST_PERIOD_NS)
+                var poseCopyMs: Double? = null
                 if (poseDue) {
                     val submitted = worker.submit(frame, tsMs)
                     if (submitted != null) {
                         lastPoseBucket = bucket
                         lastPoseNs = captureNs
+                        poseCopyMs = submitted.copyMs
+                        val tq1 = SystemClock.elapsedRealtimeNanos()
                         submitted.supersededCaptureNs?.let { listener.onPoseSuperseded(it) }
                         listener.onPoseRequested(captureNs, submitted.copyMs)
+                        enqueueNs += SystemClock.elapsedRealtimeNanos() - tq1
                     }
                 }
+                var sceneMs: Double? = null
                 if (bucket > lastSceneBucket) {
                     lastSceneBucket = bucket
                     val t0 = SystemClock.elapsedRealtimeNanos()
                     val st = scene.process(frame)
-                    listener.onScene(SceneSample(captureNs, st.lumaMean, st.tileTextureMin, st.tileTextureMedian, computeMs = (SystemClock.elapsedRealtimeNanos() - t0) / 1e6))
+                    val tq2 = SystemClock.elapsedRealtimeNanos()
+                    sceneMs = (tq2 - t0) / 1e6
+                    listener.onScene(SceneSample(captureNs, st.lumaMean, st.tileTextureMin, st.tileTextureMedian, computeMs = sceneMs))
+                    enqueueNs += SystemClock.elapsedRealtimeNanos() - tq2
                 }
                 sample = FrameSample(
                     captureMonoNs = captureNs,
@@ -408,6 +433,9 @@ class CameraPipeline(
                     faceWidthPx = f.faceWidthPx, jitterJ = f.jitterJ,
                     wrapMs = wrapMs,
                     facePostMs = f.postMs,
+                    sceneMs = sceneMs,
+                    poseCopyMs = poseCopyMs,
+                    enqueueMs = enqueueNs / 1e6,
                 )
             } catch (t: Throwable) {
                 postFaceErrors++
@@ -415,7 +443,9 @@ class CameraPipeline(
                 sample = null
             }
             val totalNs = SystemClock.elapsedRealtimeNanos() - entryNs
+            val tq3 = SystemClock.elapsedRealtimeNanos()
             listener.onFrameProcessed(ProcessedFrame(captureNs, inference.inferMs, sample?.copy(totalMs = totalNs / 1e6)))
+            carriedEnqueueNs = SystemClock.elapsedRealtimeNanos() - tq3
             hintSession?.let { s ->
                 s.reportActualWorkDuration(totalNs)
                 hintReports++

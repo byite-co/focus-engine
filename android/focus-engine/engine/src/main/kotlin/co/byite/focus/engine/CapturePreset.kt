@@ -49,9 +49,17 @@ enum class CapturePreset(
     fun gapThresholdMs(nominalFps: Int): Int =
         if (frameProcessDivisor == 1) EVERY_FRAME_GAP_THRESHOLD_MS else (2.0 * frameProcessDivisor * 1000.0 / nominalFps).roundToInt()
 
+    /**
+     * `gaps_over_long_threshold` threshold (원래 지시문 D 1번 "200ms 초과 갭 0"): 200 ms when Face runs on every frame,
+     * otherwise five times the expected interval (E at 24 fps: 5 × 83.3 ms → 417 ms).
+     */
+    fun longGapThresholdMs(nominalFps: Int): Int =
+        if (frameProcessDivisor == 1) EVERY_FRAME_LONG_GAP_THRESHOLD_MS else (5.0 * frameProcessDivisor * 1000.0 / nominalFps).roundToInt()
+
     companion object {
         const val PERF_HINT_TARGET_MS: Int = PERF_HINT_TARGET_MS_G
         const val EVERY_FRAME_GAP_THRESHOLD_MS: Int = 80
+        const val EVERY_FRAME_LONG_GAP_THRESHOLD_MS: Int = 200
 
         val DEFAULT: CapturePreset = A
 

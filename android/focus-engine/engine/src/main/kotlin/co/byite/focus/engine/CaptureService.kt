@@ -288,7 +288,11 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
         timebase = tb
         startMonoMs = captureMonoMs
         startUtcMs = System.currentTimeMillis() - (SystemClock.elapsedRealtime() - captureMonoMs)
-        val agg = FeatureAggregator(startMonoMs, startUtcMs, gapThresholdNs = facts.gapThresholdMs * FeatureAggregator.NS_PER_MS)
+        val agg = FeatureAggregator(
+            startMonoMs, startUtcMs,
+            gapThresholdNs = facts.gapThresholdMs * FeatureAggregator.NS_PER_MS,
+            longGapThresholdNs = facts.longGapThresholdMs * FeatureAggregator.NS_PER_MS,
+        )
         aggregator = agg
         for (t in pendingRequested) agg.onFrameRequested(t)
         pendingRequested.clear()
@@ -314,6 +318,10 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
             faceDelegate = preset.faceDelegate.name,
             faceBlendshapes = preset.faceBlendshapes,
             perfHintTargetMs = if (facts.perfHint != "none") preset.perfHintTargetMs else null,
+            frameLongGapThresholdMs = facts.longGapThresholdMs,
+            cameraId = facts.cameraId,
+            lensFacing = facts.lensFacing,
+            foldable = device.foldable,
         )
         header = h
         logger?.writeHeader(h)
@@ -326,10 +334,12 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
         val mp = MotionPipeline(this, sh, tb) { s -> ag.post { aggregator?.onImu(s) } }
         motion = mp
         val imuOk = mp.start()
+        val hingeOk = device.startHingeMonitor(sh)
         sh.post(statusTick)
         event(
             "session_start id=${h.sessionId} t_start_mono_ms=$startMonoMs ${h.cameraResolution} (${h.cameraAspectRatio}) nominal_fps=${facts.nominalFps} preset=${h.capturePreset} " +
                 "divisor=${h.frameProcessDivisor} gap_threshold_ms=${h.frameGapThresholdMs} face=${h.faceDelegate} blendshapes=${h.faceBlendshapes} perf_hint_ms=${h.perfHintTargetMs} " +
+                "camera_id=${h.cameraId} lens=${h.lensFacing} foldable=${h.foldable} hinge_sensor=$hingeOk long_gap_threshold_ms=${h.frameLongGapThresholdMs} " +
                 "ts_source=${tb.cameraSourceName} imu=$imuOk engine=${BuildConfig.GIT_SHA} battery_opt_ignored=${device.isIgnoringBatteryOptimizations()}",
         )
         scheduleTick()
@@ -428,6 +438,7 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
                 var fence = 0L
                 runOn(mainHandler, 5_000L) {
                     motion?.stop()
+                    device.stopHingeMonitor()
                     camera?.unbind()
                     fence = SystemClock.elapsedRealtime()
                 }
@@ -611,6 +622,7 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
             // recovered summary skips the counter check.
             stopping = true
             motion?.stop()
+            device.stopHingeMonitor()
             camera?.unbind()
             runOn(aggHandler, 4_000L) {
                 closeBuckets(SystemClock.elapsedRealtime(), finishing = true)

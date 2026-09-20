@@ -61,11 +61,17 @@ class FeatureAggregator(
     private val closeDelayMs: Long = DEFAULT_CLOSE_DELAY_MS,
     /** Preset gap threshold counted in `gaps_over_threshold` (80 ms for every-frame presets, 2 × expected interval otherwise). */
     private val gapThresholdNs: Long = DEFAULT_GAP_THRESHOLD_NS,
+    /** Preset long-gap threshold counted in `gaps_over_long_threshold` (200 ms for every-frame presets, 5 × expected interval otherwise). */
+    private val longGapThresholdNs: Long = DEFAULT_LONG_GAP_THRESHOLD_NS,
 ) {
     init {
         require(closeDelayMs >= 0) { "closeDelayMs must not be negative" }
         require(gapThresholdNs > 0) { "gapThresholdNs must be positive" }
+        require(longGapThresholdNs >= gapThresholdNs) { "longGapThresholdNs must not be below gapThresholdNs" }
     }
+
+    /** Stage times of the last processed frame, kept to name the cause of the next over-threshold gap. */
+    private class PrevCycle(val faceInferMs: Double, val sample: FrameSample?)
 
     private class Bucket {
         var requested = 0
@@ -87,13 +93,16 @@ class FeatureAggregator(
         var jitterN = 0
         val faceInferMs = ArrayList<Double>()
         var latencySumNs = 0L
-        var wrapSum = 0.0
-        var facePostSum = 0.0
+        val wrapMs = ArrayList<Double>()
+        val facePostMs = ArrayList<Double>()
+        val enqueueMs = ArrayList<Double>()
         val totalMs = ArrayList<Double>()
         var maxGapNs = 0L
         var gapCount = 0
         var gapsOver80 = 0
         var gapsOverThreshold = 0
+        var gapsOverLong = 0
+        val gapCauses = IntArray(6)
         val poses = ArrayList<PoseSample>()
         var poseRequested = 0
         var poseSuperseded = 0
@@ -118,6 +127,7 @@ class FeatureAggregator(
     private val open = HashMap<Long, Bucket>()
     private var nextToClose = 0L
     private var lastProcessedNs = Long.MIN_VALUE
+    private var prevCycle: PrevCycle? = null
     private var captureResultsSeen = false
     private var lastSceneLuma: Double? = null
     private val recentPoses = ArrayList<PoseSample>()
@@ -230,10 +240,17 @@ class FeatureAggregator(
                 b.gapCount++
                 if (gap > b.maxGapNs) b.maxGapNs = gap
                 if (gap > GAP_80MS_NS) b.gapsOver80++
-                if (gap > gapThresholdNs) b.gapsOverThreshold++
+                if (gap > gapThresholdNs) {
+                    b.gapsOverThreshold++
+                    b.gapCauses[gapCause(prevCycle)]++
+                }
+                if (gap > longGapThresholdNs) b.gapsOverLong++
             }
         }
-        if (frame.captureMonoNs > lastProcessedNs) lastProcessedNs = frame.captureMonoNs
+        if (frame.captureMonoNs > lastProcessedNs) {
+            lastProcessedNs = frame.captureMonoNs
+            prevCycle = PrevCycle(frame.faceInferMs, frame.sample)
+        }
         val sample = frame.sample ?: return
         if (late) {
             b.sampleLateDropped++
@@ -243,8 +260,9 @@ class FeatureAggregator(
         b.sampleApplied++
         tSampleApplied++
         b.latencySumNs += sample.latencyNs
-        b.wrapSum += sample.wrapMs
-        b.facePostSum += sample.facePostMs
+        b.wrapMs.add(sample.wrapMs)
+        b.facePostMs.add(sample.facePostMs)
+        b.enqueueMs.add(sample.enqueueMs)
         b.totalMs.add(sample.totalMs)
         if (sample.faceDetected) {
             b.faceFrames++
@@ -257,6 +275,22 @@ class FeatureAggregator(
             sample.faceWidthPx?.let { b.widthSum += it; b.widthN++ }
             sample.jitterJ?.let { b.jitterSum += it; b.jitterN++ }
         }
+    }
+
+    /**
+     * Which stage of the previous processed frame's cycle explains a gap over the threshold (원래 지시문 D 2번):
+     * the longest of wrap / Face (inference + post) / scene / pose copy / enqueue when that cycle took at least the
+     * expected frame interval (threshold ÷ 2), i.e. the analyzer was the bottleneck; otherwise "other" (no sample,
+     * or a cycle short enough that the camera or the system must have stalled). Index into [V0bRawRecord.GAP_CAUSE_ORDER].
+     */
+    private fun gapCause(prev: PrevCycle?): Int {
+        val sample = prev?.sample ?: return GAP_CAUSE_OTHER
+        val expectedIntervalMs = gapThresholdNs / 2.0 / NS_PER_MS
+        if (sample.totalMs < expectedIntervalMs) return GAP_CAUSE_OTHER
+        val stages = doubleArrayOf(sample.wrapMs, prev.faceInferMs + sample.facePostMs, sample.sceneMs ?: 0.0, sample.poseCopyMs ?: 0.0, sample.enqueueMs)
+        var best = 0
+        for (i in 1 until stages.size) if (stages[i] > stages[best]) best = i
+        return best
     }
 
     // ---- inputs: pose worker (analysis thread / worker → queue)
@@ -413,9 +447,11 @@ class FeatureAggregator(
             maxFrameGapMs = if (b.gapCount > 0) (b.maxGapNs + NS_PER_MS / 2) / NS_PER_MS else null,
             gapsOver80Ms = b.gapsOver80,
             gapsOverThreshold = b.gapsOverThreshold,
+            gapsOverLongThreshold = b.gapsOverLong,
             powerState = PowerState.P0,
         )
         val poseInfer = b.poses.map { it.poseInferMs }
+        val sceneMs = b.scenes.map { it.computeMs }
         val raw = V0bRawRecord(
             tMonoMs = start,
             segmentLabel = labelAt(start),
@@ -432,9 +468,18 @@ class FeatureAggregator(
             poseInferMsMean = Stats.meanOf(poseInfer),
             poseInferMsMax = poseInfer.maxOrNull(),
             frameLatencyMsMean = if (b.sampleApplied > 0) b.latencySumNs.toDouble() / b.sampleApplied / NS_PER_MS else null,
-            stageWrapMsMean = if (b.sampleApplied > 0) b.wrapSum / b.sampleApplied else null,
-            stageFacePostMsMean = if (b.sampleApplied > 0) b.facePostSum / b.sampleApplied else null,
-            stageSceneMsMean = Stats.meanOf(b.scenes.map { it.computeMs }),
+            stageWrapMsMean = Stats.meanOf(b.wrapMs),
+            stageWrapMsP95 = Stats.percentileNearestRankOf(b.wrapMs, 0.95),
+            stageWrapMsMax = b.wrapMs.maxOrNull(),
+            stageFacePostMsMean = Stats.meanOf(b.facePostMs),
+            stageFacePostMsP95 = Stats.percentileNearestRankOf(b.facePostMs, 0.95),
+            stageFacePostMsMax = b.facePostMs.maxOrNull(),
+            stageSceneMsMean = Stats.meanOf(sceneMs),
+            stageSceneMsP95 = Stats.percentileNearestRankOf(sceneMs, 0.95),
+            stageSceneMsMax = sceneMs.maxOrNull(),
+            stageEnqueueMsMean = Stats.meanOf(b.enqueueMs),
+            stageEnqueueMsP95 = Stats.percentileNearestRankOf(b.enqueueMs, 0.95),
+            stageEnqueueMsMax = b.enqueueMs.maxOrNull(),
             poseFrameCopyMsMean = Stats.meanOf(b.poseCopyMs),
             poseFrameCopyMsP95 = Stats.percentileNearestRankOf(b.poseCopyMs, 0.95),
             poseFrameCopyMsMax = b.poseCopyMs.maxOrNull(),
@@ -442,6 +487,13 @@ class FeatureAggregator(
             frameTotalMsP95 = Stats.percentileNearestRankOf(b.totalMs, 0.95),
             frameTotalMsMax = b.totalMs.maxOrNull(),
             poseWaitMsMean = if (b.poses.isNotEmpty()) b.poseWaitSum / b.poses.size else null,
+            poseInferMsP95 = Stats.percentileNearestRankOf(poseInfer, 0.95),
+            gapCauseWrap = b.gapCauses[GAP_CAUSE_WRAP],
+            gapCauseFace = b.gapCauses[GAP_CAUSE_FACE],
+            gapCauseScene = b.gapCauses[GAP_CAUSE_SCENE],
+            gapCausePoseCopy = b.gapCauses[GAP_CAUSE_POSE_COPY],
+            gapCauseEnqueue = b.gapCauses[GAP_CAUSE_ENQUEUE],
+            gapCauseOther = b.gapCauses[GAP_CAUSE_OTHER],
             poseRequested = b.poseRequested,
             poseCompleted = b.poseCompleted,
             poseApplied = b.poses.size,
@@ -461,6 +513,7 @@ class FeatureAggregator(
             batteryVoltageMv = device.batteryVoltageMv,
             isInteractive = device.isInteractive,
             isDeviceIdle = device.isDeviceIdle,
+            hingeAngleDeg = device.hingeAngleDeg,
         )
         return AggregatedSecond(second, raw)
     }
@@ -546,6 +599,17 @@ class FeatureAggregator(
 
         /** Default preset threshold (every-frame presets). */
         const val DEFAULT_GAP_THRESHOLD_NS: Long = GAP_80MS_NS
+
+        /** Default long-gap threshold (every-frame presets): 200 ms, must be 0 for the pass mark. */
+        const val DEFAULT_LONG_GAP_THRESHOLD_NS: Long = 200_000_000L
+
+        // gap-cause indices, same order as V0bRawRecord.GAP_CAUSE_ORDER
+        private const val GAP_CAUSE_WRAP = 0
+        private const val GAP_CAUSE_FACE = 1
+        private const val GAP_CAUSE_SCENE = 2
+        private const val GAP_CAUSE_POSE_COPY = 3
+        private const val GAP_CAUSE_ENQUEUE = 4
+        private const val GAP_CAUSE_OTHER = 5
 
         /** `pose_motion` reference window: newest sample at least 0.9 s older, at most 3 s older. */
         const val POSE_REFERENCE_MIN_AGE_NS: Long = 900_000_000L

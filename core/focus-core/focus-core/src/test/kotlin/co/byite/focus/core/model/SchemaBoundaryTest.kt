@@ -77,7 +77,7 @@ class SchemaBoundaryTest {
             "imu_state", "screen_state", "app_state",
             // 0.2.1 counters + 0.2.3 additions (CHANGELOG v0.2.3): received / skipped / applied / late-dropped, preset gap threshold
             "frames_requested", "frames_processed", "frames_analyzer_received", "frames_skipped_intentional",
-            "frames_sample_applied", "frames_sample_late_dropped", "frames_dropped", "max_frame_gap_ms", "gaps_over_80ms", "gaps_over_threshold",
+            "frames_sample_applied", "frames_sample_late_dropped", "frames_dropped", "max_frame_gap_ms", "gaps_over_80ms", "gaps_over_threshold", "gaps_over_long_threshold",
             "power_state",
         )
         assertEquals(expected, names(SecondRecord.serializer().descriptor))
@@ -92,13 +92,17 @@ class SchemaBoundaryTest {
             "shoulder_center_x", "shoulder_center_y", "shoulder_width", "pose_samples",
             "tile_texture_min", "tile_texture_median", "scene_samples",
             "face_infer_ms_mean", "face_infer_ms_p95", "face_infer_ms_max", "pose_infer_ms_mean", "pose_infer_ms_max", "frame_latency_ms_mean",
-            "stage_wrap_ms_mean", "stage_face_post_ms_mean", "stage_scene_ms_mean",
+            "stage_wrap_ms_mean", "stage_wrap_ms_p95", "stage_wrap_ms_max",
+            "stage_face_post_ms_mean", "stage_face_post_ms_p95", "stage_face_post_ms_max",
+            "stage_scene_ms_mean", "stage_scene_ms_p95", "stage_scene_ms_max",
+            "stage_enqueue_ms_mean", "stage_enqueue_ms_p95", "stage_enqueue_ms_max",
             "pose_frame_copy_ms_mean", "pose_frame_copy_ms_p95", "pose_frame_copy_ms_max",
-            "frame_total_ms_mean", "frame_total_ms_p95", "frame_total_ms_max", "pose_wait_ms_mean",
+            "frame_total_ms_mean", "frame_total_ms_p95", "frame_total_ms_max", "pose_wait_ms_mean", "pose_infer_ms_p95",
+            "gap_cause_wrap", "gap_cause_face", "gap_cause_scene", "gap_cause_pose_copy", "gap_cause_enqueue", "gap_cause_other",
             "pose_requested", "pose_completed", "pose_applied", "pose_superseded", "pose_late_dropped", "pose_errors",
             "face_inference_errors", "pre_face_errors",
             "imu_samples", "accel_x_mean", "accel_y_mean", "accel_z_mean", "accel_variance",
-            "thermal_status", "battery_pct", "battery_current_ua", "battery_voltage_mv", "is_interactive", "is_device_idle",
+            "thermal_status", "battery_pct", "battery_current_ua", "battery_voltage_mv", "is_interactive", "is_device_idle", "hinge_angle_deg",
         )
         val desc = V0bRawRecord.serializer().descriptor
         assertEquals(expected, names(desc))
@@ -127,6 +131,7 @@ class SchemaBoundaryTest {
             "calibration_id", "calibration_snapshot_version", "task_mode",
             // schema 0.2.3 capture preset (CHANGELOG v0.2.3)
             "capture_preset", "frame_process_divisor", "frame_gap_threshold_ms", "face_delegate", "face_blendshapes", "perf_hint_target_ms",
+            "frame_long_gap_threshold_ms", "camera_id", "lens_facing", "foldable",
         )
         assertEquals(expected, names(SessionHeader.serializer().descriptor))
         assertEquals("16:9", SessionHeader.aspectRatioOf("1280x720"))

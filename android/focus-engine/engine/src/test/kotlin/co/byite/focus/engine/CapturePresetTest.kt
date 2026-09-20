@@ -33,6 +33,9 @@ class CapturePresetTest {
         for (p in CapturePreset.entries) if (p.frameProcessDivisor == 1) assertEquals(80, p.gapThresholdMs(24), p.id)
         assertEquals(167, CapturePreset.E.gapThresholdMs(24))
         assertEquals(133, CapturePreset.E.gapThresholdMs(30))
+        for (p in CapturePreset.entries) if (p.frameProcessDivisor == 1) assertEquals(200, p.longGapThresholdMs(24), p.id)
+        assertEquals(417, CapturePreset.E.longGapThresholdMs(24), "5 × 83.3 ms")
+        assertEquals(333, CapturePreset.E.longGapThresholdMs(30))
     }
 
     @Test

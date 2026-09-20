@@ -98,6 +98,11 @@ data class SecondRecord(
      * every-frame presets, 2 × expected interval otherwise). Older logs decode as [gapsOver80Ms].
      */
     @SerialName("gaps_over_threshold") val gapsOverThreshold: Int = gapsOver80Ms,
+    /**
+     * Gaps longer than the session's `frame_long_gap_threshold_ms` (header; 200 ms for every-frame presets, 5 × expected
+     * interval otherwise). The pass mark requires 0 (원래 지시문 D 1번). Older logs decode as 0 (unknown).
+     */
+    @SerialName("gaps_over_long_threshold") val gapsOverLongThreshold: Int = 0,
     @SerialName("power_state") val powerState: PowerState,
 ) {
     init {
@@ -110,7 +115,7 @@ data class SecondRecord(
         require((candidateState == null) == (candidateStartMonoMs == null)) { "candidate_state and candidate_start_mono_ms go together (t=$tMonoMs)" }
         require(headLandmarkPresent || headOffsetBelowShoulderRatio == null) { "head_offset_below_shoulder_ratio needs a head landmark (t=$tMonoMs)" }
         require(framesRequested >= 0 && framesProcessed >= 0 && framesDropped >= 0 && gapsOver80Ms >= 0) { "frame counters must not be negative (t=$tMonoMs)" }
-        require(framesAnalyzerReceived >= 0 && framesSkippedIntentional >= 0 && framesSampleApplied >= 0 && framesSampleLateDropped >= 0 && gapsOverThreshold >= 0) {
+        require(framesAnalyzerReceived >= 0 && framesSkippedIntentional >= 0 && framesSampleApplied >= 0 && framesSampleLateDropped >= 0 && gapsOverThreshold >= 0 && gapsOverLongThreshold >= 0) {
             "frame counters must not be negative (t=$tMonoMs)"
         }
         // The per-second parts below are clamped at 0: a counter that reaches the aggregator after its bucket closed is

@@ -41,13 +41,23 @@ data class V0bRawRecord(
     /** Mean (analyzer callback − capture timestamp) of processed frames. */
     @SerialName("frame_latency_ms_mean") val frameLatencyMsMean: Double? = null,
 
-    // ---- Stage timings on the analysis thread (schema 0.2.3, CHANGELOG v0.2.3; per processed frame unless noted)
-    /** ImageProxy plane → RGBA frame (zero-copy check or row copy). */
+    // ---- Stage timings on the analysis thread (schema 0.2.3, CHANGELOG v0.2.3; per applied sample unless noted; mean, nearest-rank p95, max)
+    /** ImageProxy plane → RGBA frame (zero-copy check or row copy): "변환·전처리". */
     @SerialName("stage_wrap_ms_mean") val stageWrapMsMean: Double? = null,
+    @SerialName("stage_wrap_ms_p95") val stageWrapMsP95: Double? = null,
+    @SerialName("stage_wrap_ms_max") val stageWrapMsMax: Double? = null,
     /** Landmarks / matrix → scalars (head pose, face width, jitter). */
     @SerialName("stage_face_post_ms_mean") val stageFacePostMsMean: Double? = null,
+    @SerialName("stage_face_post_ms_p95") val stageFacePostMsP95: Double? = null,
+    @SerialName("stage_face_post_ms_max") val stageFacePostMsMax: Double? = null,
     /** SceneQuality run, per scene run (1 Hz). */
     @SerialName("stage_scene_ms_mean") val stageSceneMsMean: Double? = null,
+    @SerialName("stage_scene_ms_p95") val stageSceneMsP95: Double? = null,
+    @SerialName("stage_scene_ms_max") val stageSceneMsMax: Double? = null,
+    /** Posting this frame's messages to the aggregation queue ("큐 적재"; the final ProcessedFrame post is charged to the next frame). */
+    @SerialName("stage_enqueue_ms_mean") val stageEnqueueMsMean: Double? = null,
+    @SerialName("stage_enqueue_ms_p95") val stageEnqueueMsP95: Double? = null,
+    @SerialName("stage_enqueue_ms_max") val stageEnqueueMsMax: Double? = null,
     /** Deep copy of the frame for the Pose worker, per pose request. */
     @SerialName("pose_frame_copy_ms_mean") val poseFrameCopyMsMean: Double? = null,
     @SerialName("pose_frame_copy_ms_p95") val poseFrameCopyMsP95: Double? = null,
@@ -58,6 +68,17 @@ data class V0bRawRecord(
     @SerialName("frame_total_ms_max") val frameTotalMsMax: Double? = null,
     /** Pose request → Pose inference start on the worker (queue wait), per completed pose. */
     @SerialName("pose_wait_ms_mean") val poseWaitMsMean: Double? = null,
+    /** Nearest-rank p95 of the Pose Landmarker time of the poses applied to this bucket. */
+    @SerialName("pose_infer_ms_p95") val poseInferMsP95: Double? = null,
+
+    // ---- Cause of every gap over the preset threshold (원래 지시문 D 2번): the longest stage of the previous processed
+    // frame's cycle when that cycle was longer than the expected interval, otherwise "other" (camera / system).
+    @SerialName("gap_cause_wrap") val gapCauseWrap: Int = 0,
+    @SerialName("gap_cause_face") val gapCauseFace: Int = 0,
+    @SerialName("gap_cause_scene") val gapCauseScene: Int = 0,
+    @SerialName("gap_cause_pose_copy") val gapCausePoseCopy: Int = 0,
+    @SerialName("gap_cause_enqueue") val gapCauseEnqueue: Int = 0,
+    @SerialName("gap_cause_other") val gapCauseOther: Int = 0,
 
     // ---- Pose worker counters (schema 0.2.3). Requests and supersessions are attributed by the frame's capture
     // timestamp; completions, applications, errors and late drops by the bucket the result belongs to, or by the oldest
@@ -101,11 +122,31 @@ data class V0bRawRecord(
     @SerialName("battery_voltage_mv") val batteryVoltageMv: Int? = null,
     @SerialName("is_interactive") val isInteractive: Boolean,
     @SerialName("is_device_idle") val isDeviceIdle: Boolean,
+    /** Latest hinge angle (degrees, `TYPE_HINGE_ANGLE`) at bucket close; null when the device has no hinge sensor or no reading yet. */
+    @SerialName("hinge_angle_deg") val hingeAngleDeg: Double? = null,
 ) {
     init {
         require(poseSamples >= 0 && sceneSamples >= 0 && imuSamples >= 0) { "sample counters must not be negative (t=$tMonoMs)" }
         require(poseRequested >= 0 && poseCompleted >= 0 && poseApplied >= 0 && poseSuperseded >= 0 && poseLateDropped >= 0 && poseErrors >= 0) { "pose counters must not be negative (t=$tMonoMs)" }
         require(poseApplied == poseSamples) { "pose_applied must equal pose_samples (t=$tMonoMs)" }
         require(faceInferenceErrors >= 0 && preFaceErrors >= 0) { "error counters must not be negative (t=$tMonoMs)" }
+        require(gapCauseWrap >= 0 && gapCauseFace >= 0 && gapCauseScene >= 0 && gapCausePoseCopy >= 0 && gapCauseEnqueue >= 0 && gapCauseOther >= 0) { "gap causes must not be negative (t=$tMonoMs)" }
+    }
+
+    /** Gap causes as a name → count map in the fixed display order. */
+    val gapCauses: Map<String, Int>
+        get() = linkedMapOf(
+            GAP_CAUSE_WRAP to gapCauseWrap, GAP_CAUSE_FACE to gapCauseFace, GAP_CAUSE_SCENE to gapCauseScene,
+            GAP_CAUSE_POSE_COPY to gapCausePoseCopy, GAP_CAUSE_ENQUEUE to gapCauseEnqueue, GAP_CAUSE_OTHER to gapCauseOther,
+        )
+
+    companion object {
+        const val GAP_CAUSE_WRAP = "변환·전처리"
+        const val GAP_CAUSE_FACE = "Face"
+        const val GAP_CAUSE_SCENE = "scene"
+        const val GAP_CAUSE_POSE_COPY = "Pose 복사"
+        const val GAP_CAUSE_ENQUEUE = "큐 적재"
+        const val GAP_CAUSE_OTHER = "그 외"
+        val GAP_CAUSE_ORDER: List<String> = listOf(GAP_CAUSE_WRAP, GAP_CAUSE_FACE, GAP_CAUSE_SCENE, GAP_CAUSE_POSE_COPY, GAP_CAUSE_ENQUEUE, GAP_CAUSE_OTHER)
     }
 }

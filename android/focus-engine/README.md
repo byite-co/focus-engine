@@ -30,15 +30,17 @@ APK 는 arm64-v8a 만 담는다(실측 기기 기준, `devapp/build.gradle.kts` 
 
 | id | A 와 다른 점 | header |
 |---|---|---|
-| A | 1280x720(16:9), Face CPU, blendshape on, Face 매 프레임 | `frame_process_divisor 1`, `frame_gap_threshold_ms 80` |
+| A | 1280x720(16:9), Face CPU, blendshape on, Face 매 프레임 | `frame_process_divisor 1`, `frame_gap_threshold_ms 80`, `frame_long_gap_threshold_ms 200` |
 | B | blendshape off | `face_blendshapes false` |
 | C | 640x360(16:9) 요청. 기기의 YUV 출력 크기에 640x360 이 없으면 면적이 가장 가까운 16:9 크기, 그것도 없으면 640x480 을 **C2** 로 표시(`PresetResolution.choose`) | `capture_preset C` 또는 `C2` |
 | D | Face GPU delegate(`Delegate.GPU`). 생성 실패는 자가 점검이 잡는다 | `face_delegate GPU` |
-| E | Face 격프레임(24fps → 12fps). `FrameSkipRule`: 마지막 처리 프레임보다 (2 − 0.5)×프레임 주기(62.5ms) 안에 온 프레임을 건너뛴다(capture timestamp 기준이라 카메라가 프레임을 떨어뜨려도 위상이 밀리지 않는다). 건너뛴 프레임은 `frames_skipped_intentional` | `frame_process_divisor 2`, `frame_gap_threshold_ms 167` |
+| E | Face 격프레임(24fps → 12fps). `FrameSkipRule`: 마지막 처리 프레임보다 (2 − 0.5)×프레임 주기(62.5ms) 안에 온 프레임을 건너뛴다(capture timestamp 기준이라 카메라가 프레임을 떨어뜨려도 위상이 밀리지 않는다). 건너뛴 프레임은 `frames_skipped_intentional` | `frame_process_divisor 2`, `frame_gap_threshold_ms 167`, `frame_long_gap_threshold_ms 417` |
 | G | Face 분석 스레드(`focus-analysis`)에만 `PerformanceHintManager` 세션(목표 35ms). 매 Face 사이클(analyzer 콜백 1회: wrap + Face + post + scene + pose copy) 뒤 `reportActualWorkDuration` 으로 실제 처리 시간을 보고한다. Pose 스레드는 세션에 넣지 않고 스레드 우선순위는 바꾸지 않는다. API 31 미만이거나 세션 생성이 null 이면 자가 점검 줄에 남기고 header `perf_hint_target_ms` 는 null | `perf_hint_target_ms 35` |
 | F | ROI 크롭. **이번에 구현하지 않았다**(아래 "프리셋 F") | — |
 
 요약과 header 의 해상도는 요청 해상도가 아니라 CameraX 가 실제로 정한 해상도(`ImageAnalysis.resolutionInfo`, 첫 프레임으로 재확인)이고 종횡비를 같이 표시한다(`1280x720 (16:9)`).
+header 에는 카메라 id(`camera_id`)와 렌즈 방향(`lens_facing`, `LENS_FACING`), 폴더블 여부(`foldable` = `TYPE_HINGE_ANGLE` 센서 존재)도 들어가고, 폴더블이면 `focus-status` 스레드가 hinge 각을 받아 초당 `hinge_angle_deg` 로 남긴다.
+요약은 이를 `카메라 id 1 (FRONT) 1280x720 (16:9) @ 24fps` 와 `접힘 상태: 펼침 100% (hinge 평균 179°)`(< 30° 접힘, < 150° 반접힘, 그 외 펼침)로 보인다.
 events.log 의 `resolution_choice`(요청·사유·기기의 YUV 출력 크기 목록)와 `camera_bound`(실제 선택) 줄로 확인한다.
 
 **프리셋 F(ROI 크롭)를 건너뛴 사유**: 정정 2 의 규칙대로 하면 2D 랜드마크·얼굴 폭·위치 스칼라는 crop 의 위치·크기·배율로 역변환하면 되지만, head pose 는 좌표 변환으로
@@ -55,7 +57,7 @@ events.log 의 `resolution_choice`(요청·사유·기기의 YUV 출력 크기 �
 | `focus-pose` | `PoseWorker`: 대기 슬롯 1 + 실행 중 1, 픽셀 버퍼 2개(밖으로 안 나감, `release` 에서 해제), Pose landmarker 추론 | `PoseSample`, `onPoseError` → aggregation 큐 |
 | `focus-aggregate` | **`FeatureAggregator` 의 유일한 접근자**, 레코드 목록, 1Hz 버킷 닫힘(tick), timebase 줄, 상태 문자열, `FeatureLogger.append`(직렬화 없이 객체만 큐잉) | 레코드 → IO 큐 |
 | `focus-io` (`THREAD_PRIORITY_BACKGROUND`) | JSONL 직렬화 + `session.jsonl` 쓰기(30초 배치), `events.log`, `summary.txt` | — |
-| `focus-status` | 1Hz `DeviceStatusReader.read()`(thermal·배터리·keyguard binder 호출), IMU `SensorEventListener` | `DeviceSample`(최신값), `ImuSample` → aggregation 큐 |
+| `focus-status` | 1Hz `DeviceStatusReader.read()`(thermal·배터리·keyguard binder 호출), IMU `SensorEventListener`, hinge 각 `SensorEventListener`(폴더블) | `DeviceSample`(최신값, hinge 각 포함), `ImuSample` → aggregation 큐 |
 | `focus-stop` | 정상 종료의 `StopSequence` 실행(아래) | — |
 
 분석 스레드에는 추론·스칼라 추출·memcpy 만 남고 파일 IO·직렬화·binder 호출은 없다. 어느 파이프라인도 집계기를 직접 호출하지 않는다(`DataBoundaryTest` 와 별개로 코드 구조로 보장: `CaptureService` 의 Listener 구현은 전부 `aggHandler.post`).
@@ -171,9 +173,12 @@ cd android/focus-engine
 - **프레임 계수**(CHANGELOG v0.2.3 (a); 정의는 `core/focus-core/README.md`): `frames_requested`(CaptureResult), `frames_analyzer_received`(analyzer 콜백), `frames_skipped_intentional`(E 의 건너뜀),
   `frames_processed`(Face 추론이 성공한 직후 확정 — 후처리·Scene·Pose 복사가 실패해도 처리 프레임), `frames_sample_applied`·`frames_sample_late_dropped`. 파생: 백프레셔 = requested − received(KEEP_ONLY_LATEST 가 버린 것),
   미처리(예상 밖) = received − skipped − processed(`face_inference_errors` + `pre_face_errors`(timestamp 역행, wrap 실패, 파이프라인 미준비)), Face 이후 실패 = processed − 반영 − 늦음. `frames_dropped` = 이 넷의 합, 드롭 비율 = ÷ (requested − skipped).
-  capture result 가 한 번도 오지 않은 세션은 requested = received. 갭은 처리 프레임의 capture timestamp 차이(버킷 경계를 넘는 갭은 뒤 프레임의 버킷에): `gaps_over_80ms` 와 프리셋 임계 `gaps_over_threshold`.
-- **단계별 계측**(`v0b_raw`): `stage_wrap_ms_mean`(ImageProxy → RGBA, zero-copy 검사 또는 행 복사), `face_infer_ms_*`(landmarker), `stage_face_post_ms_mean`(HeadPose·폭·j), `stage_scene_ms_mean`(1Hz),
-  `pose_frame_copy_ms_mean/p95/max`(deep copy, ~3.7MB @1280x720), `frame_total_ms_mean/p95/max`(analyzer 콜백 진입부터 aggregation 큐 post 직전까지 = Face 사이클; G 가 보고하는 값), `pose_wait_ms_mean`(요청 → 워커 추론 시작), `pose_infer_ms_*`.
+  capture result 가 한 번도 오지 않은 세션은 requested = received. 갭은 처리 프레임의 capture timestamp 차이(버킷 경계를 넘는 갭은 뒤 프레임의 버킷에): `gaps_over_80ms`, 프리셋 임계 `gaps_over_threshold`(80 / E 167ms), 긴 갭 `gaps_over_long_threshold`(200 / E 417ms; 합격선은 0).
+- **갭 원인**(원래 지시문 2번, `v0b_raw` `gap_cause_*`): 임계를 넘은 갭마다 직전 처리 프레임 사이클의 가장 긴 단계(변환·전처리, Face = 추론 + 후처리, scene, Pose 복사, 큐 적재)를 원인으로 센다.
+  직전 사이클 전체가 기대 간격(임계 ÷ 2)보다 짧았거나 표본이 없으면 분석 스레드 탓이 아니므로 "그 외"(카메라·시스템)로 센다. 요약의 비교 행마다 상위 원인을 적는다.
+- **단계별 계측**(`v0b_raw`, 각 평균·p95·최대): `stage_wrap_ms_*`(변환·전처리: ImageProxy → RGBA, zero-copy 검사 또는 행 복사), `face_infer_ms_*`(landmarker), `stage_face_post_ms_*`(HeadPose·폭·j), `stage_scene_ms_*`(1Hz),
+  `stage_enqueue_ms_*`(큐 적재: 이 프레임의 메시지 post 시간 합; 마지막 `ProcessedFrame` post 는 다음 프레임에 계상), `pose_frame_copy_ms_*`(deep copy, ~3.7MB @1280x720), `frame_total_ms_*`(analyzer 콜백 진입부터 aggregation 큐 post 직전까지 = Face 사이클; G 가 보고하는 값),
+  `pose_wait_ms_mean`(요청 → 워커 추론 시작), `pose_infer_ms_mean/p95/max`.
 - **세션 창**: `t_start_mono_ms` = **첫 수신 프레임의 capture timestamp**(카메라 바인딩 시각이 아니다). 버킷은 여기에 정렬한 `[t, t+1000)` 이고 버킷 끝 + 300ms 뒤에 닫아 늦게 오는 입력을 기다린다.
   첫 프레임 전에 온 capture result 는 보관했다가 세션 시작 뒤에 넣되 timestamp 가 시작 전이면 계수에서 뺀다; 정지 fence 이후 timestamp 의 입력도 뺀다(`inputsBeforeStart`/`inputsAfterFence`, 요약 ※ 줄).
   프레임이 없는 초도 레코드를 남긴다(`frames_processed 0`). 첫 버킷은 항상 scene 표본을 가지므로 `scene_luma` 는 언제나 측정값이다.
@@ -270,11 +275,13 @@ summary.txt     정지 시 요약. 서비스가 죽었으면 다음 실행 때 J
   프리셋 임계 초과 갭(참고로 80ms 초과), 최대 갭, 누락된 초(= 레코드 없는 초 + 프레임 0인 초), Face 추론 ms(평균 = 프레임 가중 평균, p95 = **초당 평균값의** nearest-rank p95,
   최대 = 초당 최댓값의 최대), Pose 계수(요청·대기 중 교체·완료(반영·늦어 폐기)·오류·종료 시 취소)와 추론 ms, 최고 thermal status, 배터리 % 시작→끝, 평균 전류(µA, 원값 부호),
   추정 평균 전력(mW = |전류 µA| × 전압 mV ÷ 10⁶ 의 초 평균), 화면 off 행, idle 행.
-- **[비교 통계]** 세션 시작 뒤 60초(워밍업)와 화면 상태가 바뀐 직후 5초(전환)를 뺀 초를 **화면 off 행**과 **화면 on 행**으로 나누고, 워밍업·전환은 각각 한 행으로 따로 보인다.
-  열: 초, fps, 드롭%(백프레셔/미처리/Face후/늦음), 갭>임계 %(= gaps_over_threshold ÷ 처리 프레임), Face ms 평균/p95/최대, 사이클 ms 평균/p95/최대, wrap/post/scene ms, pose copy 평균/p95/최대, Pose ms 평균/최대·대기, mA, mW, thermal.
-- **합격(프리셋 X, 화면 off 행 기준)**: 처리 fps ≥ 23.5 ÷ divisor(E 는 11.75), 갭 초과 비율 < 1%, 드롭 비율 < 1% 를 모두 만족하면 합격. 옆에 화면 off 평균 전력(mW)과 그 행의 최고 thermal 을 같이 적는다 — G 는 성능과 전력·발열을 함께 본다. off 행이 없으면 "판정 불가".
+- **[비교 통계]** 세션 시작 뒤 60초(워밍업)와 화면 상태가 바뀐 직후 5초(전환)를 뺀 초를 **화면 off 행**과 **화면 on 행**으로 나누고, 워밍업·전환은 각각 한 행으로 따로 보인다. 행마다 세 줄:
+  (1) 초, fps, 드롭%(백프레셔/미처리/Face후/늦음), 갭>임계 %(= gaps_over_threshold ÷ 처리 프레임)와 수, 갭>긴 임계 수, 최대 갭, Face ms 평균/p95/최대, 사이클 ms 평균/p95/최대, mA, mW, thermal;
+  (2) 단계 ms(각 평균/p95/최대): 변환·전처리, face_post, scene, 큐 적재, Pose 복사, Pose 추론(+ 대기 평균);
+  (3) 갭>임계 원인: 많은 순서(예: `Face 5, 그 외 3, scene 1`). p95 는 초당 평균값의 nearest-rank p95, 최대는 초당 최댓값의 최대.
+- **합격(프리셋 X, 화면 off 행 기준)**: 처리 fps ≥ 23.5 ÷ divisor(E 는 11.75), 갭 초과 비율 < 1%, 드롭 비율 < 1%, 긴 갭(200ms, E 417ms) 0 을 모두 만족하면 합격. 옆에 화면 off 평균 전력(mW)과 그 행의 최고 thermal 을 같이 적는다 — G 는 성능과 전력·발열을 함께 본다. off 행이 없으면 "판정 불가".
 - **[화면 상태 구간]** 연속 on/off 구간마다 시작·끝(세션 시작 기준 초), 상태, 초(괄호 안은 워밍업·전환으로 제외한 초), Face ms 평균/p95, 드롭%, mW.
-- **[10초 추이]** 10초 창마다 초 수, fps, 드롭%, 갭>임계 수, Face ms, 사이클 ms, Pose ms, thermal, mA, 화면 on 초.
+- **[N초 추이]** 10초 창마다 초 수, 처리 fps, face 비율, yaw/pitch/roll 평균, 드롭%, 갭>임계 수, Face ms, 사이클 ms, Pose ms, thermal, mA, 화면 on 초. 60행을 넘으면 창을 10초 단위로 늘린다(30분 세션 → 30초 창 60행).
 - 마커별: 길이(초), face_detect_ratio(반영 표본 가중), yaw·pitch·roll 평균 ± 표준편차(초당 평균값 기준, 모표준편차), 얼굴 폭 중앙값,
   j 중앙값·p95, `shoulder_visibility_min ≥ 0.6` 인 초 비율, 머리 landmark 있는 초 비율, head_offset 중앙값, 휘도 평균.
   마커가 없던 초는 `(마커 없음)` 행에 모은다.
@@ -289,7 +296,7 @@ summary.txt     정지 시 요약. 서비스가 죽었으면 다음 실행 때 J
 1. **정면 착석 10분.** 시작 직후 `정면` 마커. 중간에 2분은 `가만히` 마커를 누르고 가만히 있는다. 처음 30초 안에 한 번은 자기 왼쪽으로
    고개를 30° 정도 돌려 yaw 부호를 확인한다(위 표: yaw > 0 이어야 한다), 책상을 보면 pitch < 0.
    기준: `[정면]`·`[가만히]` face ≥ 99%, `[가만히]` 구간 yaw·pitch 표준편차 < 2°.
-2. **평소처럼 공부 30분.** 마커 없이 둔다. 기준: 합격 줄(화면 off 행: 처리 fps ≥ 23.5, 갭 초과 < 1%, 드롭 < 1%), thermal ≤ 1(LIGHT). 화면 off 평균 전력(mW)을 기록한다.
+2. **평소처럼 공부 30분.** 마커 없이 둔다. 기준: 합격 줄(화면 off 행: 처리 fps ≥ 23.5, 갭 초과 < 1%, 드롭 < 1%, 200ms 초과 갭 0), thermal ≤ 1(LIGHT). 화면 off 평균 전력(mW)과 갭 원인 줄을 기록한다.
 3. **낮은 거치**에서 마커 순서대로: `정면` 1분 → `숙임`(필기) 1분 → `엎드림` 1분 → `자리비움` 30초 → `빈의자`(의자에 옷 걸기) 30초.
    `정지` 후 같은 순서를 **눈높이 거치**에서 반복한다(별도 세션). 마커별 face·머리 landmark·어깨 vis·head_offset 통계가 V0-C/D 설계 자료다.
 4. **프리셋 비교(R4).** 같은 자리·같은 조명에서 A → B → C → D → E → G 순서로 각 10분 이상, 화면 off 위주로 돈다(처음 60초는 워밍업으로 요약에서 빠진다).

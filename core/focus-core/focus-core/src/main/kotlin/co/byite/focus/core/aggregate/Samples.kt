@@ -34,6 +34,12 @@ data class FrameSample(
     val facePostMs: Double = 0.0,
     /** Whole analyzer callback for this frame (entry → image closed), the "Face cycle" a PerformanceHintManager session is told about. */
     val totalMs: Double = 0.0,
+    /** SceneQuality time when it ran on this frame (1 Hz), else null. */
+    val sceneMs: Double? = null,
+    /** Deep copy for the Pose worker when this frame was handed over, else null. */
+    val poseCopyMs: Double? = null,
+    /** Time spent posting this frame's messages to the aggregation queue (the final ProcessedFrame post is charged to the next frame). */
+    val enqueueMs: Double = 0.0,
 ) {
     init {
         if (!faceDetected) {
@@ -41,7 +47,8 @@ data class FrameSample(
                 "face scalars need a detected face (t=$captureMonoNs)"
             }
         }
-        require(latencyNs >= 0L && wrapMs >= 0.0 && facePostMs >= 0.0 && totalMs >= 0.0) { "timings must not be negative (t=$captureMonoNs)" }
+        require(latencyNs >= 0L && wrapMs >= 0.0 && facePostMs >= 0.0 && totalMs >= 0.0 && enqueueMs >= 0.0) { "timings must not be negative (t=$captureMonoNs)" }
+        require((sceneMs ?: 0.0) >= 0.0 && (poseCopyMs ?: 0.0) >= 0.0) { "timings must not be negative (t=$captureMonoNs)" }
     }
 }
 
@@ -124,4 +131,6 @@ data class DeviceSample(
     val isDeviceIdle: Boolean,
     val screenState: ScreenState,
     val appState: AppState,
+    /** Latest hinge angle in degrees (foldables), null otherwise. */
+    val hingeAngleDeg: Double? = null,
 )

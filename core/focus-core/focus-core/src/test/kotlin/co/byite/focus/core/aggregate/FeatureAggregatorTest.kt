@@ -136,6 +136,49 @@ class FeatureAggregatorTest {
     }
 
     @Test
+    fun longGapsAndGapCausesNameTheSlowestStageOfThePreviousCycle() {
+        val a = agg() // thresholds 80 ms / 200 ms; expected interval = 40 ms
+        // frame 0: a long cycle dominated by Face → the gap that follows is attributed to Face
+        a.onFrameReceived(ns(t0))
+        a.onFrameProcessed(ProcessedFrame(ns(t0), 60.0, FrameSample(ns(t0), 1_000_000L, false, wrapMs = 1.0, facePostMs = 0.5, totalMs = 70.0, sceneMs = 3.0, poseCopyMs = 2.0, enqueueMs = 0.1)))
+        a.frame(100) // gap 100 ms > 80: cause Face
+        // frame at 100 had total 20 ms (< 40): the next gap is not the analyzer's
+        a.frame(350) // gap 250 ms > 200: cause other, long gap
+        // a cycle where the pose copy dominated
+        a.onFrameReceived(ns(t0 + 400))
+        a.onFrameProcessed(ProcessedFrame(ns(t0 + 400), 5.0, FrameSample(ns(t0 + 400), 1_000_000L, false, wrapMs = 1.0, facePostMs = 0.5, totalMs = 45.0, poseCopyMs = 30.0, enqueueMs = 0.1)))
+        a.frame(500) // gap 100: cause pose copy
+        a.frame(541) // gap 41: no cause
+        val (s, raw) = a.closeBuckets(t0 + 1300, device)[0]
+        assertEquals(3, s.gapsOverThreshold)
+        assertEquals(1, s.gapsOverLongThreshold)
+        assertEquals(mapOf("변환·전처리" to 0, "Face" to 1, "scene" to 0, "Pose 복사" to 1, "큐 적재" to 0, "그 외" to 1), raw.gapCauses)
+        assertEquals(3, raw.gapCauses.values.sum())
+    }
+
+    @Test
+    fun stageStatsCarryP95AndMaxAndTheHingeAngle() {
+        val a = agg()
+        a.onFrameReceived(ns(t0))
+        a.onFrameProcessed(ProcessedFrame(ns(t0), 10.0, FrameSample(ns(t0), 1_000_000L, false, wrapMs = 1.0, facePostMs = 0.2, totalMs = 12.0, enqueueMs = 0.05)))
+        a.onFrameReceived(ns(t0 + 41))
+        a.onFrameProcessed(ProcessedFrame(ns(t0 + 41), 10.0, FrameSample(ns(t0 + 41), 1_000_000L, false, wrapMs = 3.0, facePostMs = 0.4, totalMs = 14.0, enqueueMs = 0.15)))
+        a.onPoseRequested(ns(t0 + 5), 1.0)
+        a.onPose(pose(5, infer = 30.0))
+        a.onPoseRequested(ns(t0 + 700), 1.0)
+        a.onPose(pose(700, infer = 50.0))
+        val raw = a.closeBuckets(t0 + 1300, device.copy(hingeAngleDeg = 178.5))[0].raw
+        assertEquals(2.0, raw.stageWrapMsMean!!, 1e-12)
+        assertEquals(3.0, raw.stageWrapMsP95)
+        assertEquals(3.0, raw.stageWrapMsMax)
+        assertEquals(0.4, raw.stageFacePostMsP95)
+        assertEquals(0.15, raw.stageEnqueueMsMax)
+        assertEquals(0.1, raw.stageEnqueueMsMean!!, 1e-12)
+        assertEquals(50.0, raw.poseInferMsP95)
+        assertEquals(178.5, raw.hingeAngleDeg)
+    }
+
+    @Test
     fun gapIsCountedEvenWhenTheSampleIsMissing() {
         val a = agg()
         a.frame(0)
