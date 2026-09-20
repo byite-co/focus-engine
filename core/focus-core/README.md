@@ -16,12 +16,14 @@
 
 | 패키지 | 내용 |
 |---|---|
-| `model` | `State`(우선순위 포함), `InvalidReason`, `Event`, `SessionHeader`, `SecondRecord`(스키마 0.2.1), `IntervalRecord`, `SessionEnd`, `CalibrationSnapshot`, `TimebaseRecord`, `ParameterSet`, `BackdateRules`, `FocusSchema` |
+| `model` | `State`(우선순위 포함), `InvalidReason`, `Event`, `SessionHeader`, `SecondRecord`(스키마 0.2.1), `IntervalRecord`, `SessionEnd`, `CalibrationSnapshot`, `TimebaseRecord`, `V0bRawRecord`(V0-B 원시 스칼라 줄), `ParameterSet`, `BackdateRules`, `FocusSchema` |
 | `engine` | `GateEngine`·`GateDecision`, `FaceBand`(얼굴 검출 2단 임계값), `NaiveBaselineEngine`, `PhoneGateTracker`(집어 듦·재거치·재캘리브레이션 상태 기계) |
 | `finalizer` | `StateFinalizer`: raw/final 분리, 30초 확정 버퍼, 소급 덮어쓰기 표, flushNow, lifecycle gap, 프로세스 종료 복구 |
 | `log` | `JsonlCodec`, `SessionLog`, `FocusJson` |
 | `replay` | `ReplayRunner`: 로그 → 엔진 → finalizer 재실행 |
 | `gt` | GT 파서·lint, behavior 카탈로그, expected_state 생성기, 초 단위 diff, 합격선, 콘솔 표 |
+| `aggregate` | `FeatureAggregator`: 기기 층의 프레임·Pose·Scene·IMU 스칼라(`FrameSample`, `PoseSample`, `SceneSample`, `ImuSample`, `DeviceSample`)를 세션 시작에 정렬한 1초 버킷으로 집계해 `SecondRecord` + `V0bRawRecord` 를 낸다(V0-A/B, 지시문 C). 결정적, 시계 없음 |
+| `report` | `V0bReport`: V0-B 세션 요약(전체 + 마커별). 실시간 경로와 프로세스 종료 복원이 같은 함수를 쓴다 |
 
 ## 빌드·테스트
 
@@ -62,17 +64,23 @@ JDK 17 이상. Kotlin 2.2, kotlinx-serialization 1.9, kotlin.test.
 - **GT 큐 정렬(2차 판정 7)**: 대본 GT 는 `start_cue_t_mono_ms == header.t_start_mono_ms` 이고 모든 큐 시각(interval 시작·끝)이 버킷 경계(1000ms 배수)여야 한다. 어긋나면 `GtParser` 가 오류를 낸다. 관찰 GT(`gt_type != scripted`)는 큐·void 시각을 가장 가까운 버킷 경계로 반올림하고 경고를 남긴다(`GtParser.alignToSession`, `GtDiff.diff` 가 호출).
 - **PAUSED 복귀(14)**: PAUSED 로 끝난 interval 다음 큐 뒤 채점 제외는 6초(반응 3 + 얼굴 재검출 `auto_resume_face_ms` 3). 합격선은 "복귀 큐 뒤 7초 안에 재개"(`GtRules.resume_within_ms`, 초기값).
 - 결정성: 시계·난수를 쓰지 않는다. 같은 로그를 재생하면 레코드·interval·SessionEnd 가 완전히 같다(`ReplayResult.sameOutcomeAs`).
+- **V0-B 집계(`FeatureAggregator`)**: 버킷은 `t_start + k·1000` 에 정렬하고, 버킷 끝 + `closeDelayMs`(300) 뒤에 닫는다. 프레임이 없는 초도 레코드를 낸다.
+  캘리브레이션·게이트가 없는 단계라 `raw_state`·`final_state`·`invalid_reason`·`candidate_*`·`events`·`torso_*_ratio`·`zone_id`·`bg_tile_texture_ratio` 는 비우고,
+  null 을 허용하지 않는 `zone_status = no_head_pose`, `imu_state = UNKNOWN`, `power_state = P0` 는 자리표시자다(스키마 결정 필요, 지시문 C PR 본문).
+  `frames_requested` 는 capture result 수(한 번도 없으면 처리 수), `frames_dropped = max(0, requested − processed)`, 갭은 처리 프레임의 capture timestamp 차이.
+  `pose_motion` 의 기준 표본은 0.9~3초 전의 가장 최근 Pose 표본. `scene_luma` 는 버킷에 표본이 없으면 직전 값.
 
 ## 데이터 경계
 
 로그 모델의 직렬화 필드는 스칼라·enum·문자열·사건 목록(`events`: 스칼라 객체의 목록)뿐이다. `SecondRecord` 에는 수치 배열을 두지 않는다.
 `calibration` 줄(`CalibrationSnapshot`)에 한해 이름이 정해진 고정 길이 수치 목록만 허용한다: `zones`(≤ 3), `dock_gravity_vector`(3), `bg_tile_texture_baseline`(16), `bg_tile_mask`(16).
-`SchemaBoundaryTest` 가 `SerialDescriptor` 를 훑어 이 규칙을 검사하고 `SecondRecord`·`SessionHeader`·`CalibrationSnapshot` 필드 목록을 고정한다.
+`SchemaBoundaryTest` 가 `SerialDescriptor` 를 훑어 이 규칙을 검사하고 `SecondRecord`·`SessionHeader`·`CalibrationSnapshot`·`V0bRawRecord` 필드 목록을 고정한다. `v0b_raw` 줄은 배열·목록 없이 스칼라만 허용한다.
 
 ## 세션 JSONL 형식 (feature_schema_version 0.2.1)
 
 첫 줄은 세션 header, 이후 한 줄에 객체 하나. `type` 키로 구분한다(없으면 키로 추론). 빈 줄과 모르는 키는 무시한다.
-시간이 있는 줄(calibration, timebase, interval, second)은 시간 순으로 쓴다.
+시간이 있는 줄(calibration, timebase, interval, second, v0b_raw)은 시간 순으로 쓴다. 같은 시각이면 second 뒤에 v0b_raw 가 온다.
+`JsonlCodec.encodeHeader/encodeSecond/encodeV0bRaw/...` 는 줄 하나씩 만드는 인코더로, 기기 층의 스트리밍 기록이 쓴다.
 
 ```jsonl
 {"type":"header","session_id":"S1","participant_id":"P1","t_start_mono_ms":4000000,"t_start_utc_ms":1789000000000,"spec_version":"0.2.0","algorithm_version":"abc123","feature_schema_version":"0.2.1","parameter_set_id":"ps-v0.2.1-default","device_model":"SM-S931N","os_version":"16","camera_resolution":"640x480","nominal_fps":24,"calibration_id":"C1","calibration_snapshot_version":"1","task_mode":"VISUAL"}
@@ -113,6 +121,11 @@ JDK 17 이상. Kotlin 2.2, kotlinx-serialization 1.9, kotlin.test.
 - `timebase`: `t_mono_ms, camera_ts_source, camera_to_mono_offset_ns, imu_to_mono_offset_ns`. 세션 시작과 1분마다.
 - `interval`: lifecycle gap 한 구간. `state` 는 `reason.state` 와 같아야 한다(`APP_SWITCH → PHONE`, `SCREEN_LOCK → PAUSED`).
 - `session_end`: `t_mono_ms, t_utc_ms, reason ∈ {USER, LIFECYCLE_GAP_TIMEOUT, PROCESS_DEATH_RECOVERED, UNKNOWN}`.
+- `v0b_raw` (V0-B 단계, 지시문 C; 같은 `t_mono_ms` 의 `second` 줄과 짝): 캘리브레이션 전 원시 스칼라. `segment_label`(개발 앱 구간 마커, string?),
+  `shoulder_center_x`·`shoulder_center_y`·`shoulder_width`(upright 정규화, 버킷의 마지막 검출 Pose 표본), `pose_samples`,
+  `tile_texture_min`·`tile_texture_median`(4×4 tile 의 Y 표준편차), `scene_samples`, `face_infer_ms_mean`·`_p95`·`_max`, `pose_infer_ms_mean`·`_max`,
+  `frame_latency_ms_mean`, `imu_samples`, `accel_x_mean`·`accel_y_mean`·`accel_z_mean`·`accel_variance`(축별 분산 합), `thermal_status`,
+  `battery_pct`, `battery_current_ua`, `battery_voltage_mv`, `is_interactive`, `is_device_idle`. 재생·GT 대조는 이 줄을 읽지 않는다.
 
 재생은 로그의 `raw_state`·`final_state`·`invalid_reason`·`candidate_*` 와 출력 사건을 버리고 다시 계산한다. 입력 사건(`user_redock_tap`, `zone_added`)만 엔진에 넣는다. 다시 계산한 출력 사건은 로그의 출력 사건과 종류·`t_mono_ms` 로 비교해 리포트에 남긴다.
 

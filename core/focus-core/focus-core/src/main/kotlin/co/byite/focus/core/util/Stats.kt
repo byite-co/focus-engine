@@ -3,6 +3,7 @@ package co.byite.focus.core.util
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.round
+import kotlin.math.sqrt
 
 /** Small deterministic statistics helpers; pure Kotlin so the module stays multiplatform-ready. */
 object Stats {
@@ -21,6 +22,34 @@ object Stats {
         val s = values.sorted()
         val rank = ceil(p * s.size).toInt().coerceIn(1, s.size)
         return s[rank - 1]
+    }
+
+    /** Median of double [values]. Null for empty input. */
+    fun medianOf(values: List<Double>): Double? {
+        if (values.isEmpty()) return null
+        val s = values.sorted()
+        val n = s.size
+        return if (n % 2 == 1) s[n / 2] else (s[n / 2 - 1] + s[n / 2]) / 2.0
+    }
+
+    /** Nearest-rank percentile of double [values]. Null for empty input. */
+    fun percentileNearestRankOf(values: List<Double>, p: Double): Double? {
+        if (values.isEmpty()) return null
+        require(p > 0.0 && p <= 1.0) { "p must be in (0, 1]" }
+        val s = values.sorted()
+        val rank = ceil(p * s.size).toInt().coerceIn(1, s.size)
+        return s[rank - 1]
+    }
+
+    /** Arithmetic mean. Null for empty input. */
+    fun meanOf(values: List<Double>): Double? = if (values.isEmpty()) null else values.sum() / values.size
+
+    /** Population standard deviation. Null for empty input. */
+    fun stddevOf(values: List<Double>): Double? {
+        val m = meanOf(values) ?: return null
+        var acc = 0.0
+        for (v in values) acc += (v - m) * (v - m)
+        return sqrt(acc / values.size)
     }
 
     /** Safe ratio; null when the denominator is zero. */
