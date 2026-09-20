@@ -10,6 +10,8 @@ object EngineStatus {
     @Volatile var logPath: String? = null
     @Volatile var line: String = ""
     @Volatile var segmentLabel: String? = null
+    /** "자가 점검: OK (…)" or the failure with exception class and message; null before the first start. */
+    @Volatile var selfCheck: String? = null
 }
 
 /** What must survive the process: last summary, log path, whether a session is still open (R6 복구). */
@@ -37,6 +39,13 @@ class EnginePrefs(context: Context) {
             p.edit().putString(KEY_ACTIVE_ID, v).commit()
         }
 
+    /** Result line of the engine self-check of the last start (shown as the first summary line, also after recovery). */
+    var lastSelfCheck: String?
+        get() = p.getString(KEY_SELF_CHECK, null)
+        set(v) {
+            p.edit().putString(KEY_SELF_CHECK, v).commit()
+        }
+
     /** Session whose summary was rebuilt from its JSONL after a crash; cleared when a new session starts. */
     var lastRecoveredSessionId: String?
         get() = p.getString(KEY_RECOVERED_ID, null)
@@ -48,5 +57,6 @@ class EnginePrefs(context: Context) {
         const val KEY_ACTIVE = "session_active"
         const val KEY_ACTIVE_ID = "active_session_id"
         const val KEY_RECOVERED_ID = "last_recovered_session_id"
+        const val KEY_SELF_CHECK = "last_self_check"
     }
 }

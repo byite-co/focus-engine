@@ -1,8 +1,8 @@
 # core/focus-core
 
-순수 로직 코어(Kotlin JVM). 스펙 v0.2.0 + CHANGELOG v0.2.1 의 기록 스키마(0.2.1), StateFinalizer, 로그 재생, GT 대조 도구를 담는다.
+순수 로직 코어(Kotlin JVM). 스펙 v0.2.0 + CHANGELOG v0.2.1·v0.2.2 의 기록 스키마(0.2.2; 0.2.1 로그도 읽는다), StateFinalizer, 로그 재생, GT 대조 도구를 담는다.
 게이트 규칙 전체는 아직 없고 `GateEngine` 인터페이스, 비교용 `NaiveBaselineEngine`, 폰 게이트의 IMU 부분(`PhoneGateTracker`)만 있다.
-지시문은 `directives/B-focus-core.md`, 정본은 `docs/focus/`(동결), 설계 변경은 `CHANGELOG.md` v0.2.1 과 `docs/research-notes/RN-001-v0.2.1-spec-clarifications.md`.
+지시문은 `directives/B-focus-core.md`(+ V0-B 추가는 `directives/C-v0ab-raw-features.md`), 정본은 `docs/focus/`(동결), 설계 변경은 `CHANGELOG.md` v0.2.1·v0.2.2 와 `docs/research-notes/RN-001-v0.2.1-spec-clarifications.md`, `RN-002-mediapipe-telemetry-and-jitter.md`.
 
 ## 구성
 
@@ -66,9 +66,10 @@ JDK 17 이상. Kotlin 2.2, kotlinx-serialization 1.9, kotlin.test.
 - 결정성: 시계·난수를 쓰지 않는다. 같은 로그를 재생하면 레코드·interval·SessionEnd 가 완전히 같다(`ReplayResult.sameOutcomeAs`).
 - **V0-B 집계(`FeatureAggregator`)**: 버킷은 `t_start + k·1000` 에 정렬하고, 버킷 끝 + `closeDelayMs`(300) 뒤에 닫는다. 프레임이 없는 초도 레코드를 낸다.
   캘리브레이션·게이트가 없는 단계라 `raw_state`·`final_state`·`invalid_reason`·`candidate_*`·`events`·`torso_*_ratio`·`zone_id`·`bg_tile_texture_ratio` 는 비우고,
-  null 을 허용하지 않는 `zone_status = no_head_pose`, `imu_state = UNKNOWN`, `power_state = P0` 는 자리표시자다(스키마 결정 필요, 지시문 C PR 본문).
+  null 을 허용하지 않는 필드는 v0.2.2 (a) 대로 `zone_status = uncalibrated`, `imu_state = UNKNOWN`, `power_state = P0`.
   `frames_requested` 는 capture result 수(한 번도 없으면 처리 수), `frames_dropped = max(0, requested − processed)`, 갭은 처리 프레임의 capture timestamp 차이.
-  `pose_motion` 의 기준 표본은 0.9~3초 전의 가장 최근 Pose 표본. `scene_luma` 는 버킷에 표본이 없으면 직전 값.
+  `pose_motion` 의 기준 표본은 0.9~3초 전의 가장 최근 Pose 표본. `scene_luma` 는 항상 측정값이고 버킷에 표본이 없을 때만 직전 값; 표본이 한 번도 없는데
+  버킷을 닫으면 예외(세션은 첫 처리 프레임에서 시작해야 한다는 계약).
 
 ## 데이터 경계
 
@@ -76,7 +77,7 @@ JDK 17 이상. Kotlin 2.2, kotlinx-serialization 1.9, kotlin.test.
 `calibration` 줄(`CalibrationSnapshot`)에 한해 이름이 정해진 고정 길이 수치 목록만 허용한다: `zones`(≤ 3), `dock_gravity_vector`(3), `bg_tile_texture_baseline`(16), `bg_tile_mask`(16).
 `SchemaBoundaryTest` 가 `SerialDescriptor` 를 훑어 이 규칙을 검사하고 `SecondRecord`·`SessionHeader`·`CalibrationSnapshot`·`V0bRawRecord` 필드 목록을 고정한다. `v0b_raw` 줄은 배열·목록 없이 스칼라만 허용한다.
 
-## 세션 JSONL 형식 (feature_schema_version 0.2.1)
+## 세션 JSONL 형식 (feature_schema_version 0.2.2)
 
 첫 줄은 세션 header, 이후 한 줄에 객체 하나. `type` 키로 구분한다(없으면 키로 추론). 빈 줄과 모르는 키는 무시한다.
 시간이 있는 줄(calibration, timebase, interval, second, v0b_raw)은 시간 순으로 쓴다. 같은 시각이면 second 뒤에 v0b_raw 가 온다.
@@ -105,7 +106,7 @@ JDK 17 이상. Kotlin 2.2, kotlinx-serialization 1.9, kotlin.test.
 | `head_landmark_present` | bool | Pose nose/ear landmark 유효 |
 | `head_offset_below_shoulder_ratio` | double? | (head_y − shoulder_line_y) ÷ 어깨 폭, 양수가 아래. 머리 landmark 없으면 null |
 | `yaw_mean`, `pitch_mean`, `roll_mean` | double? | head pose 초 평균(도). 얼굴 없으면 null |
-| `zone_status`, `zone_id` | enum, int? | `in_zone, outside, no_head_pose`. `zone_id` 는 in_zone 일 때만 |
+| `zone_status`, `zone_id` | enum, int? | `in_zone, outside, no_head_pose, uncalibrated`. `zone_id` 는 in_zone 일 때만. `uncalibrated`(0.2.2) = 작업영역이 아직 없음(캘리브레이션 전·진행 중) |
 | `pose_motion` | double? | 어깨 중심 1초 변위 ÷ 어깨 폭 |
 | `scene_luma` | double | 전체 프레임 Y 평균 0..255 |
 | `bg_tile_texture_ratio` | double? | 배경 tile 중 texture 가 기준의 25% 미만으로 떨어진 비율. proxy 사용 불가면 null |

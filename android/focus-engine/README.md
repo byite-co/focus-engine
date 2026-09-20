@@ -4,7 +4,8 @@ V0-A/B: Android 측정 엔진 골격과 Face/Pose raw feature 기록. 게이트 
 지시문은 `directives/C-v0ab-raw-features.md`, 정본은 `docs/focus/spec-v0.2.0.md` 1·6·7·9장과
 `docs/focus/v0-plan-and-gt.md` 2~4장, 기록 스키마는 `core/focus-core` (0.2.1).
 spike-r1(R1~R3)의 foreground service, Camera2Interop fps 고정, 요약 복원·클립보드 복사,
-Release 게시 워크플로를 그대로 이어받았다.
+Release 게시 워크플로를 그대로 이어받았다. 스키마·정의 결정은 `CHANGELOG.md` v0.2.2 와
+`docs/research-notes/RN-002-mediapipe-telemetry-and-jitter.md`.
 
 ## 구성
 
@@ -12,12 +13,12 @@ Release 게시 워크플로를 그대로 이어받았다.
 |---|---|
 | `engine/` | `:engine` Android 라이브러리. `CaptureService`(camera 타입 FGS, 서비스 lifecycle 에 CameraX 바인딩, wakelock), `pipeline/camera/CameraPipeline`, `pipeline/face/FacePipeline`(+`HeadPose`, `RigidJitter`), `pipeline/pose/PosePipeline`(+`PoseGeometry`), `pipeline/scene/SceneQuality`(+`SceneGrid`), `MotionPipeline`(IMU 5Hz), `timebase/Timebase`(+`ClockOffsetEstimator`), `FeatureLogger`(JSONL), `SessionRecovery`, `DeviceStatusReader` |
 | `engine/src/main/assets/` | MediaPipe 모델 파일 2개 (아래 표) |
-| `engine/src/main/java/com/google/android/datatransport/` | MediaPipe 가 끌고 오는 Google 텔레메트리 라이브러리의 no-op 스텁 (아래 데이터 경계) |
+| `engine/src/main/java/com/google/android/datatransport/` | MediaPipe 가 끌고 오는 Google 텔레메트리 라이브러리의 no-op 스텁 8개 (아래 "MediaPipe 원격 통계 로깅 차단") |
 | `devapp/` | `:devapp` 개발용 앱. 시작/정지, 구간 마커 6개, 상태(1Hz), 요약, 요약 복사. edge-to-edge 인셋 처리 |
 | `../../core/focus-core` | composite build (`includeBuild`) 로 참조하는 순수 로직. 초당 집계 `FeatureAggregator`, 로그 모델, 요약 `V0bReport` |
 
 패키지 `co.byite.focus.engine` (엔진), `co.byite.focus.devapp` (앱, applicationId 도 같다).
-minSdk 29, compileSdk 37.2, targetSdk 37. AGP 9.4.1, Kotlin 2.4.20, CameraX 1.6.2, MediaPipe Tasks Vision 1.0.0.
+minSdk 29, compileSdk 37.2, targetSdk 37. AGP 9.4.1, Kotlin 2.4.20, CameraX 1.6.2, MediaPipe Tasks Vision 1.0.0(`strictly` 고정).
 APK 는 arm64-v8a 만 담는다(실측 기기 기준, `devapp/build.gradle.kts` 의 `abiFilters`).
 
 기기 층(이 모듈)은 프레임과 센서 값을 스칼라로 줄여 `FeatureAggregator`(focus-core)에 넘기고,
@@ -31,15 +32,55 @@ APK 는 arm64-v8a 만 담는다(실측 기기 기준, `devapp/build.gradle.kts` 
 - `FeatureLogger` 는 focus-core 로그 모델(`SessionHeader`, `TimebaseRecord`, `AggregatedSecond`, `SessionEnd`)만 받는다.
   로그 DTO 에 배열·비트맵 필드가 없는지는 focus-core 의 `SchemaBoundaryTest` 가 검사한다.
 - 파일·로그·크래시 경로에 픽셀이나 랜드마크를 쓰는 코드 경로가 없다. 이번 단계에는 DEBUG 덤프(Pose 5점 기록)도 없다.
-- INTERNET 권한 없음. MediaPipe `tasks-core` 는 `com.google.android.datatransport:transport-backend-cct` 를 끌고 오는데
-  그 매니페스트가 `INTERNET`·`ACCESS_NETWORK_STATE` 를 선언하고, `TasksStatsProtoLogger` 가 생성자에서 무조건
-  `RemoteLoggingClient`(Clearcut 사용 통계 전송)를 만든다. 그래서 (1) `configurations.all { exclude(group = "com.google.android.datatransport") }`
-  로 라이브러리를 빼고, (2) `RemoteLoggingClient` 가 링크하는 8개 심볼(`TransportRuntime`, `TransportFactory`, `Transport`,
-  `Event`, `Encoding`, `Transformer`, `Destination`, `CCTDestination`)을 아무것도 하지 않는 스텁으로 제공하며,
-  (3) 매니페스트에서 두 권한을 `tools:node="remove"` 하고, (4) CI 가 merged manifest 에 두 권한이 없는지 검사한다.
-  결과: APK 매니페스트 권한은 `CAMERA, FOREGROUND_SERVICE, FOREGROUND_SERVICE_CAMERA, POST_NOTIFICATIONS, WAKE_LOCK` 뿐이고
-  dex 에 datatransport 런타임 클래스가 없다(스텁만 있다).
+- INTERNET 권한 없음. 아래 "MediaPipe 원격 통계 로깅 차단" 참조. APK 매니페스트 권한은
+  `CAMERA, FOREGROUND_SERVICE, FOREGROUND_SERVICE_CAMERA, POST_NOTIFICATIONS, WAKE_LOCK` 뿐이고 CI 가 검사한다.
 - 모델은 assets 에 포함하고 런타임 다운로드 경로가 없다.
+
+## MediaPipe 원격 통계 로깅 차단 (CHANGELOG v0.2.2 (c), RN-002)
+
+**대상 버전**: `com.google.mediapipe:tasks-vision:1.0.0` (`gradle/libs.versions.toml` 에 `strictly` 로 고정. 올릴 때는 아래 확인 방법을 다시 돌린다).
+
+**문제**: `tasks-core` 는 `com.google.android.datatransport:transport-backend-cct` 를 끌고 오고, 그 매니페스트가 `INTERNET`·`ACCESS_NETWORK_STATE` 를
+선언하며 `transport-runtime` 은 JobService·BroadcastReceiver 를 병합한다. `tasks-core` 의 `TasksStatsLoggerFactory.create` 는 배포 버전
+0.10.14~1.0.0 모두 `TasksStatsProtoLogger` 를 만들고, 그 생성자가 무조건 `new RemoteLoggingClient(context)`(Google Clearcut 로 사용 통계 전송)를
+실행한다. 의존성만 빼면 landmarker 생성 시 `NoClassDefFoundError` 가 난다.
+
+**처리** (잠정 승인): (1) `configurations.all { exclude(group = "com.google.android.datatransport") }` (engine·devapp), (2) `RemoteLoggingClient` 가
+링크하는 심볼만 아무것도 하지 않는 스텁으로 제공, (3) 매니페스트에서 두 권한을 `tools:node="remove"`, (4) CI 가 병합 매니페스트에 두 권한이 없는지 검사.
+스텁은 `engine/src/main/java/com/google/android/datatransport/` 한 곳에 모았다. 패키지 이름은 MediaPipe 바이트코드가 정하므로 3개 패키지·8개 파일이고,
+`DataBoundaryTest.datatransportStubsAreExactlyTheDocumentedSet` 가 이 목록 외의 파일이 없는지 검사한다.
+
+| 스텁 (FQCN) | MediaPipe 가 쓰는 멤버 | 동작 |
+|---|---|---|
+| `com.google.android.datatransport.runtime.TransportRuntime` | `initialize(Context)`, `getInstance()`, `newFactory(Destination)` | 아무것도 안 함 / 싱글턴 / 드롭 팩토리 |
+| `com.google.android.datatransport.runtime.Destination` | 마커 인터페이스 | — |
+| `com.google.android.datatransport.cct.CCTDestination` | `INSTANCE` | 싱글턴 |
+| `com.google.android.datatransport.TransportFactory` | `getTransport(String, Class, Encoding, Transformer)` | 드롭 `Transport` 반환 |
+| `com.google.android.datatransport.Transport` | `send(Event)` | 드롭 |
+| `com.google.android.datatransport.Event` | `ofData(Object)` | 페이로드 버림 |
+| `com.google.android.datatransport.Encoding` | `of(String)` | 상수 |
+| `com.google.android.datatransport.Transformer` | `apply(T)` (람다 SAM) | 인터페이스만 |
+
+**확인 방법** (버전을 올릴 때 반복):
+
+```sh
+# 1) tasks-core 가 datatransport 를 어디서 쓰는지, 팩토리가 어떤 로거를 만드는지
+curl -sSO https://dl.google.com/dl/android/maven2/com/google/mediapipe/tasks-core/1.0.0/tasks-core-1.0.0.aar
+unzip -o tasks-core-1.0.0.aar classes.jar && mkdir -p cls && unzip -qo classes.jar -d cls
+grep -rl datatransport cls                       # RemoteLoggingClient 만 나와야 한다
+javap -c -p -cp cls com.google.mediapipe.tasks.core.logging.TasksStatsLoggerFactory | grep Logger.create
+javap -v -p -cp cls com.google.mediapipe.tasks.core.logging.RemoteLoggingClient | grep -E "Class|Methodref|InterfaceMethodref|Fieldref" | grep datatransport
+# 2) 빌드 산출물: 병합 매니페스트 권한과 dex 안의 datatransport 클래스(스텁만 있어야 한다)
+grep -o 'android:name="android.permission.[A-Z_]*"' devapp/build/intermediates/merged_manifests/debug/processDebugManifest/AndroidManifest.xml | sort -u
+unzip -o devapp/build/outputs/apk/debug/devapp-debug.apk 'classes*.dex' -d dex
+for d in dex/classes*.dex; do $ANDROID_HOME/build-tools/37.0.0/dexdump -l plain "$d" | grep -oE "Lcom/google/android/datatransport/[^;]*;"; done | sort -u
+# 3) 실기기: devapp 시작 → 상태·요약 첫 줄 "자가 점검: OK (…)" 확인
+```
+
+**엔진 자가 점검**: 서비스 시작 시(카메라 바인딩 전, 분석 스레드) Face·Pose landmarker 를 만들고 640x480 회색 더미 프레임 1장을 각각 추론한다.
+`Throwable` 까지 잡아(NoClassDefFoundError, UnsatisfiedLinkError 포함) 실패하면 `자가 점검 실패: <예외 클래스>: <메시지>` 를 상태와 요약에 표시하고
+세션을 끝낸다. 성공하면 요약 첫 줄이 `자가 점검: OK (Face …ms, Pose …ms, …)` 다. 복원한 요약도 마지막 자가 점검 결과를 첫 줄에 둔다.
+실기기에서 스텁 관련 크래시가 확인되면 대안(실제 라이브러리 유지 + 매니페스트에서 INTERNET 과 그 라이브러리의 컴포넌트 제거)으로 바꾼다.
 
 ## 모델 파일
 
@@ -88,8 +129,9 @@ cd android/focus-engine
 - 프레임 계수: `frames_requested` = Camera2 capture result 수(HAL 이 낸 프레임), `frames_processed` = Face 를 돌린 프레임,
   `frames_dropped` = requested − processed (KEEP_ONLY_LATEST 가 버린 프레임; 0 이하면 0). capture result 가 한 번도
   오지 않은 세션은 requested = processed 로 둔다. 갭은 처리 프레임의 capture timestamp 차이(버킷 경계를 넘는 갭은 뒤 프레임의 버킷에).
-- 버킷은 세션 시작(`t_start_mono_ms`)에 정렬한 `[t, t+1000)`. 버킷 끝 + 300ms 뒤에 닫아 늦게 오는 capture result 를 기다린다.
-  프레임이 없는 초도 레코드를 남긴다(`frames_processed 0`).
+- 세션 시작 `t_start_mono_ms` = **첫 처리 프레임의 capture timestamp**(카메라 바인딩 시각이 아니다). 버킷은 여기에 정렬한 `[t, t+1000)` 이고
+  버킷 끝 + 300ms 뒤에 닫아 늦게 오는 capture result 를 기다린다. 첫 프레임 전에 온 capture result 는 보관했다가 세션 시작 뒤에 넣는다.
+  프레임이 없는 초도 레코드를 남긴다(`frames_processed 0`). 첫 버킷은 항상 scene 표본을 가지므로 `scene_luma` 는 언제나 측정값이다.
 - IMU: 가속도계 5Hz(200,000µs), 분석 스레드로 전달. 캘리브레이션(거치 자세)이 없어 `imu_state` 는 분류하지 않고 원시 통계만
   `v0b_raw` 에 남긴다.
 - Timebase: camera `SENSOR_INFO_TIMESTAMP_SOURCE` 가 REALTIME 이면 offset 0(R1 결과). 아니면 처음 100프레임의
@@ -113,11 +155,21 @@ canonical face → 카메라 공간(X 오른쪽, Y 위, Z 카메라 쪽; 정면 
 
 **얼굴 폭 px**: face-oval 랜드마크 234↔454 의 버퍼 픽셀 거리.
 
-**강체 잔차 지터 j** (`RigidJitter`, 스펙 6장): 표정에 덜 움직이는 14점(콧등 168·6·197·195·5, 눈꼬리·눈머리 33·133·362·263,
-이마 10·151·9·108·337)을 (x·W, −y·H, −z·W)로 카메라 공간에 놓고 Rᵀ 로 canonical 공간에 옮긴 뒤 중심을 빼고 얼굴 폭으로
-나눈다. j = 직전 얼굴 프레임(≤ 500ms 전) 대비 이 점들의 변위 RMS. 머리의 강체 회전은 R 이 흡수한다.
-스펙과 다른 점: Java API 가 metric 랜드마크를 주지 않아 역변환을 metric 이 아닌 화면 좌표(weak perspective)에 적용했다.
-따라서 j 는 얼굴 폭 대비 비율(무단위)이고 같은 방법으로 잰 baseline 과의 비율만 의미가 있다. 초당 값은 프레임 j 의 평균.
+**강체 잔차 지터 j** (`RigidJitter`; 스펙 6장, 정의는 CHANGELOG v0.2.2 (b)). 정확한 정의:
+
+1. 강체 부분집합 14점 — 콧등 168·6·197·195·5, 눈꼬리·눈머리 33·133·362·263, 이마 10·151·9·108·337 — 을 버퍼 픽셀 3차원 점 p_i = (x·W, y·H, z·W) 로 둔다
+   (z 는 MediaPipe 정규화 z 에 폭을 곱한 것, 회전 보정 없음: 두 프레임이 같은 좌표계면 충분하다).
+2. 직전 얼굴 프레임의 점 P 를 현재 프레임의 점 Q 에 similarity 변환(스케일 s, 회전 R, 평행이동 t)으로 최소제곱 정합한다:
+   min Σ|s·R·p_i + t − q_i|². R 은 Horn(1987)의 폐형식(중심을 뺀 교차공분산으로 만든 4x4 행렬의 최대 고윳값 고유벡터 = 단위 쿼터니언, Jacobi 반복),
+   s = Σ(R·p_i)·q_i ÷ Σ|p_i|², t 는 중심 차이.
+3. j = √(Σ|s·R·p_i + t − q_i|² / 14) ÷ 현재 프레임의 양안 거리. 양안 거리 = 왼눈 중심(33·133 중점)과 오른눈 중심(362·263 중점)의 버퍼 픽셀 거리.
+   j 는 무단위(양안 거리 대비 비율)다.
+4. 제외(null): 머리 각속도 = transformation matrix 회전 블록의 상대 회전각 acos((tr(R_prevᵀR_cur) − 1)/2) ÷ Δt 가 30°/s 초과인 쌍,
+   직전 얼굴 프레임이 500ms 보다 오래된 쌍, 얼굴 재검출 직후(기준 없음), 양안 거리 0. 제외된 쌍의 수는 events.log 의 `jitter_skipped_fast_rotation` 에 남는다.
+5. 초당 `jitter_j` 는 그 초의 프레임 j 평균.
+
+스펙과 다른 점: canonical 공간 역변환은 Java API 가 metric 랜드마크를 주지 않아 쓸 수 없고, 대신 similarity 정합이 강체 운동과 거리 변화(스케일)를
+흡수한다. baseline 도 같은 방법으로 잰다. 단위 테스트: 순수 강체 이동·회전·스케일에서 j ≈ 0, 랜드마크별 독립 잡음에서 j > 0, 빠른 회전 쌍 제외.
 
 **Pose** (`PoseGeometry`, BlazePose 33점): 어깨 11·12, 코 0, 귀 7·8. 버퍼 정규화 좌표를 upright 로 돌린 뒤 픽셀로 잰다.
 `shoulder_visibility_min` = min(vis 11, vis 12). `shoulder_center_x/y` = 어깨 중점 ÷ upright 폭/높이,
@@ -138,23 +190,25 @@ events.log      카메라 상태, 첫 프레임, fps 범위 변화, 마커, 오�
 summary.txt     정지 시 요약. 서비스가 죽었으면 다음 실행 때 JSONL 로 복원한 요약
 ```
 
-- `second` 줄은 focus-core `SecondRecord`(스키마 0.2.1) 그대로다. 캘리브레이션과 게이트가 없어 다음을 비운다: `raw_state`,
+- `second` 줄은 focus-core `SecondRecord`(스키마 0.2.2) 그대로다. 캘리브레이션과 게이트가 없어 다음을 비운다: `raw_state`,
   `final_state`, `invalid_reason`, `candidate_*`, `events`(빈 목록), `torso_center_offset_ratio`, `torso_width_ratio`, `zone_id`,
-  `bg_tile_texture_ratio`. null 을 허용하지 않아 비울 수 없는 필드는 아래 값으로 채웠고 PR 본문에 보고했다:
+  `bg_tile_texture_ratio`. null 을 허용하지 않는 필드는 CHANGELOG v0.2.2 (a) 의 결정대로 채운다:
 
   | 필드 | 값 | 이유 |
   |---|---|---|
-  | `zone_status` | `no_head_pose` | 작업영역이 없어 판정 자체가 없음. 얼굴이 있어도 같은 값이다 |
-  | `imu_state` | `UNKNOWN` | 거치 자세 기준이 없어 DOCKED/LIFTED 등을 분류할 수 없음. IMU 표본이 있어도 같은 값이다 |
+  | `zone_status` | `uncalibrated` | 작업영역이 아직 없다(캘리브레이션 전·진행 중). V0-B 레코드는 얼굴 유무와 무관하게 전부 이 값 |
+  | `imu_state` | `UNKNOWN` | 거치 자세 기준이 없어 DOCKED/LIFTED 등을 분류할 수 없음 |
   | `power_state` | `P0` | 전력 상태 머신 미구현 |
-  | `scene_luma` | 버킷에 scene 표본이 없으면 직전 값, 그것도 없으면 0.0 | non-null double |
-  | `face_detect_ratio` | 처리 프레임 0 이면 0.0 | non-null double |
-  | header `calibration_id`, `calibration_snapshot_version` | `""` | 캘리브레이션 없음 |
+  | header `calibration_id`, `calibration_snapshot_version` | `"none"` | 캘리브레이션 없음 |
+  | `scene_luma` | 그 초의 측정값. 표본이 없는 초만 직전 측정값 | 상수 자리표시 금지. 세션이 첫 처리 프레임에서 시작하므로 항상 측정값이 있다 |
+  | `face_detect_ratio` | 처리 프레임 0 이면 0.0 | non-null double (0/0) |
+  | `frames_requested` | capture result 가 한 번도 없으면 처리 수 | 드롭 계산의 분모 |
 
 - `v0b_raw` 줄(focus-core `V0bRawRecord`, 스칼라만): `segment_label`(마커), 어깨 중심·폭(정규화), `pose_samples`,
   tile texture 최솟값·중앙값, `scene_samples`, Face 추론 ms 평균·p95·최대, Pose 추론 ms 평균·최대, 프레임 콜백 지연 평균,
   IMU 표본 수·축별 평균·분산 합, thermal status, 배터리 %·전류(µA 원값)·전압(mV), 화면 on, Doze.
 - 마커는 버킷 시작 시각에 활성이던 마커를 그 초에 붙인다. 마커 변경 시각은 events.log 에도 남는다.
+- 요약 첫 줄은 엔진 자가 점검 결과(`자가 점검: OK (…)` 또는 실패 내용)다. 복원한 요약도 같다.
 - flush: 닫힌 레코드 30개(= 30초)마다 파일에 쓰고 flush 한다. header·timebase·session_end 는 즉시. 프로세스가 죽으면
   마지막 flush 이후 최대 30초를 잃는다.
 - 복원(R6): 앱을 다시 열면 `session_active` 플래그가 남은 세션을 감지해 `session.jsonl` 을 읽고(잘린 마지막 줄은 버린다),
@@ -190,8 +244,8 @@ summary.txt     정지 시 요약. 서비스가 죽었으면 다음 실행 때 J
 ## 알려진 한계·가정
 
 - 세로 거치만 지원한다(target rotation 고정). 가로 거치는 upright 기준이 어긋나 yaw/roll 이 뒤바뀐다.
-- `imu_state`·`zone_status`·`power_state` 는 위 표의 자리표시자다. 판정 코드가 이 값을 읽으면 안 된다(V0-C/D 에서 채운다).
-- j 는 스펙의 canonical-metric 정의의 근사다(위). baseline 도 같은 방법으로 재야 한다.
+- `imu_state`·`zone_status`·`power_state` 는 위 표의 값이다. 판정 코드가 이 값을 읽으면 안 된다(V0-C/D 에서 채운다).
+- j 는 similarity 정합 잔차 정의다(위). baseline 도 같은 방법으로 재야 한다.
 - Face 추론 p95 는 초당 평균값의 p95 다. 프레임 단위 p95 는 로그에 남기지 않는다(초당 레코드에 배열을 두지 않는 규칙).
 - 24fps 도 30fps 도 지원 목록에 없으면 fps 범위를 지정하지 않고 HAL 기본값으로 돈다. events.log 의 `session_start` 줄에 `fps_selected=unset` 으로 남는다.
 - 앱을 지우면 세션 로그도 지워진다. 재설치 전에 `adb pull` 한다.

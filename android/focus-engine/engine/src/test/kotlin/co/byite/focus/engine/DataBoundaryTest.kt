@@ -12,7 +12,8 @@ import kotlin.test.fail
  * 1. frame, bitmap, MediaPipe and landmark types exist only under `co.byite.focus.engine.pipeline.*`;
  * 2. the FeatureLogger accepts focus-core log models only (no array, buffer or bitmap parameter);
  * 3. the engine manifest declares no network permission, and its INTERNET line is a removal;
- * 4. the sample types handed out of the pipelines carry scalars only.
+ * 4. the sample types handed out of the pipelines carry scalars only;
+ * 5. the datatransport stubs (README "MediaPipe 원격 통계 로깅 차단") are exactly the documented set, and nothing else lives in src/main/java.
  */
 class DataBoundaryTest {
     private val root = File("src/main/kotlin/co/byite/focus/engine")
@@ -61,6 +62,27 @@ class DataBoundaryTest {
             if (line.contains("android.permission.INTERNET") || line.contains("android.permission.ACCESS_NETWORK_STATE")) {
                 assertTrue(line.contains("tools:node=\"remove\""), "AndroidManifest.xml:${i + 1} must remove, not declare, the permission: $line")
             }
+        }
+    }
+
+    @Test
+    fun datatransportStubsAreExactlyTheDocumentedSet() {
+        val javaRoot = File("src/main/java")
+        val expected = listOf(
+            "com/google/android/datatransport/Encoding.java",
+            "com/google/android/datatransport/Event.java",
+            "com/google/android/datatransport/Transformer.java",
+            "com/google/android/datatransport/Transport.java",
+            "com/google/android/datatransport/TransportFactory.java",
+            "com/google/android/datatransport/cct/CCTDestination.java",
+            "com/google/android/datatransport/runtime/Destination.java",
+            "com/google/android/datatransport/runtime/TransportRuntime.java",
+        ).sorted()
+        val actual = javaRoot.walkTopDown().filter { it.isFile }.map { it.relativeTo(javaRoot).path.replace(File.separatorChar, '/') }.sorted().toList()
+        assertTrue(actual == expected, "src/main/java must hold exactly the 8 datatransport stubs, got:\n" + actual.joinToString("\n"))
+        for (f in expected) {
+            val text = File(javaRoot, f).readText()
+            assertTrue("import java.net" !in text && "HttpURLConnection" !in text && "Socket" !in text, "$f must not touch the network")
         }
     }
 

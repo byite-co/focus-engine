@@ -26,10 +26,10 @@ data class AggregatedSecond(val second: SecondRecord, val raw: V0bRawRecord)
  *
  * V0-B has no calibration and no gates, so the fields that depend on them are left empty:
  * `raw_state`, `final_state`, `invalid_reason`, `candidate_*`, `events`, `torso_*_ratio`,
- * `zone_id`, `bg_tile_texture_ratio` are null/empty. The non-nullable schema fields that cannot be
- * emptied are filled with the documented placeholders: `zone_status = no_head_pose` (no zones
- * registered), `imu_state = UNKNOWN` (no dock posture to classify against), `power_state = P0`
- * (no power state machine yet).
+ * `zone_id`, `bg_tile_texture_ratio` are null/empty. The non-nullable schema fields are filled as
+ * decided for v0.2.2: `zone_status = uncalibrated` (no zones exist yet), `imu_state = UNKNOWN` (no dock
+ * posture to classify against), `power_state = P0` (no power state machine yet). `scene_luma` is always
+ * a measured value: the bucket's samples, or the last measured value when the bucket has none.
  */
 class FeatureAggregator(
     private val tStartMonoMs: Long,
@@ -190,6 +190,10 @@ class FeatureAggregator(
         val headPresent = lastPose?.headLandmarkPresent ?: false
         val luma = if (b.scenes.isNotEmpty()) b.scenes.sumOf { it.lumaMean } / b.scenes.size else lastSceneLuma
         if (luma != null) lastSceneLuma = luma
+        // scene_luma is non-nullable and must be a measurement: the device layer starts the session at its
+        // first processed frame, which always carries a scene sample, so this is only reachable when that
+        // contract is broken. Fail loudly rather than write a constant.
+        checkNotNull(luma) { "bucket $k closed before any scene sample; the session must start at the first processed frame" }
         val requested = if (captureResultsSeen) b.requested else b.processed
         val second = SecondRecord(
             tMonoMs = start,
@@ -203,10 +207,10 @@ class FeatureAggregator(
             yawMean = if (b.poseAngleN > 0) b.yawSum / b.poseAngleN else null,
             pitchMean = if (b.poseAngleN > 0) b.pitchSum / b.poseAngleN else null,
             rollMean = if (b.poseAngleN > 0) b.rollSum / b.poseAngleN else null,
-            zoneStatus = ZoneStatus.NO_HEAD_POSE,
+            zoneStatus = ZoneStatus.UNCALIBRATED,
             zoneId = null,
             poseMotion = lastPose?.let { poseMotion(it) },
-            sceneLuma = luma ?: 0.0,
+            sceneLuma = luma,
             bgTileTextureRatio = null,
             jitterJ = if (b.jitterN > 0) b.jitterSum / b.jitterN else null,
             faceWidthPx = if (b.widthN > 0) b.widthSum / b.widthN else null,

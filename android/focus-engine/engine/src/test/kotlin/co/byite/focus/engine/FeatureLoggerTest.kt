@@ -4,6 +4,7 @@ import co.byite.focus.core.aggregate.AggregatedSecond
 import co.byite.focus.core.aggregate.DeviceSample
 import co.byite.focus.core.aggregate.FeatureAggregator
 import co.byite.focus.core.aggregate.FrameSample
+import co.byite.focus.core.aggregate.SceneSample
 import co.byite.focus.core.log.JsonlCodec
 import co.byite.focus.core.model.AppState
 import co.byite.focus.core.model.FocusSchema
@@ -32,6 +33,7 @@ class FeatureLoggerTest {
 
     private fun seconds(n: Int): List<AggregatedSecond> {
         val a = FeatureAggregator(header.tStartMonoMs, header.tStartUtcMs)
+        a.onScene(SceneSample((header.tStartMonoMs + 10) * 1_000_000L, 118.0, 4.0, 9.0))
         for (i in 0 until n) a.onFrame(FrameSample((header.tStartMonoMs + i * 1000L + 10) * 1_000_000L, 1_000_000L, true, 1.0, -5.0, 0.0, 200.0, null, 12.0))
         return a.closeBuckets(header.tStartMonoMs + n * 1000L + 300, device)
     }

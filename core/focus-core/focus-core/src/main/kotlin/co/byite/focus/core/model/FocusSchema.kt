@@ -5,8 +5,11 @@ object FocusSchema {
     /** Design baseline this code implements. Frozen; changes go to CHANGELOG v0.2.x. */
     const val SPEC_VERSION: String = "0.2.0"
 
-    /** Version of the per-second record layout ([SecondRecord]). 0.2.1 = CHANGELOG v0.2.1 schema. */
-    const val FEATURE_SCHEMA_VERSION: String = "0.2.1"
+    /**
+     * Version of the per-second record layout ([SecondRecord]). 0.2.1 = CHANGELOG v0.2.1 schema;
+     * 0.2.2 = CHANGELOG v0.2.2 (`zone_status.uncalibrated`, `v0b_raw` line). Additive only: 0.2.1 logs still decode.
+     */
+    const val FEATURE_SCHEMA_VERSION: String = "0.2.2"
 
     /**
      * Length of one per-second bucket. A record stamped `t_mono_ms = t` summarises the half-open

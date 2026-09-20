@@ -127,7 +127,7 @@ class MainActivity : ComponentActivity() {
         val sid = prefs.activeSessionId
         Thread {
             val text = try {
-                SessionRecovery.recover(path, sid)
+                SessionRecovery.recover(path, sid, prefs.lastSelfCheck)
             } catch (e: Exception) {
                 "${SessionRecovery.PREFIX}\n복원 실패: ${e.javaClass.simpleName}: ${e.message}"
             }
@@ -193,7 +193,7 @@ class MainActivity : ComponentActivity() {
         for (b in markerButtons) b.isEnabled = running
         val recovered = prefs.lastRecoveredSessionId
         status.text = when {
-            running -> "실행 중 (세션 ${EngineStatus.sessionId}, 마커 ${EngineStatus.segmentLabel ?: "-"})\n${EngineStatus.line}"
+            running -> "실행 중 (세션 ${EngineStatus.sessionId}, 마커 ${EngineStatus.segmentLabel ?: "-"})\n${EngineStatus.selfCheck ?: "자가 점검 중"}\n${EngineStatus.line}"
             recovering -> "이전 세션 ${prefs.activeSessionId} 이 정상 정지되지 않았다. session.jsonl 로 요약을 복원하는 중"
             recovered != null -> "이전 세션 $recovered 은 서비스가 죽어 정상 정지 요약이 없다. 아래 요약은 session.jsonl 로 다시 계산한 것이다 " +
                 "(session_end PROCESS_DEATH_RECOVERED).\n마지막 flush(30초) 안의 레코드는 잃었을 수 있다."

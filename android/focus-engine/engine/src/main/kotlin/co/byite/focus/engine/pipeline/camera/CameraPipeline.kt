@@ -60,7 +60,10 @@ class CameraPipeline(
     private val listener: Listener,
 ) {
     interface Listener {
-        /** Camera2 capture result for one frame the HAL produced, stamped on the monotonic clock. */
+        /** First processed frame: the session starts at its capture time (buckets align to it). Called before its [onFrame]. */
+        fun onSessionStart(captureMonoMs: Long)
+
+        /** Camera2 capture result for one frame the HAL produced, stamped on the monotonic clock. May precede [onSessionStart]. */
         fun onFrameRequested(captureMonoNs: Long)
         fun onFrame(frame: FrameSample, pose: PoseSample?, scene: SceneSample?)
         fun onEvent(message: String)
@@ -72,7 +75,7 @@ class CameraPipeline(
     private var analysis: ImageAnalysis? = null
     private var provider: ProcessCameraProvider? = null
     private var scratch: ByteBuffer? = null
-    private var sessionStartMs = 0L
+    private var sessionStartMs = -1L
     private var lastTimestampMs = Long.MIN_VALUE
     private var lastPoseBucket = -1L
     private var lastPoseNs = Long.MIN_VALUE
@@ -93,15 +96,30 @@ class CameraPipeline(
     var timebase: Timebase? = null
         private set
 
-    /** Creates the landmarkers on the analysis thread. Throws when a model cannot be loaded. */
-    fun prepare() {
-        face = FacePipeline(context)
-        pose = PosePipeline(context)
+    /**
+     * Engine self-check (analysis thread): creates both landmarkers and runs one synthetic frame
+     * (640×480 mid-grey RGBA, timestamp 0) through each. Returns a one-line report; throws — including
+     * `Error`s such as NoClassDefFoundError / UnsatisfiedLinkError — when a model cannot be loaded or run.
+     * A real frame always carries a later timestamp than the synthetic one, so VIDEO mode stays monotonic.
+     */
+    fun prepare(): String {
+        val fp = FacePipeline(context)
+        face = fp
+        val pp = PosePipeline(context)
+        pose = pp
+        val w = SELF_CHECK_WIDTH
+        val h = SELF_CHECK_HEIGHT
+        val buf = ByteBuffer.allocateDirect(w * 4 * h)
+        for (i in 0 until buf.capacity()) buf.put(0x80.toByte())
+        buf.rewind()
+        val frame = RgbaFrame(buf, w, h, 0, 0L)
+        val f = fp.process(frame, 0L)
+        val p = pp.process(frame, 0L)
+        return "OK (Face ${"%.1f".format(f.inferMs)}ms, Pose ${"%.1f".format(p.inferMs)}ms, synthetic ${w}x$h grey: face=${f.detected} pose=${p.detected})"
     }
 
     /** Selects the front camera and binds one ImageAnalysis to [owner]. Returns false when there is no front camera. */
-    fun bind(cameraProvider: ProcessCameraProvider, owner: LifecycleOwner, sessionStartMonoMs: Long): Boolean {
-        sessionStartMs = sessionStartMonoMs
+    fun bind(cameraProvider: ProcessCameraProvider, owner: LifecycleOwner): Boolean {
         val selector = CameraSelector.DEFAULT_FRONT_CAMERA
         val infos = selector.filter(cameraProvider.availableCameraInfos)
         if (infos.isEmpty()) return false
@@ -223,6 +241,10 @@ class CameraPipeline(
                 return
             }
             lastTimestampMs = tsMs
+            if (sessionStartMs < 0) {
+                sessionStartMs = tsMs
+                listener.onSessionStart(tsMs)
+            }
             val frame = wrap(image, captureNs)
             val f = fp.process(frame, tsMs)
             if (!f.transformOk && !transformWarned) {
@@ -301,9 +323,13 @@ class CameraPipeline(
     }
 
     /** One-line frame-path statistics for the event log. */
-    fun stats(): String = "frames zero_copy=$zeroCopyFrames copied=$copiedFrames non_monotonic=$nonMonotonic capture_failures=$captureFailures fps_result=${fpsEffective ?: "unknown"}"
+    fun stats(): String = "frames zero_copy=$zeroCopyFrames copied=$copiedFrames non_monotonic=$nonMonotonic capture_failures=$captureFailures " +
+        "jitter_skipped_fast_rotation=${face?.jitterSkippedFastRotation ?: 0} fps_result=${fpsEffective ?: "unknown"}"
 
     companion object {
+        const val SELF_CHECK_WIDTH = 640
+        const val SELF_CHECK_HEIGHT = 480
+
         /** Pose cadence while no face is detected: ≥ 3 fps. */
         const val POSE_FAST_PERIOD_NS: Long = 300_000_000L
     }

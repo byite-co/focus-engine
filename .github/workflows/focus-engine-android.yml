@@ -53,7 +53,7 @@ jobs:
           yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
           "$SDKMANAGER" --install "platforms;android-37.2" "build-tools;37.0.0" > /dev/null
 
-      - name: Unit tests (engine JVM: pure logic + data boundary)
+      - name: "Unit tests (engine JVM: pure logic, jitter, data boundary)"
         run: ./gradlew :engine:testDebugUnitTest --console=plain
 
       - name: assembleDebug

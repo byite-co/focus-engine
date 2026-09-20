@@ -17,6 +17,7 @@ Flutter 앱에 붙는 네이티브 측정 엔진(Android 우선)과 순수 로�
 | `gt/sessions/` | 실측 세션 로그. git에 올리지 않는다 (`.gitkeep`만 추적) |
 | `core/focus-core/` | 순수 로직 코어. Kotlin JVM, Android·java.* 의존 금지 |
 | `android/spike-r1/` | 리스크 스파이크 R1. 버리는 코드 |
+| `android/focus-engine/` | V0-A/B 측정 엔진. `:engine`(Android 라이브러리, `core/focus-core`를 composite build로 참조)과 `:devapp`(개발용 앱). 지시문 `directives/C-v0ab-raw-features.md` |
 | `directives/` | CC 세션 지시문 보관 |
 | `tools/hooks/` | git 훅. `pre-commit`이 미디어 파일 규칙을 검사한다 |
 | `.github/workflows/guard-media.yml` | push와 PR에서 같은 미디어 규칙을 검사한다 |

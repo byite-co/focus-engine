@@ -10,6 +10,7 @@ import co.byite.focus.core.model.ScreenState
 import co.byite.focus.core.model.ZoneStatus
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -19,7 +20,8 @@ class FeatureAggregatorTest {
     private val device = DeviceSample(thermalStatus = 1, batteryPct = 80, batteryCurrentUa = -350_000, batteryVoltageMv = 4000, isInteractive = false, isDeviceIdle = true, screenState = ScreenState.OFF, appState = AppState.BACKGROUND)
 
     private fun ns(ms: Long): Long = ms * 1_000_000L
-    private fun agg(delay: Long = 300) = FeatureAggregator(t0, Synth.UTC0, closeDelayMs = delay)
+    /** Aggregator with the first-frame scene sample the device layer guarantees (session start = first processed frame). */
+    private fun agg(delay: Long = 300) = FeatureAggregator(t0, Synth.UTC0, closeDelayMs = delay).also { it.onScene(SceneSample(ns(t0 + 5), 118.0, 4.0, 9.0)) }
 
     private fun frame(ms: Long, face: Boolean = true, yaw: Double = 1.0, pitch: Double = -5.0, roll: Double = 0.5, width: Double = 200.0, j: Double? = 0.01, infer: Double = 15.0) =
         if (face) FrameSample(ns(t0 + ms), 30_000_000L, true, yaw, pitch, roll, width, j, infer)
@@ -153,19 +155,28 @@ class FeatureAggregatorTest {
     }
 
     @Test
-    fun sceneLumaCarriesForwardAndTextureStatsAreSummarised() {
-        val a = agg()
+    fun sceneLumaIsMeasuredAndCarriesForwardOnlyWhenTheBucketHasNoSample() {
+        val a = FeatureAggregator(t0, Synth.UTC0)
         a.onScene(SceneSample(ns(t0 + 100), 100.0, 3.0, 8.0))
         a.onScene(SceneSample(ns(t0 + 600), 120.0, 2.0, 10.0))
-        val closed = a.closeBuckets(t0 + 2300, device)
+        a.onScene(SceneSample(ns(t0 + 2100), 90.0, 1.0, 7.0))
+        val closed = a.closeBuckets(t0 + 3300, device)
         assertEquals(110.0, closed[0].second.sceneLuma)
         assertEquals(2.0, closed[0].raw.tileTextureMin)
         assertEquals(9.0, closed[0].raw.tileTextureMedian)
         assertEquals(2, closed[0].raw.sceneSamples)
-        assertEquals(110.0, closed[1].second.sceneLuma, "no sample in the bucket: last known value")
+        assertEquals(110.0, closed[1].second.sceneLuma, "no sample in the bucket: last measured value")
         assertEquals(0, closed[1].raw.sceneSamples)
         assertNull(closed[1].raw.tileTextureMin)
         assertNull(closed[1].second.bgTileTextureRatio)
+        assertEquals(90.0, closed[2].second.sceneLuma)
+    }
+
+    @Test
+    fun aBucketClosedBeforeAnySceneSampleIsAContractViolationNotAConstant() {
+        val a = FeatureAggregator(t0, Synth.UTC0)
+        a.onFrame(frame(0))
+        assertFailsWith<IllegalStateException> { a.closeBuckets(t0 + 1300, device) }
     }
 
     @Test
@@ -203,7 +214,7 @@ class FeatureAggregatorTest {
         assertTrue(s.events.isEmpty())
         assertNull(s.torsoCenterOffsetRatio)
         assertNull(s.torsoWidthRatio)
-        assertEquals(ZoneStatus.NO_HEAD_POSE, s.zoneStatus)
+        assertEquals(ZoneStatus.UNCALIBRATED, s.zoneStatus)
         assertNull(s.zoneId)
         assertEquals(ImuState.UNKNOWN, s.imuState)
         assertEquals(PowerState.P0, s.powerState)

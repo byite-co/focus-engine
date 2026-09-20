@@ -5,6 +5,7 @@ import co.byite.focus.core.engine.NaiveBaselineEngine
 import co.byite.focus.core.log.FocusJson
 import co.byite.focus.core.model.Event
 import co.byite.focus.core.model.EventType
+import co.byite.focus.core.model.FocusSchema
 import co.byite.focus.core.model.State
 import co.byite.focus.core.replay.ReplayRunner
 import kotlin.test.Test
@@ -78,7 +79,7 @@ class GtDiffTest {
         assertEquals(0, cmp.primary.missedAbsentS)
         assertEquals(cmp.primary.copy(engineId = cmp.baseline.engineId), cmp.baseline)
         assertEquals(GtRules.DEFAULT, report.gtRules)
-        assertEquals("0.2.1", report.featureSchemaVersion)
+        assertEquals(FocusSchema.FEATURE_SCHEMA_VERSION, report.featureSchemaVersion)
 
         val items = report.pass.items.associateBy { it.id }
         assertEquals(true, items.getValue("absent_recall").passed)

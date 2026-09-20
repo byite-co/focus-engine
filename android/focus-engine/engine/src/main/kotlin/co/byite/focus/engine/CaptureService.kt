@@ -76,6 +76,9 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
     private var startUtcMs = 0L
     private var lastTimebaseMs = 0L
     private var eventsOut: LazyWriter? = null
+    private var selfCheck: String = "자가 점검: 기록 없음"
+    /** Capture results that arrived before the first processed frame fixed the session start. */
+    private val pendingRequested = ArrayList<Long>()
 
     override fun onCreate() {
         super.onCreate()
@@ -121,6 +124,8 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
         EngineStatus.logPath = files.sessionJsonl.absolutePath
         EngineStatus.line = "카메라 여는 중"
         EngineStatus.segmentLabel = null
+        EngineStatus.selfCheck = null
+        pendingRequested.clear()
         prefs.lastRecoveredSessionId = null
         prefs.lastLogPath = files.sessionJsonl.absolutePath
         prefs.activeSessionId = files.sessionId
@@ -155,24 +160,33 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    /** Analysis thread: load the models, then bind the camera on the main thread. */
+    /** Analysis thread: self-check (models + one synthetic frame), then bind the camera on the main thread. */
     private fun openSession(provider: ProcessCameraProvider) {
         val ah = analysisHandler ?: return
         val cam = CameraPipeline(this, ah, this)
-        try {
-            cam.prepare()
-        } catch (e: Exception) {
-            Log.e(TAG, "model load failed", e)
-            event("model_load_failed ${e.javaClass.simpleName}: ${e.message}")
+        val check = try {
+            "자가 점검: " + cam.prepare()
+        } catch (t: Throwable) {
+            // Errors (NoClassDefFoundError, UnsatisfiedLinkError) included: this is what the stubbed
+            // telemetry dependency would surface as, and it must be visible, not a silent crash.
+            Log.e(TAG, "self-check failed", t)
+            val msg = "자가 점검 실패: ${t.javaClass.name}: ${t.message}"
+            selfCheck = msg
+            EngineStatus.selfCheck = msg
+            prefs.lastSelfCheck = msg
+            prefs.lastSummary = msg
+            event("self_check_failed ${t.javaClass.name}: ${t.message}")
             mainHandler.post { stopSession(SessionEndReason.UNKNOWN) }
             return
         }
+        selfCheck = check
+        EngineStatus.selfCheck = check
+        prefs.lastSelfCheck = check
+        event("self_check $check")
         mainHandler.post {
             if (!running || stopping) return@post
-            startMonoMs = SystemClock.elapsedRealtime()
-            startUtcMs = System.currentTimeMillis()
             val bound = try {
-                cam.bind(provider, this, startMonoMs)
+                cam.bind(provider, this)
             } catch (e: Exception) {
                 Log.e(TAG, "camera bind failed", e)
                 event("camera_bind_failed ${e.javaClass.simpleName}: ${e.message}")
@@ -184,54 +198,73 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
                 return@post
             }
             val facts = cam.facts!!
-            val tb = cam.timebase!!
             ah.post {
-                timebase = tb
                 camera = cam
-                val agg = FeatureAggregator(startMonoMs, startUtcMs)
-                aggregator = agg
-                val h = SessionHeader(
-                    sessionId = files!!.sessionId,
-                    participantId = PARTICIPANT_ID,
-                    tStartMonoMs = startMonoMs,
-                    tStartUtcMs = startUtcMs,
-                    specVersion = FocusSchema.SPEC_VERSION,
-                    algorithmVersion = BuildConfig.GIT_SHA,
-                    featureSchemaVersion = FocusSchema.FEATURE_SCHEMA_VERSION,
-                    parameterSetId = ParameterSet.DEFAULT.parameterSetId,
-                    deviceModel = "${Build.MANUFACTURER} ${Build.MODEL}",
-                    osVersion = "${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})",
-                    cameraResolution = "${facts.width}x${facts.height}",
-                    nominalFps = facts.nominalFps,
-                    calibrationId = "",
-                    calibrationSnapshotVersion = "",
-                    taskMode = TaskMode.VISUAL,
-                )
-                header = h
-                logger?.writeHeader(h)
-                val tbRec = tb.record(startMonoMs)
-                timebaseLines.add(tbRec)
-                logger?.writeTimebase(tbRec)
-                lastTimebaseMs = startMonoMs
-                val mp = MotionPipeline(this, ah, tb) { s -> aggregator?.onImu(s) }
-                motion = mp
-                val imuOk = mp.start()
+                timebase = cam.timebase
                 event(
-                    "session_start id=${h.sessionId} camera=${facts.cameraId} ${h.cameraResolution} fps_selected=${facts.fpsSelected} " +
-                        "fps_available=${facts.fpsAvailable} ts_source=${tb.cameraSourceName} ${facts.stabilization} imu=$imuOk " +
-                        "engine=${BuildConfig.GIT_SHA} battery_opt_ignored=${device.isIgnoringBatteryOptimizations()}",
+                    "camera_bound camera=${facts.cameraId} ${facts.width}x${facts.height} fps_selected=${facts.fpsSelected} " +
+                        "fps_available=${facts.fpsAvailable} ts_source=${facts.timestampSource} ${facts.stabilization}",
                 )
-                EngineStatus.line = "카메라 바인딩됨 ${h.cameraResolution} fps ${facts.fpsSelected} ts ${tb.cameraSourceName}"
-                mainHandler.post { updateNotification(EngineStatus.line) }
-                scheduleTick()
+                EngineStatus.line = "$check\n카메라 바인딩됨 ${facts.width}x${facts.height} fps ${facts.fpsSelected} ts ${facts.timestampSource} · 첫 프레임 대기"
+                mainHandler.post { updateNotification("카메라 ${facts.width}x${facts.height} fps ${facts.fpsSelected}") }
             }
         }
     }
 
     // ---- CameraPipeline.Listener (analysis thread)
 
+    /** The session starts at the first processed frame's capture time: buckets align to it and bucket 0 always has a scene sample. */
+    override fun onSessionStart(captureMonoMs: Long) {
+        val cam = camera ?: return
+        val tb = timebase ?: return
+        val facts = cam.facts ?: return
+        startMonoMs = captureMonoMs
+        startUtcMs = System.currentTimeMillis() - (SystemClock.elapsedRealtime() - captureMonoMs)
+        val agg = FeatureAggregator(startMonoMs, startUtcMs)
+        aggregator = agg
+        for (t in pendingRequested) agg.onFrameRequested(t)
+        pendingRequested.clear()
+        val h = SessionHeader(
+            sessionId = files!!.sessionId,
+            participantId = PARTICIPANT_ID,
+            tStartMonoMs = startMonoMs,
+            tStartUtcMs = startUtcMs,
+            specVersion = FocusSchema.SPEC_VERSION,
+            algorithmVersion = BuildConfig.GIT_SHA,
+            featureSchemaVersion = FocusSchema.FEATURE_SCHEMA_VERSION,
+            parameterSetId = ParameterSet.DEFAULT.parameterSetId,
+            deviceModel = "${Build.MANUFACTURER} ${Build.MODEL}",
+            osVersion = "${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})",
+            cameraResolution = "${facts.width}x${facts.height}",
+            nominalFps = facts.nominalFps,
+            calibrationId = NO_CALIBRATION,
+            calibrationSnapshotVersion = NO_CALIBRATION,
+            taskMode = TaskMode.VISUAL,
+        )
+        header = h
+        logger?.writeHeader(h)
+        val tbRec = tb.record(startMonoMs)
+        timebaseLines.add(tbRec)
+        logger?.writeTimebase(tbRec)
+        lastTimebaseMs = startMonoMs
+        val ah = analysisHandler ?: return
+        val mp = MotionPipeline(this, ah, tb) { s -> aggregator?.onImu(s) }
+        motion = mp
+        val imuOk = mp.start()
+        event(
+            "session_start id=${h.sessionId} t_start_mono_ms=$startMonoMs ${h.cameraResolution} nominal_fps=${facts.nominalFps} " +
+                "ts_source=${tb.cameraSourceName} imu=$imuOk engine=${BuildConfig.GIT_SHA} battery_opt_ignored=${device.isIgnoringBatteryOptimizations()}",
+        )
+        scheduleTick()
+    }
+
     override fun onFrameRequested(captureMonoNs: Long) {
-        aggregator?.onFrameRequested(captureMonoNs)
+        val agg = aggregator
+        if (agg == null) {
+            if (pendingRequested.size < PENDING_REQUESTED_MAX) pendingRequested.add(captureMonoNs)
+        } else {
+            agg.onFrameRequested(captureMonoNs)
+        }
     }
 
     override fun onFrame(frame: FrameSample, pose: PoseSample?, scene: SceneSample?) {
@@ -334,7 +367,7 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
             event("session_stop reason=$reason (no header)")
             logger?.close()
             logger?.awaitIdle(3000)
-            return "세션이 카메라 바인딩 전에 끝났다: $reason"
+            return selfCheck + "\n세션이 첫 프레임 전에 끝났다: $reason"
         }
         val end = SessionEnd(now, System.currentTimeMillis(), reason)
         lg.writeSessionEnd(end)
@@ -343,7 +376,7 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
         if (agg.lateInputs > 0) notes.add("닫힌 버킷에 늦게 도착한 입력 ${agg.lateInputs}건은 버렸다.")
         if (agg.nonMonotonicFrames > 0) notes.add("capture timestamp 가 역행한 프레임 ${agg.nonMonotonicFrames}개.")
         val log = SessionLog(h, records.map { it.second }, sessionEnd = end, timebase = timebaseLines.toList(), v0bRaw = records.map { it.raw })
-        val summary = V0bReport.build(log, notes).render()
+        val summary = selfCheck + "\n" + V0bReport.build(log, notes).render()
         event("session_stop reason=$reason records=${records.size}")
         files?.let { f ->
             val done = CountDownLatch(1)
@@ -473,6 +506,9 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
         const val ACTION_SET_MARKER = "co.byite.focus.engine.action.SET_MARKER"
         const val EXTRA_LABEL = "label"
         const val PARTICIPANT_ID = "dev"
+        /** header calibration_id / calibration_snapshot_version before V0-C (CHANGELOG v0.2.2 (a)). */
+        const val NO_CALIBRATION = "none"
+        private const val PENDING_REQUESTED_MAX = 300
         private const val CHANNEL_ID = "focus-engine-capture"
         private const val NOTIFICATION_ID = 11
         private const val WAKE_LOCK_TIMEOUT_MS = 6L * 60 * 60 * 1000

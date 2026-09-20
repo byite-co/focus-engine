@@ -27,7 +27,8 @@ data class FaceFeatures(
 /**
  * MediaPipe Face Landmarker, VIDEO mode, CPU, num_faces = 1, blendshapes + transformation matrix on
  * (spec 1장 파이프라인). Head pose via [HeadPose], face width = distance between face-oval landmarks
- * 234 and 454 in buffer pixels, jitter via [RigidJitter].
+ * 234 and 454 in buffer pixels, jitter via [RigidJitter] (similarity residual ÷ inter-ocular distance,
+ * frame pairs with head rotation > 30°/s excluded).
  */
 class FacePipeline(context: Context) : AutoCloseable {
     private val landmarker: FaceLandmarker = FaceLandmarker.createFromOptions(
@@ -41,9 +42,7 @@ class FacePipeline(context: Context) : AutoCloseable {
             .build(),
     )
     private val jitter = RigidJitter()
-    private val xs = DoubleArray(RigidJitter.SUBSET.size)
-    private val ys = DoubleArray(RigidJitter.SUBSET.size)
-    private val zs = DoubleArray(RigidJitter.SUBSET.size)
+    private val subset = DoubleArray(3 * RigidJitter.SUBSET.size)
     private var lastRotation = -1
     private var options: ImageProcessingOptions? = null
 
@@ -70,14 +69,15 @@ class FacePipeline(context: Context) : AutoCloseable {
         val dx = (a.x() - b.x()) * w
         val dy = (a.y() - b.y()) * h
         val faceWidth = sqrt(dx * dx + dy * dy)
-        val j = if (faceWidth > 0.0) {
+        val interocular = interocularPx(lm, w, h)
+        val j = if (interocular > 0.0) {
             for (i in RigidJitter.SUBSET.indices) {
                 val p = lm[RigidJitter.SUBSET[i]]
-                xs[i] = p.x() * w
-                ys[i] = p.y() * h
-                zs[i] = p.z() * w
+                subset[3 * i] = p.x() * w
+                subset[3 * i + 1] = p.y() * h
+                subset[3 * i + 2] = p.z() * w
             }
-            jitter.next(RigidJitter.toCanonical(xs, ys, zs, HeadPose.rotationOf(m), faceWidth), frame.captureMonoNs)
+            jitter.next(subset, HeadPose.rotationOf(m), interocular, frame.captureMonoNs)
         } else {
             jitter.reset()
             null
@@ -94,12 +94,24 @@ class FacePipeline(context: Context) : AutoCloseable {
         )
     }
 
+    /** Pixel distance between the eye centres (midpoints of outer and inner corners) in the buffer frame. */
+    private fun interocularPx(lm: List<com.google.mediapipe.tasks.components.containers.NormalizedLandmark>, w: Double, h: Double): Double {
+        val lo = lm[RigidJitter.LEFT_EYE_OUTER]; val li = lm[RigidJitter.LEFT_EYE_INNER]
+        val ri = lm[RigidJitter.RIGHT_EYE_INNER]; val ro = lm[RigidJitter.RIGHT_EYE_OUTER]
+        val lx = (lo.x() + li.x()) / 2.0 * w; val ly = (lo.y() + li.y()) / 2.0 * h
+        val rx = (ri.x() + ro.x()) / 2.0 * w; val ry = (ri.y() + ro.y()) / 2.0 * h
+        return sqrt((lx - rx) * (lx - rx) + (ly - ry) * (ly - ry))
+    }
+
     private fun optionsFor(rotation: Int): ImageProcessingOptions {
         val o = options
         if (o != null && rotation == lastRotation) return o
         lastRotation = rotation
         return ImageProcessingOptions.builder().setRotationDegrees(rotation).build().also { options = it }
     }
+
+    /** Frame pairs the jitter skipped for fast head rotation (event log). */
+    val jitterSkippedFastRotation: Long get() = jitter.skippedFastRotation
 
     override fun close() = landmarker.close()
 

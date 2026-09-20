@@ -20,10 +20,11 @@ object SessionRecovery {
     private const val TAG = "FocusRecovery"
     const val PREFIX = "[JSONL 재계산] 정상 종료 요약이 없어 session.jsonl 로 다시 계산했다."
 
-    fun recover(logPath: String?, sessionId: String?): String {
+    fun recover(logPath: String?, sessionId: String?, selfCheckLine: String?): String {
+        val head = (selfCheckLine ?: "자가 점검: 기록 없음") + "\n" + PREFIX
         val file = logPath?.let { File(it) }
         if (file == null || !file.isFile) {
-            return "$PREFIX\n세션 ${sessionId ?: "?"}: session.jsonl 이 없다 (헤더를 쓰기 전에 죽었거나 파일이 지워졌다)."
+            return "$head\n세션 ${sessionId ?: "?"}: session.jsonl 이 없다 (헤더를 쓰기 전에 죽었거나 파일이 지워졌다)."
         }
         val text = file.readText()
         val (log, droppedTornLine) = readTolerant(text)
@@ -46,7 +47,7 @@ object SessionRecovery {
         val notes = ArrayList<String>()
         notes.add("프로세스 종료 뒤 복원: 마지막 flush(최대 30초) 이후의 레코드는 잃었을 수 있다.")
         if (droppedTornLine) notes.add("잘린 마지막 줄 하나를 버렸다.")
-        val summary = "$PREFIX\n${V0bReport.build(closed, notes).render()}"
+        val summary = "$head\n${V0bReport.build(closed, notes).render()}"
         val out = File(file.parentFile, "summary.txt")
         if (!out.exists()) {
             try {
