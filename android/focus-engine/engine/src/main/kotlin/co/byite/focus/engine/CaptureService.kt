@@ -176,6 +176,7 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
             prefs.lastSelfCheck = msg
             prefs.lastSummary = msg
             event("self_check_failed ${t.javaClass.name}: ${t.message}")
+            runCatching { cam.release() }
             mainHandler.post { stopSession(SessionEndReason.UNKNOWN) }
             return
         }
@@ -183,6 +184,8 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
         EngineStatus.selfCheck = check
         prefs.lastSelfCheck = check
         event("self_check $check")
+        // From here every stop path releases the landmarkers through finishOnAnalysisThread.
+        camera = cam
         mainHandler.post {
             if (!running || stopping) return@post
             val bound = try {
@@ -199,7 +202,6 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
             }
             val facts = cam.facts!!
             ah.post {
-                camera = cam
                 timebase = cam.timebase
                 event(
                     "camera_bound camera=${facts.cameraId} ${facts.width}x${facts.height} fps_selected=${facts.fpsSelected} " +
