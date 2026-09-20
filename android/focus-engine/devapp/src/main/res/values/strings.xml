@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">focus-engine dev</string>
+    <string name="btn_permissions">권한 요청</string>
+    <string name="btn_start">시작</string>
+    <string name="btn_stop">정지</string>
+    <string name="btn_copy_summary">요약 복사</string>
+    <string name="btn_battery_settings">배터리 최적화 설정 열기</string>
+    <string name="label_markers">구간 마커</string>
+    <string name="marker_front">정면</string>
+    <string name="marker_still">정지</string>
+    <string name="marker_bow">숙임</string>
+    <string name="marker_prone">엎드림</string>
+    <string name="marker_away">자리비움</string>
+    <string name="marker_empty_chair">빈의자</string>
+    <string name="marker_clear">마커 해제</string>
+    <string name="label_status">상태</string>
+    <string name="label_log_path">세션 로그</string>
+    <string name="label_summary">마지막 요약</string>
+    <string name="status_idle">대기 중</string>
+    <string name="toast_copied">요약을 클립보드에 복사했다</string>
+    <string name="toast_need_camera">CAMERA 권한이 필요하다</string>
+    <string name="toast_not_visible">Activity 가 보이는 상태에서만 시작한다</string>
+    <string name="toast_no_summary">복사할 요약이 없다</string>
+    <string name="toast_not_running">측정 중이 아니다</string>
+</resources>
