@@ -11,6 +11,9 @@ import co.byite.focus.core.model.ScreenState
  * All times are on the session's monotonic clock (Android `elapsedRealtime`), already converted
  * by the device layer's Timebase from the camera / IMU clocks. Frame values are stamped with the
  * *capture* timestamp, never with the callback arrival time (spec 9장 시간 기준).
+ *
+ * Threading (directive D, 정정 3): every sample is produced on a pipeline thread and *posted* to the
+ * aggregation queue; only that queue's thread touches the aggregator.
  */
 data class FrameSample(
     /** Capture timestamp (ns, monotonic). */
@@ -26,8 +29,11 @@ data class FrameSample(
     val faceWidthPx: Double? = null,
     /** Rigid-residual jitter j against the previous face frame (spec 6장). Null without a face or without a previous frame. */
     val jitterJ: Double? = null,
-    /** Face Landmarker wall time for this frame (ms). */
-    val faceInferMs: Double,
+    /** Stage timings of this frame on the analysis thread (ms). The Face Landmarker time itself travels with [FeatureAggregator.onFrameProcessed]. */
+    val wrapMs: Double = 0.0,
+    val facePostMs: Double = 0.0,
+    /** Whole analyzer callback for this frame (entry → image closed), the "Face cycle" a PerformanceHintManager session is told about. */
+    val totalMs: Double = 0.0,
 ) {
     init {
         if (!faceDetected) {
@@ -35,7 +41,7 @@ data class FrameSample(
                 "face scalars need a detected face (t=$captureMonoNs)"
             }
         }
-        require(faceInferMs >= 0.0 && latencyNs >= 0L) { "timings must not be negative (t=$captureMonoNs)" }
+        require(latencyNs >= 0L && wrapMs >= 0.0 && facePostMs >= 0.0 && totalMs >= 0.0) { "timings must not be negative (t=$captureMonoNs)" }
     }
 }
 
@@ -62,6 +68,8 @@ data class PoseSample(
     /** Upright frame size in pixels. */
     val frameWidthPx: Int,
     val frameHeightPx: Int,
+    /** Pose request (frame copied on the analysis thread) → inference start on the worker (ms). */
+    val waitMs: Double = 0.0,
 ) {
     init {
         require(frameWidthPx > 0 && frameHeightPx > 0) { "frame size must be positive (t=$captureMonoNs)" }
@@ -76,6 +84,7 @@ data class PoseSample(
             "shoulder centre and width go together (t=$captureMonoNs)"
         }
         shoulderWidthPx?.let { require(it > 0.0) { "shoulder width must be positive (t=$captureMonoNs)" } }
+        require(poseInferMs >= 0.0 && waitMs >= 0.0) { "timings must not be negative (t=$captureMonoNs)" }
     }
 
     val hasShoulders: Boolean get() = detected && shoulderCenterXPx != null
@@ -89,7 +98,13 @@ data class SceneSample(
     /** Minimum and median of the 16 tile textures (std-dev of Y inside a tile). */
     val tileTextureMin: Double,
     val tileTextureMedian: Double,
-)
+    /** SceneQuality wall time on the analysis thread (ms). */
+    val computeMs: Double = 0.0,
+) {
+    init {
+        require(computeMs >= 0.0) { "timings must not be negative (t=$captureMonoNs)" }
+    }
+}
 
 /** One accelerometer sample (m/s²) on the monotonic clock. */
 data class ImuSample(

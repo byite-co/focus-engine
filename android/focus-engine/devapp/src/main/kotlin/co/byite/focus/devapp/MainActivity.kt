@@ -12,6 +12,8 @@ import android.os.Looper
 import android.provider.Settings
 import android.view.View
 import android.widget.Button
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -22,13 +24,14 @@ import androidx.core.graphics.Insets
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.Lifecycle
+import co.byite.focus.engine.CapturePreset
 import co.byite.focus.engine.CaptureService
 import co.byite.focus.engine.DeviceStatusReader
 import co.byite.focus.engine.EnginePrefs
 import co.byite.focus.engine.EngineStatus
 import co.byite.focus.engine.SessionRecovery
 
-/** Dev app: start / stop, segment markers, live status, summary, copy. The engine is `:engine`. */
+/** Dev app: preset choice, start / stop, segment markers, live status, summary, copy. The engine is `:engine`. */
 class MainActivity : ComponentActivity() {
 
     private lateinit var prefs: EnginePrefs
@@ -39,6 +42,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var summary: TextView
     private lateinit var btnStart: Button
     private lateinit var btnStop: Button
+    private lateinit var presetGroup: RadioGroup
     private val markerButtons = ArrayList<Button>()
     private val ui = Handler(Looper.getMainLooper())
     private var recovering = false
@@ -65,6 +69,8 @@ class MainActivity : ComponentActivity() {
         summary = findViewById(R.id.summary)
         btnStart = findViewById(R.id.btn_start)
         btnStop = findViewById(R.id.btn_stop)
+        presetGroup = findViewById(R.id.preset_group)
+        buildPresetButtons()
 
         findViewById<Button>(R.id.btn_permissions).setOnClickListener {
             val wanted = mutableListOf(Manifest.permission.CAMERA)
@@ -95,6 +101,33 @@ class MainActivity : ComponentActivity() {
             markerButtons += b
         }
         findViewById<Button>(R.id.btn_marker_clear).also { markerButtons += it }.setOnClickListener { setMarker(null) }
+    }
+
+    /** One radio button per capture preset (directive D); the last choice is remembered. */
+    private fun buildPresetButtons() {
+        val last = CapturePreset.byId(prefs.lastPreset)
+        for (p in CapturePreset.entries) {
+            val b = RadioButton(this)
+            b.id = View.generateViewId()
+            b.text = getString(R.string.preset_button, p.id, presetSummary(p))
+            b.tag = p.id
+            b.isChecked = p == last
+            presetGroup.addView(b)
+        }
+    }
+
+    private fun presetSummary(p: CapturePreset): String = when (p) {
+        CapturePreset.A -> getString(R.string.preset_a)
+        CapturePreset.B -> getString(R.string.preset_b)
+        CapturePreset.C -> getString(R.string.preset_c)
+        CapturePreset.D -> getString(R.string.preset_d)
+        CapturePreset.E -> getString(R.string.preset_e)
+        CapturePreset.G -> getString(R.string.preset_g)
+    }
+
+    private fun selectedPreset(): CapturePreset {
+        val checked = findViewById<RadioButton?>(presetGroup.checkedRadioButtonId)
+        return CapturePreset.byId(checked?.tag as? String)
     }
 
     /** systemBars + displayCutout insets as root padding, absolute each time (no accumulation). */
@@ -161,7 +194,9 @@ class MainActivity : ComponentActivity() {
             return
         }
         prefs.lastRecoveredSessionId = null
-        ContextCompat.startForegroundService(this, CaptureService.startIntent(this))
+        val preset = selectedPreset()
+        prefs.lastPreset = preset.id
+        ContextCompat.startForegroundService(this, CaptureService.startIntent(this, preset))
         ui.postDelayed({ refresh() }, 300)
     }
 
@@ -190,10 +225,11 @@ class MainActivity : ComponentActivity() {
         val running = EngineStatus.running
         btnStart.isEnabled = cam && !running && !recovering
         btnStop.isEnabled = running
+        for (i in 0 until presetGroup.childCount) presetGroup.getChildAt(i).isEnabled = !running && !recovering
         for (b in markerButtons) b.isEnabled = running
         val recovered = prefs.lastRecoveredSessionId
         status.text = when {
-            running -> "실행 중 (세션 ${EngineStatus.sessionId}, 마커 ${EngineStatus.segmentLabel ?: "-"})\n${EngineStatus.selfCheck ?: "자가 점검 중"}\n${EngineStatus.line}"
+            running -> "실행 중 (세션 ${EngineStatus.sessionId}, 프리셋 ${EngineStatus.preset ?: "-"}, 마커 ${EngineStatus.segmentLabel ?: "-"})\n${EngineStatus.selfCheck ?: "자가 점검 중"}\n${EngineStatus.line}"
             recovering -> "이전 세션 ${prefs.activeSessionId} 이 정상 정지되지 않았다. session.jsonl 로 요약을 복원하는 중"
             recovered != null -> "이전 세션 $recovered 은 서비스가 죽어 정상 정지 요약이 없다. 아래 요약은 session.jsonl 로 다시 계산한 것이다 " +
                 "(session_end PROCESS_DEATH_RECOVERED).\n마지막 flush(30초) 안의 레코드는 잃었을 수 있다."

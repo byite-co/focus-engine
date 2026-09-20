@@ -12,6 +12,8 @@ object EngineStatus {
     @Volatile var segmentLabel: String? = null
     /** "자가 점검: OK (…)" or the failure with exception class and message; null before the first start. */
     @Volatile var selfCheck: String? = null
+    /** Preset id of the running session (C2 when C fell back), null when idle. */
+    @Volatile var preset: String? = null
 }
 
 /** What must survive the process: last summary, log path, whether a session is still open (R6 복구). */
@@ -51,6 +53,11 @@ class EnginePrefs(context: Context) {
         get() = p.getString(KEY_RECOVERED_ID, null)
         set(v) = p.edit().putString(KEY_RECOVERED_ID, v).apply()
 
+    /** Capture preset id the dev app last selected (directive D). */
+    var lastPreset: String?
+        get() = p.getString(KEY_PRESET, null)
+        set(v) = p.edit().putString(KEY_PRESET, v).apply()
+
     private companion object {
         const val KEY_SUMMARY = "last_summary"
         const val KEY_LOG = "last_log_path"
@@ -58,5 +65,6 @@ class EnginePrefs(context: Context) {
         const val KEY_ACTIVE_ID = "active_session_id"
         const val KEY_RECOVERED_ID = "last_recovered_session_id"
         const val KEY_SELF_CHECK = "last_self_check"
+        const val KEY_PRESET = "last_preset"
     }
 }

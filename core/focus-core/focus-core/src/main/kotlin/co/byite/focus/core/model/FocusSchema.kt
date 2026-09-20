@@ -7,9 +7,12 @@ object FocusSchema {
 
     /**
      * Version of the per-second record layout ([SecondRecord]). 0.2.1 = CHANGELOG v0.2.1 schema;
-     * 0.2.2 = CHANGELOG v0.2.2 (`zone_status.uncalibrated`, `v0b_raw` line). Additive only: 0.2.1 logs still decode.
+     * 0.2.2 = CHANGELOG v0.2.2 (`zone_status.uncalibrated`, `v0b_raw` line); 0.2.3 = CHANGELOG v0.2.3
+     * (frame counters `frames_analyzer_received` / `frames_skipped_intentional` / `gaps_over_threshold`,
+     * capture preset header fields, stage timings and pose counters on the `v0b_raw` line).
+     * Additive only: 0.2.1 and 0.2.2 logs still decode (missing fields take the documented defaults).
      */
-    const val FEATURE_SCHEMA_VERSION: String = "0.2.2"
+    const val FEATURE_SCHEMA_VERSION: String = "0.2.3"
 
     /**
      * Length of one per-second bucket. A record stamped `t_mono_ms = t` summarises the half-open
