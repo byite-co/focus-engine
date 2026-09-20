@@ -376,14 +376,16 @@ class FeatureAggregator(
         if (fenceNs == null) fenceNs = fenceMonoMs * NS_PER_MS
     }
 
-    /** Close every bucket whose end + [closeDelayMs] ≤ [nowMonoMs], oldest first. */
+    /** Close every bucket whose end + [closeDelayMs] ≤ [nowMonoMs], oldest first. Never a bucket ending after the stop fence. */
     fun closeBuckets(nowMonoMs: Long, device: DeviceSample): List<AggregatedSecond> = closeWhile(device) { end -> end + closeDelayMs <= nowMonoMs }
 
     /**
-     * Session end: close every *complete* bucket (end ≤ [nowMonoMs]) without the grace; the partial last bucket is
-     * dropped. Afterwards every input is rejected (counted in [inputsAfterFence]). The session totals are unaffected.
+     * Session end: close every *complete* bucket (end ≤ [nowMonoMs], and ≤ the stop fence when one was raised)
+     * without the grace; the partial last bucket is dropped. Afterwards every input is rejected (counted in
+     * [inputsAfterFence]) and further calls emit nothing, whatever clock they pass. The session totals are unaffected.
      */
     fun finish(nowMonoMs: Long, device: DeviceSample): List<AggregatedSecond> {
+        if (finished) return emptyList()
         val out = closeWhile(device) { end -> end <= nowMonoMs }
         finished = true
         return out
@@ -391,7 +393,9 @@ class FeatureAggregator(
 
     private inline fun closeWhile(device: DeviceSample, closable: (endMs: Long) -> Boolean): List<AggregatedSecond> {
         val out = ArrayList<AggregatedSecond>()
-        while (closable(bucketEnd(nextToClose))) {
+        if (finished) return out
+        val fenceMs = fenceNs?.let { it / NS_PER_MS }
+        while (closable(bucketEnd(nextToClose)) && (fenceMs == null || bucketEnd(nextToClose) <= fenceMs)) {
             val k = nextToClose
             val b = open.remove(k) ?: Bucket()
             out.add(emit(k, b, device))

@@ -30,8 +30,8 @@ class DeviceStatusReader(private val context: Context) : SensorEventListener {
     private val packageName = context.packageName
     @Volatile private var hingeAngleDeg: Double? = null
 
-    /** True when the device exposes a hinge-angle sensor (foldable). */
-    val foldable: Boolean get() = hinge != null
+    /** True when a hinge-angle sensor was detected; false means "no sensor, fold state unknown", not "not foldable". */
+    val hingeSensor: Boolean get() = hinge != null
 
     /** Listen to the hinge angle on [handler]'s thread for the session; no-op without the sensor. */
     fun startHingeMonitor(handler: Handler): Boolean {

@@ -1,5 +1,7 @@
 package co.byite.focus.core.aggregate
 
+import co.byite.focus.core.model.SessionEnd
+
 /**
  * Outcome of the normal stop order ([StopSequence]). [steps] lists the steps in the order they ran, for the
  * event log and the order test.
@@ -15,6 +17,8 @@ data class StopResult(
     val queueDrained: Boolean,
     val records: List<AggregatedSecond>,
     val totals: CounterTotals,
+    /** `session_end`, stamped at the fence by [StopFinalizer]. */
+    val end: SessionEnd,
     /** Broken conservation relations ([CounterConsistency.check]); empty when everything adds up. */
     val mismatches: List<String>,
     val steps: List<String>,
@@ -24,11 +28,13 @@ data class StopResult(
  * Normal stop order (directive D 정정 5 2번 + 명확화), as a contract the device layer fills with its threads:
  *
  * 1. camera and IMU stop accepting input; the accept fence (capture timestamp) is raised on the aggregation queue;
- *    the Face / Scene work already running on the analysis thread finishes (bounded) or is counted as cancelled;
+ *    the Face / Scene work already running on the analysis thread finishes (bounded) or is counted as cancelled —
+ *    on a timeout the [WorkGeneration] of that work is bumped so a late outcome is never posted nor counted;
  * 2. the Pose waiting slot accepts nothing more;
- * 3. the in-flight Pose run finishes within [POSE_STOP_TIMEOUT_MS] or is counted as `pose_cancelled_at_stop`;
+ * 3. the in-flight Pose run finishes within [POSE_STOP_TIMEOUT_MS] or is counted as `pose_cancelled_at_stop`
+ *    (its generation is bumped the same way; the worker closes the landmarker itself once the run returns);
  * 4. a barrier is posted to the aggregation queue and everything the pipelines posted before it is drained;
- * 5. `FeatureAggregator.finish()`;
+ * 5. [StopFinalizer.finish] at the fence (never at the wall clock);
  * 6. the counter conservation relations are checked;
  * 7. `session_end` and the summary are written.
  *
@@ -48,8 +54,8 @@ class StopSequence(
     private val awaitPoseIdle: (timeoutMs: Long) -> Long,
     /** Step 4: barrier on the aggregation queue; true when everything posted before it ran. */
     private val drainAggregationQueue: (timeoutMs: Long) -> Boolean,
-    /** Step 5: on the aggregation queue's thread — `finish()`; returns the closed records and the session totals. */
-    private val finish: (fenceMonoMs: Long) -> Pair<List<AggregatedSecond>, CounterTotals>,
+    /** Step 5: on the aggregation queue's thread — [StopFinalizer.finish] at the fence; returns every record, the totals and the end marker. */
+    private val finish: (fenceMonoMs: Long) -> FinishOutcome,
     /** Step 7: `session_end` + summary. */
     private val writeEnd: (StopResult) -> Unit,
 ) {
@@ -71,11 +77,11 @@ class StopSequence(
         steps.add(STEP_AWAIT_POSE)
         val drained = drainAggregationQueue(drainTimeoutMs)
         steps.add(STEP_DRAIN)
-        val (records, totals) = finish(fence)
+        val outcome = finish(fence)
         steps.add(STEP_FINISH)
-        val mismatches = CounterConsistency.check(totals, framesCancelled, poseCancelled)
+        val mismatches = CounterConsistency.check(outcome.totals, framesCancelled, poseCancelled)
         steps.add(STEP_CHECK)
-        val result = StopResult(fence, framesCancelled, poseCancelled, drained, records, totals, mismatches, steps)
+        val result = StopResult(fence, framesCancelled, poseCancelled, drained, outcome.records, outcome.totals, outcome.end, mismatches, steps)
         writeEnd(result)
         steps.add(STEP_WRITE_END)
         return result

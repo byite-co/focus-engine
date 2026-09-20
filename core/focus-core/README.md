@@ -77,8 +77,9 @@ JDK 17 이상. Kotlin 2.2, kotlinx-serialization 1.9, kotlin.test.
   갭은 처리 프레임(Face 추론 성공)의 capture timestamp 차이: `gaps_over_80ms`(고정 80ms), `gaps_over_threshold`(프리셋 임계, 생성자 `gapThresholdNs`), `gaps_over_long_threshold`(긴 임계, `longGapThresholdNs`, 합격선 0).
   임계 초과 갭마다 직전 처리 프레임 사이클의 가장 긴 단계를 원인으로 센다(`gap_cause_*`; 사이클이 임계 ÷ 2 보다 짧거나 표본이 없으면 `other`).
   `totals` 는 버킷과 무관한 세션 총계이고 `CounterConsistency.check(totals, framesCancelledAtStop, poseCancelledAtStop)` 가 보존식 6개를 검사한다.
-- **정상 종료 순서(`StopSequence`)**: ① 입력 정지 + fence + 분석 스레드 idle(상한 500ms, 넘으면 `frames_cancelled_at_stop`) → ② Pose 대기 슬롯 폐쇄 → ③ 실행 중 Pose 상한 500ms(`pose_cancelled_at_stop`) → ④ 큐 barrier·drain →
-  ⑤ `finish()` → ⑥ 보존식 검사 → ⑦ `session_end`·요약. 람다로 기기 층이 채우고 순서 자체는 `StopSequenceTest` 가 검사한다.
+- **정상 종료 순서(`StopSequence`)**: ① 입력 정지 + fence + 분석 스레드 idle(상한 500ms, 넘으면 `WorkGeneration` 을 올려 늦은 결과를 차단하고 `frames_cancelled_at_stop`) → ② Pose 대기 슬롯 폐쇄 → ③ 실행 중 Pose 상한 500ms(넘으면 generation 을 올려 차단, `pose_cancelled_at_stop`) → ④ 큐 barrier·drain →
+  ⑤ `StopFinalizer.finish(fence)`(fence 이전에 끝난 완전한 버킷만; `session_end` 는 fence 시각, `t_utc = t_start_utc + (fence − t_start_mono)`; fence 가 서면 tick 도 그 뒤 버킷을 닫지 않는다) → ⑥ 보존식 검사 → ⑦ `session_end`·요약. 람다로 기기 층이 채우고 순서·fence·차단은 `StopSequenceTest`·`StopFinalizerTest` 가 검사한다.
+  `frames_processed` 는 "Face 추론이 성공했다"는 뜻의 카운터이고 실제 증가는 aggregation 스레드가 `ProcessedFrame` 을 적용할 때 일어난다.
 
 ## 데이터 경계
 
@@ -140,7 +141,7 @@ JDK 17 이상. Kotlin 2.2, kotlinx-serialization 1.9, kotlin.test.
   `imu_samples`, `accel_x_mean`·`accel_y_mean`·`accel_z_mean`·`accel_variance`(축별 분산 합), `thermal_status`,
   `battery_pct`, `battery_current_ua`, `battery_voltage_mv`, `is_interactive`, `is_device_idle`, `hinge_angle_deg`(폴더블). 재생·GT 대조는 이 줄을 읽지 않는다.
 - header 의 0.2.3 추가(지시문 D): `capture_preset`(A, B, C, C2, D, E, G; 없으면 null), `frame_process_divisor`(1; E 는 2), `frame_gap_threshold_ms`(80; E 는 167 @24fps), `frame_long_gap_threshold_ms`(200; E 는 417),
-  `face_delegate`(CPU/GPU), `face_blendshapes`, `perf_hint_target_ms`(G 의 hint 세션이 실제로 만들어졌을 때만), `camera_id`, `lens_facing`, `foldable`. `camera_resolution` 은 CameraX 가 실제로 정한 해상도이며
+  `face_delegate`(CPU/GPU), `face_blendshapes`, `perf_hint_target_ms`(G 의 hint 세션이 실제로 만들어졌을 때만), `camera_id`, `lens_facing`, `hinge_sensor`(힌지 센서 감지 여부; false 는 "센서 없음, 접힘 상태 미상"). `camera_resolution` 은 CameraX 가 실제로 정한 해상도이며
   `SessionHeader.cameraAspectRatio` 가 종횡비("16:9")를 계산한다.
 
 재생은 로그의 `raw_state`·`final_state`·`invalid_reason`·`candidate_*` 와 출력 사건을 버리고 다시 계산한다. 입력 사건(`user_redock_tap`, `zone_added`)만 엔진에 넣는다. 다시 계산한 출력 사건은 로그의 출력 사건과 종류·`t_mono_ms` 로 비교해 리포트에 남긴다.

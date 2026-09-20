@@ -18,7 +18,7 @@ data class V0bOverall(
     val camera: String,
     /** "id 1 (FRONT)" from the header; empty in older logs. */
     val cameraIdLine: String,
-    /** Fold state of a foldable over the session ("펼침 100%", "폴더블 아님", "접힘 상태 미상"). */
+    /** Hinge-sensor line: "힌지 센서 감지: 펼침 100% …", "힌지 센서 없음(접힘 상태 미상)" or "-" for older logs. */
     val foldLine: String,
     val preset: String,
     val gapThresholdMs: Int,
@@ -584,11 +584,14 @@ object V0bReport {
         }
     }
 
-    /** Fold state over the session from the per-second hinge angle (원래 지시문 D 4번). */
+    /**
+     * Fold state over the session from the per-second hinge angle (원래 지시문 D 4번). A device without a hinge
+     * sensor is not called "not foldable": the sensor is simply absent and the fold state unknown.
+     */
     fun foldLine(h: SessionHeader, raws: List<V0bRawRecord>): String {
-        if (h.foldable == false) return "폴더블 아님"
+        if (h.hingeSensor == false) return "힌지 센서 없음(접힘 상태 미상)"
         val angles = raws.mapNotNull { it.hingeAngleDeg }
-        if (angles.isEmpty()) return if (h.foldable == true) "접힘 상태 미상 (hinge 값 없음)" else "-"
+        if (angles.isEmpty()) return if (h.hingeSensor == true) "힌지 센서 감지: 접힘 상태 미상 (값 없음)" else "-"
         var flat = 0; var half = 0; var closed = 0
         for (a in angles) when {
             a < HINGE_CLOSED_MAX_DEG -> closed++
@@ -600,7 +603,7 @@ object V0bReport {
         if (flat > 0) parts.add("펼침 ${Stats.pct(flat / n, 0)}")
         if (half > 0) parts.add("반접힘 ${Stats.pct(half / n, 0)}")
         if (closed > 0) parts.add("접힘 ${Stats.pct(closed / n, 0)}")
-        return parts.joinToString(", ") + " (hinge 평균 ${Stats.fmt(Stats.meanOf(angles), 0)}°)"
+        return "힌지 센서 감지: " + parts.joinToString(", ") + " (hinge 평균 ${Stats.fmt(Stats.meanOf(angles), 0)}°)"
     }
 
     private fun segment(label: String, rows: List<Pair<SecondRecord, V0bRawRecord?>>): V0bSegment {
@@ -661,7 +664,7 @@ object V0bReport {
                 for (m in s.stop.mismatches) appendLine(COUNTER_MISMATCH_PREFIX + m)
             }
             appendLine("focus-engine V0-A/B 요약  세션 ${o.sessionId}  프리셋 ${o.preset}")
-            appendLine("기기: ${o.device}  엔진 ${o.algorithmVersion}  카메라 ${if (o.cameraIdLine.isNotEmpty()) o.cameraIdLine + " " else ""}${o.camera}(CameraX 실제 선택)  접힘 상태: ${o.foldLine}")
+            appendLine("기기: ${o.device}  엔진 ${o.algorithmVersion}  카메라 ${if (o.cameraIdLine.isNotEmpty()) o.cameraIdLine + " " else ""}${o.camera}(CameraX 실제 선택)  ${o.foldLine}")
             appendLine("종료: ${o.endReason}, 세션 길이 ${f(o.sessionLengthS)}s, 초당 레코드 ${o.records}")
             val fr = o.frames
             appendLine(

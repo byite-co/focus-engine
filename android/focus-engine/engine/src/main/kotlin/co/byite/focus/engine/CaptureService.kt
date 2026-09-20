@@ -23,15 +23,18 @@ import co.byite.focus.core.aggregate.AggregatedSecond
 import co.byite.focus.core.aggregate.CounterTotals
 import co.byite.focus.core.aggregate.DeviceSample
 import co.byite.focus.core.aggregate.FeatureAggregator
+import co.byite.focus.core.aggregate.FinishOutcome
 import co.byite.focus.core.aggregate.PoseSample
 import co.byite.focus.core.aggregate.ProcessedFrame
 import co.byite.focus.core.aggregate.SceneSample
+import co.byite.focus.core.aggregate.StopFinalizer
 import co.byite.focus.core.aggregate.StopResult
 import co.byite.focus.core.aggregate.StopSequence
 import co.byite.focus.core.log.SessionLog
+import co.byite.focus.core.model.AppState
 import co.byite.focus.core.model.FocusSchema
 import co.byite.focus.core.model.ParameterSet
-import co.byite.focus.core.model.SessionEnd
+import co.byite.focus.core.model.ScreenState
 import co.byite.focus.core.model.SessionEndReason
 import co.byite.focus.core.model.SessionHeader
 import co.byite.focus.core.model.TaskMode
@@ -321,7 +324,7 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
             frameLongGapThresholdMs = facts.longGapThresholdMs,
             cameraId = facts.cameraId,
             lensFacing = facts.lensFacing,
-            foldable = device.foldable,
+            hingeSensor = device.hingeSensor,
         )
         header = h
         logger?.writeHeader(h)
@@ -335,11 +338,13 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
         motion = mp
         val imuOk = mp.start()
         val hingeOk = device.startHingeMonitor(sh)
+        // First device sample through the status thread, so the first bucket close never has to read binder state here.
+        runOn(sh, 1_000L) { runCatching { device.read() }.getOrNull()?.let { first -> ag.post { if (latestDevice == null) latestDevice = first } } }
         sh.post(statusTick)
         event(
             "session_start id=${h.sessionId} t_start_mono_ms=$startMonoMs ${h.cameraResolution} (${h.cameraAspectRatio}) nominal_fps=${facts.nominalFps} preset=${h.capturePreset} " +
                 "divisor=${h.frameProcessDivisor} gap_threshold_ms=${h.frameGapThresholdMs} face=${h.faceDelegate} blendshapes=${h.faceBlendshapes} perf_hint_ms=${h.perfHintTargetMs} " +
-                "camera_id=${h.cameraId} lens=${h.lensFacing} foldable=${h.foldable} hinge_sensor=$hingeOk long_gap_threshold_ms=${h.frameLongGapThresholdMs} " +
+                "camera_id=${h.cameraId} lens=${h.lensFacing} hinge_sensor=${h.hingeSensor} hinge_listener=$hingeOk long_gap_threshold_ms=${h.frameLongGapThresholdMs} " +
                 "ts_source=${tb.cameraSourceName} imu=$imuOk engine=${BuildConfig.GIT_SHA} battery_opt_ignored=${device.isIgnoringBatteryOptimizations()}",
         )
         scheduleTick()
@@ -376,7 +381,14 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
         ag.postDelayed(tick, (next - now).coerceAtLeast(1))
     }
 
-    private fun currentDevice(): DeviceSample = latestDevice ?: device.read().also { latestDevice = it }
+    /**
+     * Latest sample the status thread posted. The binder-free placeholder below is only reachable when a bucket closes
+     * before the first status sample arrived; it is logged once and no binder call ever runs on this (aggregation) thread.
+     */
+    private fun currentDevice(): DeviceSample = latestDevice ?: run {
+        event("device_sample_missing_at_bucket_close placeholder_used")
+        NO_DEVICE_SAMPLE.also { latestDevice = it }
+    }
 
     private fun closeBuckets(now: Long, finishing: Boolean): List<AggregatedSecond> {
         val agg = aggregator ?: return emptyList()
@@ -396,6 +408,20 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
             }
         }
         return closed
+    }
+
+    /** Aggregation thread, stop step 5: [StopFinalizer.finish] at the fence; the records it closes are logged like any other. */
+    private fun finishOnAggregationThread(fenceMonoMs: Long, reason: SessionEndReason): FinishOutcome {
+        val agg = aggregator ?: return FinishOutcome(records.toList(), CounterTotals(), StopFinalizer.endAt(fenceMonoMs, startMonoMs, startUtcMs, reason))
+        val before = records.size
+        val out = StopFinalizer.finish(agg, fenceMonoMs, startMonoMs, startUtcMs, currentDevice(), reason, records.toList())
+        val closed = out.records.subList(before, out.records.size)
+        for (c in closed) {
+            records.add(c)
+            logger?.append(c)
+        }
+        closed.lastOrNull()?.let { EngineStatus.line = statusLine(it, records.size) }
+        return out
     }
 
     private fun statusLine(c: AggregatedSecond, n: Int): String {
@@ -446,17 +472,16 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
                 fence
             },
             raiseFence = { fence -> aggHandler?.post { aggregator?.stopInputs(fence) } },
-            awaitAnalysisIdle = { timeout -> if (awaitIdle(analysisHandler, timeout)) 0L else 1L },
+            // On a timeout the in-flight frame is invalidated by its generation: its outcome is never posted nor counted.
+            awaitAnalysisIdle = { timeout -> if (awaitIdle(analysisHandler, timeout)) 0L else (camera?.cancelAnalysis() ?: 0L) },
             closePoseSlot = { camera?.closePoseSlot() },
             awaitPoseIdle = { timeout -> camera?.awaitPoseIdle(timeout) ?: 0L },
             drainAggregationQueue = { timeout -> awaitIdle(statusHandler, timeout) && awaitIdle(aggHandler, timeout) },
-            finish = { _ ->
-                var totals = CounterTotals()
-                runOn(aggHandler, 10_000L) {
-                    closeBuckets(SystemClock.elapsedRealtime(), finishing = true)
-                    totals = aggregator?.totals ?: CounterTotals()
-                }
-                records.toList() to totals
+            finish = { fence ->
+                // Step 5 at the fence, never at this thread's clock (code review item 1); the same StopFinalizer the tests use.
+                var outcome = FinishOutcome(emptyList(), CounterTotals(), StopFinalizer.endAt(fence, startMonoMs, startUtcMs, reason))
+                runOn(aggHandler, 10_000L) { outcome = finishOnAggregationThread(fence, reason) }
+                outcome
             },
             writeEnd = { result ->
                 runOn(aggHandler, 10_000L) { summary = writeEndOnAggregationThread(reason, result) }
@@ -516,8 +541,7 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
             logger?.awaitIdle(3000)
             return selfCheck + "\n세션이 첫 프레임 전에 끝났다: $reason"
         }
-        val now = SystemClock.elapsedRealtime()
-        val end = SessionEnd(now, System.currentTimeMillis(), reason)
+        val end = r.end // stamped at the fence by StopFinalizer (code review item 1)
         lg.writeSessionEnd(end)
         lg.close()
         val notes = ArrayList<String>()
@@ -624,9 +648,11 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
             motion?.stop()
             device.stopHingeMonitor()
             camera?.unbind()
+            val fence = SystemClock.elapsedRealtime()
             runOn(aggHandler, 4_000L) {
-                closeBuckets(SystemClock.elapsedRealtime(), finishing = true)
-                event("service_destroyed records=${records.size}")
+                aggregator?.stopInputs(fence)
+                closeBuckets(fence, finishing = true)
+                event("service_destroyed fence=$fence records=${records.size}")
                 logger?.close()
                 logger?.awaitIdle(2000)
             }
@@ -704,6 +730,9 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
         private const val WAKE_LOCK_TIMEOUT_MS = 6L * 60 * 60 * 1000
         private const val TIMEBASE_PERIOD_MS = 60_000L
         private const val STATUS_PERIOD_MS = 1_000L
+
+        /** Binder-free placeholder for a bucket that closes before the status thread delivered a sample (logged when used). */
+        private val NO_DEVICE_SAMPLE = DeviceSample(thermalStatus = 0, isInteractive = false, isDeviceIdle = false, screenState = ScreenState.OFF, appState = AppState.BACKGROUND)
 
         fun startIntent(context: Context, preset: CapturePreset = CapturePreset.DEFAULT): Intent =
             Intent(context, CaptureService::class.java).setAction(ACTION_START).putExtra(EXTRA_PRESET, preset.id)

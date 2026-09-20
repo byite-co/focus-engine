@@ -31,6 +31,7 @@ import co.byite.focus.core.aggregate.FrameSample
 import co.byite.focus.core.aggregate.PoseSample
 import co.byite.focus.core.aggregate.ProcessedFrame
 import co.byite.focus.core.aggregate.SceneSample
+import co.byite.focus.engine.AnalysisGate
 import co.byite.focus.engine.CapturePreset
 import co.byite.focus.engine.FrameSize
 import co.byite.focus.engine.FrameSkipRule
@@ -118,6 +119,8 @@ class CameraPipeline(
     private var provider: ProcessCameraProvider? = null
     private var scratch: ByteBuffer? = null
     private var skipRule: FrameSkipRule? = null
+    /** Generation gate of the per-frame work (code review item 2). */
+    private val gate = AnalysisGate()
     private var hintSession: PerformanceHintManager.Session? = null
     private var hintReports = 0L
     private var sessionStartMs = -1L
@@ -316,6 +319,12 @@ class CameraPipeline(
     /** Stop step 3: cancelled pose requests. */
     fun awaitPoseIdle(timeoutMs: Long): Long = poseWorker?.awaitIdle(timeoutMs) ?: 0L
 
+    /**
+     * Stop step 1, after the bounded wait for the analysis thread timed out: the in-flight frame's outcome is never
+     * posted nor counted. Returns the frames counted as `frames_cancelled_at_stop` (0 or 1).
+     */
+    fun cancelAnalysis(): Long = gate.cancel()
+
     /** Analysis thread. Releases the landmarkers (the GPU delegate is thread-affine), the pose worker and the hint session. */
     fun release() {
         hintSession?.close()
@@ -352,6 +361,8 @@ class CameraPipeline(
                 sessionStartMs = tsMs
                 listener.onSessionStart(tsMs, image.width, image.height)
             }
+            // Gate (code review item 2): a frame that starts after the stop path gave up on this thread posts nothing.
+            val frameGeneration = gate.begin(captureNs) ?: return
             var enqueueNs = carriedEnqueueNs
             carriedEnqueueNs = 0L
             val tq0 = SystemClock.elapsedRealtimeNanos()
@@ -361,17 +372,17 @@ class CameraPipeline(
             val worker = poseWorker
             val rule = skipRule
             if (fp == null || worker == null || rule == null) {
-                listener.onPreFaceError(captureNs)
+                if (gate.end(frameGeneration)) listener.onPreFaceError(captureNs)
                 return
             }
             if (tsMs <= lastTimestampMs) {
                 nonMonotonic++
                 if (nonMonotonic <= 20) listener.onEvent("non_monotonic_frame ts_ms=$tsMs last=$lastTimestampMs")
-                listener.onPreFaceError(captureNs)
+                if (gate.end(frameGeneration)) listener.onPreFaceError(captureNs)
                 return
             }
             if (rule.shouldSkip(captureNs)) {
-                listener.onFrameSkipped(captureNs)
+                if (gate.end(frameGeneration)) listener.onFrameSkipped(captureNs)
                 return
             }
             lastTimestampMs = tsMs
@@ -379,7 +390,7 @@ class CameraPipeline(
                 wrap(image, captureNs)
             } catch (e: Exception) {
                 listener.onEvent("wrap_failed ${e.javaClass.simpleName}: ${e.message}")
-                listener.onPreFaceError(captureNs)
+                if (gate.end(frameGeneration)) listener.onPreFaceError(captureNs)
                 return
             }
             val wrapMs = (SystemClock.elapsedRealtimeNanos() - entryNs) / 1e6
@@ -388,7 +399,7 @@ class CameraPipeline(
             } catch (t: Throwable) {
                 faceErrors++
                 if (faceErrors <= 20) listener.onEvent("face_inference_error ${t.javaClass.simpleName}: ${t.message}")
-                listener.onFaceInferenceError(captureNs)
+                if (gate.end(frameGeneration)) listener.onFaceInferenceError(captureNs)
                 return
             }
             // frames_processed is fixed from here on (정정 3), whatever the later stages do.
@@ -443,9 +454,13 @@ class CameraPipeline(
                 sample = null
             }
             val totalNs = SystemClock.elapsedRealtimeNanos() - entryNs
-            val tq3 = SystemClock.elapsedRealtimeNanos()
-            listener.onFrameProcessed(ProcessedFrame(captureNs, inference.inferMs, sample?.copy(totalMs = totalNs / 1e6)))
-            carriedEnqueueNs = SystemClock.elapsedRealtimeNanos() - tq3
+            // frames_processed is the counter that means "Face succeeded"; the increment itself happens on the
+            // aggregation thread when this message is applied. A frame cancelled at stop never sends it.
+            if (gate.end(frameGeneration)) {
+                val tq3 = SystemClock.elapsedRealtimeNanos()
+                listener.onFrameProcessed(ProcessedFrame(captureNs, inference.inferMs, sample?.copy(totalMs = totalNs / 1e6)))
+                carriedEnqueueNs = SystemClock.elapsedRealtimeNanos() - tq3
+            }
             hintSession?.let { s ->
                 s.reportActualWorkDuration(totalNs)
                 hintReports++
@@ -488,7 +503,8 @@ class CameraPipeline(
 
     /** One-line frame-path statistics for the event log. */
     fun stats(): String = "frames zero_copy=$zeroCopyFrames copied=$copiedFrames non_monotonic=$nonMonotonic capture_failures=$captureFailures " +
-        "face_inference_errors=$faceErrors post_face_failed=$postFaceErrors pose_submitted=${poseWorker?.submitted ?: 0} " +
+        "face_inference_errors=$faceErrors post_face_failed=$postFaceErrors outcomes_suppressed_at_stop=${gate.suppressed} " +
+        "pose_submitted=${poseWorker?.submitted ?: 0} pose_results_suppressed_at_stop=${poseWorker?.suppressedResults ?: 0} " +
         "jitter_skipped_fast_rotation=${face?.jitterSkippedFastRotation ?: 0} perf_hint_reports=$hintReports fps_result=${fpsEffective ?: "unknown"}"
 
     companion object {

@@ -3,6 +3,7 @@ package co.byite.focus.core.aggregate
 import co.byite.focus.core.Synth
 import co.byite.focus.core.model.AppState
 import co.byite.focus.core.model.ScreenState
+import co.byite.focus.core.model.SessionEndReason
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -58,7 +59,12 @@ class StopSequenceTest {
             cancelled
         },
         drainAggregationQueue = { _ -> h.order.add("drain"); h.queue.drain() },
-        finish = { fence -> h.order.add("finish"); h.finishedRecords = h.agg.finish(fence, device); h.finishedRecords to h.agg.totals },
+        finish = { fence ->
+            h.order.add("finish")
+            val out = StopFinalizer.finish(h.agg, fence, t0, Synth.UTC0, device, SessionEndReason.USER)
+            h.finishedRecords = out.records
+            out
+        },
         writeEnd = { r -> h.order.add("write"); h.written = r },
     )
 
@@ -86,7 +92,62 @@ class StopSequenceTest {
         assertEquals(1, r.records.size, "one complete bucket before the fence at +1500")
         assertEquals(24, r.records[0].second.framesProcessed)
         assertEquals(1, r.records[0].raw.poseApplied)
+        assertEquals(t0 + 1500, r.end.tMonoMs, "session_end is the fence")
+        assertEquals(Synth.UTC0 + 1500, r.end.tUtcMs)
         assertEquals(r, h.written)
+    }
+
+    /**
+     * Code review item 2: a Pose run that outlives the 500 ms bound is cancelled by bumping its generation. Its result
+     * must not be posted whether it arrives just before the barrier drain or after finish, and the relations must
+     * hold with `pose_cancelled_at_stop` = 1 in both cases.
+     */
+    private fun lateResultScenario(arrivesBeforeDrain: Boolean) {
+        val h = harness()
+        val generation = WorkGeneration()
+        val gen = generation.current // captured when the worker started the run
+        h.queue.post { h.agg.onPoseRequested(ns(t0 + 800), 1.0) }
+        // The worker's post is gated exactly like PoseWorker: a stale generation posts nothing.
+        val lateResult = {
+            if (generation.isCurrent(gen)) h.queue.post { h.agg.onPose(PoseSample(ns(t0 + 800), 40.0, detected = false, frameWidthPx = 720, frameHeightPx = 1280)) }
+        }
+        val seq = StopSequence(
+            stopInputs = { t0 + 1500 },
+            raiseFence = { fence -> h.queue.post { h.agg.stopInputs(fence) } },
+            awaitAnalysisIdle = { 0L },
+            closePoseSlot = { },
+            awaitPoseIdle = { _ -> generation.bump(); 1L }, // timed out: this run is the cancelled one
+            drainAggregationQueue = { _ -> if (arrivesBeforeDrain) lateResult(); h.queue.drain() },
+            finish = { fence -> StopFinalizer.finish(h.agg, fence, t0, Synth.UTC0, device, SessionEndReason.USER) },
+            writeEnd = { },
+        )
+        val r = seq.run()
+        if (!arrivesBeforeDrain) lateResult()
+        assertEquals(1L, r.poseCancelledAtStop)
+        assertEquals(1L, r.totals.poseRequested)
+        assertEquals(0L, r.totals.poseCompleted, "a cancelled run is never counted as completed")
+        assertEquals(0L, r.totals.poseApplied)
+        assertEquals(emptyList(), r.mismatches, r.mismatches.toString())
+        assertTrue(h.queue.pending.isEmpty(), "the gated result never reached the queue")
+    }
+
+    @Test
+    fun aLatePoseResultArrivingJustBeforeTheDrainIsGatedAndTheRelationsHold() = lateResultScenario(arrivesBeforeDrain = true)
+
+    @Test
+    fun aLatePoseResultArrivingAfterFinishIsGatedAndTheRelationsHold() = lateResultScenario(arrivesBeforeDrain = false)
+
+    @Test
+    fun anUngatedResultAfterFinishIsRejectedByTheAggregatorAndCounted() {
+        val h = harness()
+        h.queue.post { h.agg.onPoseRequested(ns(t0 + 800), 1.0) }
+        val r = sequence(h, analysisInFlight = null, poseInFlight = { }, poseFinishesInTime = false, pendingPoseSlot = false).run()
+        assertEquals(1L, r.poseCancelledAtStop)
+        // Defence in depth: even without the gate, a post after finish is refused and counted outside the window.
+        assertFalse(h.agg.onPose(PoseSample(ns(t0 + 800), 40.0, detected = false, frameWidthPx = 720, frameHeightPx = 1280)))
+        assertEquals(1L, h.agg.inputsAfterFence)
+        assertEquals(0L, h.agg.totals.poseCompleted)
+        assertEquals(emptyList(), CounterConsistency.check(h.agg.totals, 0, 1))
     }
 
     @Test

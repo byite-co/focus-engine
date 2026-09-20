@@ -45,8 +45,8 @@ data class SessionHeader(
     @SerialName("camera_id") val cameraId: String? = null,
     /** Lens facing ("FRONT", "BACK", "EXTERNAL"); null in older logs. */
     @SerialName("lens_facing") val lensFacing: String? = null,
-    /** True when the device exposes a hinge-angle sensor (foldable); false when it does not; null in older logs. */
-    val foldable: Boolean? = null,
+    /** True when a hinge-angle sensor was detected, false when none was found (fold state then unknown), null in older logs. */
+    @SerialName("hinge_sensor") val hingeSensor: Boolean? = null,
 ) {
     init {
         require(frameProcessDivisor >= 1) { "frame_process_divisor must be >= 1" }

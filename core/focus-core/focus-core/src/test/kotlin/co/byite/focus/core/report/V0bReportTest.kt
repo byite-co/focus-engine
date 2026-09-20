@@ -166,7 +166,7 @@ class V0bReportTest {
         )
     }
     private val longLog = SessionLog(
-        Synth.header.copy(capturePreset = "A", cameraResolution = "1280x720", cameraId = "1", lensFacing = "FRONT", foldable = true),
+        Synth.header.copy(capturePreset = "A", cameraResolution = "1280x720", cameraId = "1", lensFacing = "FRONT", hingeSensor = true),
         longRecords, sessionEnd = SessionEnd(Synth.mono(130), Synth.utc(130), SessionEndReason.USER), v0bRaw = longRaws,
     )
 
@@ -231,7 +231,7 @@ class V0bReportTest {
         assertTrue("200ms 초과 갭 0 = 0 OK" in text, text)
         assertTrue("화면 off 평균 전력 1600 mW, 최고 thermal 1 (LIGHT)" in text, text)
         assertTrue("갭>80ms 원인: Face 1" in text, text)
-        assertTrue("카메라 id 1 (FRONT) 1280x720 (16:9) @ 24fps(CameraX 실제 선택)  접힘 상태: 펼침 77%, 반접힘 23% (hinge 평균 158°)" in text, text)
+        assertTrue("카메라 id 1 (FRONT) 1280x720 (16:9) @ 24fps(CameraX 실제 선택)  힌지 센서 감지: 펼침 77%, 반접힘 23% (hinge 평균 158°)" in text, text)
         // one long gap on the off row fails the pass mark
         val longGap = longRecords.map { if ((it.tMonoMs - Synth.T0) / 1000 == 80L) it.copy(gapsOverThreshold = 1, gapsOver80Ms = 1, gapsOverLongThreshold = 1, maxFrameGapMs = 300) else it }
         val lg = V0bReport.build(longLog.copy(records = longGap))
@@ -299,8 +299,8 @@ class V0bReportTest {
 
     @Test
     fun foldLineDescribesTheHingeAngleOrItsAbsence() {
-        assertEquals("폴더블 아님", V0bReport.foldLine(Synth.header.copy(foldable = false), longRaws))
-        assertEquals("접힘 상태 미상 (hinge 값 없음)", V0bReport.foldLine(Synth.header.copy(foldable = true), raws))
+        assertEquals("힌지 센서 없음(접힘 상태 미상)", V0bReport.foldLine(Synth.header.copy(hingeSensor = false), longRaws), "no hinge sensor is not 'not foldable'")
+        assertEquals("힌지 센서 감지: 접힘 상태 미상 (값 없음)", V0bReport.foldLine(Synth.header.copy(hingeSensor = true), raws))
         assertEquals("-", V0bReport.foldLine(Synth.header, raws))
         assertEquals("", V0bReport.build(log).overall.cameraIdLine)
     }

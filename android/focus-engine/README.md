@@ -39,8 +39,8 @@ APK 는 arm64-v8a 만 담는다(실측 기기 기준, `devapp/build.gradle.kts` 
 | F | ROI 크롭. **이번에 구현하지 않았다**(아래 "프리셋 F") | — |
 
 요약과 header 의 해상도는 요청 해상도가 아니라 CameraX 가 실제로 정한 해상도(`ImageAnalysis.resolutionInfo`, 첫 프레임으로 재확인)이고 종횡비를 같이 표시한다(`1280x720 (16:9)`).
-header 에는 카메라 id(`camera_id`)와 렌즈 방향(`lens_facing`, `LENS_FACING`), 폴더블 여부(`foldable` = `TYPE_HINGE_ANGLE` 센서 존재)도 들어가고, 폴더블이면 `focus-status` 스레드가 hinge 각을 받아 초당 `hinge_angle_deg` 로 남긴다.
-요약은 이를 `카메라 id 1 (FRONT) 1280x720 (16:9) @ 24fps` 와 `접힘 상태: 펼침 100% (hinge 평균 179°)`(< 30° 접힘, < 150° 반접힘, 그 외 펼침)로 보인다.
+header 에는 카메라 id(`camera_id`)와 렌즈 방향(`lens_facing`, `LENS_FACING`), 힌지 센서 감지 여부(`hinge_sensor` = `TYPE_HINGE_ANGLE` 센서 존재)도 들어가고, 센서가 있으면 `focus-status` 스레드가 hinge 각을 받아 초당 `hinge_angle_deg` 로 남긴다.
+요약은 이를 `카메라 id 1 (FRONT) 1280x720 (16:9) @ 24fps` 와 `힌지 센서 감지: 펼침 100% (hinge 평균 179°)`(< 30° 접힘, < 150° 반접힘, 그 외 펼침)로 보인다. 센서가 없으면 `힌지 센서 없음(접힘 상태 미상)` 이다 — 센서가 없다는 사실이지 "폴더블이 아니다" 는 뜻이 아니다.
 events.log 의 `resolution_choice`(요청·사유·기기의 YUV 출력 크기 목록)와 `camera_bound`(실제 선택) 줄로 확인한다.
 
 **프리셋 F(ROI 크롭)를 건너뛴 사유**: 정정 2 의 규칙대로 하면 2D 랜드마크·얼굴 폭·위치 스칼라는 crop 의 위치·크기·배율로 역변환하면 되지만, head pose 는 좌표 변환으로
@@ -64,7 +64,8 @@ events.log 의 `resolution_choice`(요청·사유·기기의 YUV 출력 크기 �
 
 ## 정상 종료 순서 (지시문 D 정정 5, `StopSequence`)
 
-`정지` 버튼(`ACTION_STOP`) → `focus-stop` 스레드에서 순서대로: ① `main` 에서 IMU 해제·camera unbind, 그 시각을 accept fence 로 aggregation 큐에 post(`stopInputs(fence)`; capture timestamp ≥ fence 인 입력은 계수에서 제외), 분석 스레드에 marker 를 post 해 실행 중인 Face·Scene 작업이 끝나길 기다린다(상한 500ms, 넘으면 `frames_cancelled_at_stop` 1) → ② Pose 대기 슬롯 폐쇄(대기 중 요청은 `pose_cancelled_at_stop`) → ③ 실행 중 Pose 를 상한 500ms 기다린다(넘으면 `pose_cancelled_at_stop`, 늦게 온 결과는 finish 뒤라 버려진다) → ④ status 스레드 marker → aggregation 큐 barrier(제한 3초) → ⑤ 집계 스레드에서 `finish()`(완전한 버킷만) → ⑥ `CounterConsistency.check(totals, cancelled…)` → ⑦ `session_end` 줄, 요약(첫머리에 검사 결과), `summary.txt`. 그 뒤 분석 스레드에서 landmarker·hint 세션·Pose 워커 해제(GPU delegate 는 만든 스레드에서 닫아야 한다), 스레드 종료. events.log 에 `stop_sequence steps=… fence=… frames_cancelled=… pose_cancelled=… drained=… mismatches=…` 와 `counter_mismatch …` 줄이 남는다.
+`정지` 버튼(`ACTION_STOP`) → `focus-stop` 스레드에서 순서대로: ① `main` 에서 IMU·hinge 해제·camera unbind, 그 시각을 accept fence 로 aggregation 큐에 post(`stopInputs(fence)`; capture timestamp ≥ fence 인 입력은 계수에서 제외), 분석 스레드에 marker 를 post 해 실행 중인 Face·Scene 작업이 끝나길 기다린다(상한 500ms). 넘으면 `AnalysisGate.cancel()` 이 그 작업의 generation 을 올려 결과가 큐에 post 되지도 계수에 들지도 않게 하고, `received` 를 이미 낸 프레임 하나가 `frames_cancelled_at_stop` 이 된다 → ② Pose 대기 슬롯 폐쇄(대기 중 요청은 `pose_cancelled_at_stop`) → ③ 실행 중 Pose 를 상한 500ms 기다린다. 넘으면 `PoseWorker.awaitIdle` 이 generation 을 올려 그 결과는 post 되지 않고(`pose_completed` 에 들지 않고) `pose_cancelled_at_stop` 으로만 센다 → ④ status 스레드 marker → aggregation 큐 barrier(제한 3초) → ⑤ 집계 스레드에서 `StopFinalizer.finish(fence)`: fence 이전에 끝난 완전한 버킷만 닫고 `session_end` 를 fence 시각으로 만든다(`t_utc = t_start_utc + (fence − t_start_mono)`); 이 단계가 fence 뒤 몇백 ms 에 돌아도 fence 이후 버킷은 생기지 않는다 → ⑥ `CounterConsistency.check(totals, cancelled…)` → ⑦ `session_end` 줄, 요약(첫머리에 검사 결과), `summary.txt`. 그 뒤 분석 스레드에서 Face landmarker·hint 세션 해제(GPU delegate 는 만든 스레드에서 닫는다)와 `PoseWorker.release()`; Pose landmarker 는 실행 중인 추론이 없으면 그 자리에서, 있으면 워커가 추론이 돌아온 뒤 스스로 닫는다(추론 중 close 금지, 종료 경로는 기다리지 않는다). events.log 에 `stop_sequence steps=… fence=… frames_cancelled=… pose_cancelled=… drained=… mismatches=…`, `counter_mismatch …`, 그리고 `outcomes_suppressed_at_stop`·`pose_results_suppressed_at_stop` 계수가 남는다.
+요약의 세션 길이·처리 fps 분모·마지막 화면 상태 구간·전력 평균은 모두 fence 까지의 레코드로 계산된다. 이 마무리는 순수 로직(`StopFinalizer`)이라 `CaptureService` 와 `StopFinalizerTest`·`StopSequenceTest` 가 같은 코드를 쓴다.
 시스템이 서비스를 내리는 `onDestroy` 는 이 순서를 밟지 않고 버퍼만 flush 한다; 다음 실행의 복원 요약은 "계수 검증 생략(비정상 종료)" 로 시작한다.
 
 ## 데이터 경계
@@ -171,11 +172,12 @@ cd android/focus-engine
   Pose 요청은 버킷의 첫 프레임(1fps)과 얼굴 미검출 중 직전 요청 뒤 300ms 이상(≥3fps); 워커가 바쁘면 대기 슬롯의 이전 요청을 최신 프레임으로 교체한다(`pose_superseded`).
   Pose 결과는 프레임의 capture timestamp 가 속한 버킷에 반영되고, 버킷이 닫힌 뒤(끝 + 300ms) 도착하면 버리고 `pose_late_dropped` 로 센다.
 - **프레임 계수**(CHANGELOG v0.2.3 (a); 정의는 `core/focus-core/README.md`): `frames_requested`(CaptureResult), `frames_analyzer_received`(analyzer 콜백), `frames_skipped_intentional`(E 의 건너뜀),
-  `frames_processed`(Face 추론이 성공한 직후 확정 — 후처리·Scene·Pose 복사가 실패해도 처리 프레임), `frames_sample_applied`·`frames_sample_late_dropped`. 파생: 백프레셔 = requested − received(KEEP_ONLY_LATEST 가 버린 것),
+  `frames_processed`("Face 추론이 성공했다"는 뜻의 카운터. 분석 스레드는 Face 성공 직후 그 사실을 `ProcessedFrame` 하나에 담아 post 하고, 실제 증가는 aggregation 스레드가 그 메시지를 적용할 때 일어난다 — 후처리·Scene·Pose 복사가 실패해도 처리 프레임이다), `frames_sample_applied`·`frames_sample_late_dropped`. 파생: 백프레셔 = requested − received(KEEP_ONLY_LATEST 가 버린 것),
   미처리(예상 밖) = received − skipped − processed(`face_inference_errors` + `pre_face_errors`(timestamp 역행, wrap 실패, 파이프라인 미준비)), Face 이후 실패 = processed − 반영 − 늦음. `frames_dropped` = 이 넷의 합, 드롭 비율 = ÷ (requested − skipped).
   capture result 가 한 번도 오지 않은 세션은 requested = received. 갭은 처리 프레임의 capture timestamp 차이(버킷 경계를 넘는 갭은 뒤 프레임의 버킷에): `gaps_over_80ms`, 프리셋 임계 `gaps_over_threshold`(80 / E 167ms), 긴 갭 `gaps_over_long_threshold`(200 / E 417ms; 합격선은 0).
 - **갭 원인**(원래 지시문 2번, `v0b_raw` `gap_cause_*`): 임계를 넘은 갭마다 직전 처리 프레임 사이클의 가장 긴 단계(변환·전처리, Face = 추론 + 후처리, scene, Pose 복사, 큐 적재)를 원인으로 센다.
   직전 사이클 전체가 기대 간격(임계 ÷ 2)보다 짧았거나 표본이 없으면 분석 스레드 탓이 아니므로 "그 외"(카메라·시스템)로 센다. 요약의 비교 행마다 상위 원인을 적는다.
+  한계: 큐 적재 시간은 마지막 `ProcessedFrame` post 를 다음 프레임에 계상하므로 "큐 적재" 원인은 한 프레임 밀려 귀속될 수 있다(µs 단위라 순위에 영향은 거의 없다).
 - **단계별 계측**(`v0b_raw`, 각 평균·p95·최대): `stage_wrap_ms_*`(변환·전처리: ImageProxy → RGBA, zero-copy 검사 또는 행 복사), `face_infer_ms_*`(landmarker), `stage_face_post_ms_*`(HeadPose·폭·j), `stage_scene_ms_*`(1Hz),
   `stage_enqueue_ms_*`(큐 적재: 이 프레임의 메시지 post 시간 합; 마지막 `ProcessedFrame` post 는 다음 프레임에 계상), `pose_frame_copy_ms_*`(deep copy, ~3.7MB @1280x720), `frame_total_ms_*`(analyzer 콜백 진입부터 aggregation 큐 post 직전까지 = Face 사이클; G 가 보고하는 값),
   `pose_wait_ms_mean`(요청 → 워커 추론 시작), `pose_infer_ms_mean/p95/max`.

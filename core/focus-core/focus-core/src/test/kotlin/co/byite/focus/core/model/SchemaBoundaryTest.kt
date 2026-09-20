@@ -131,7 +131,7 @@ class SchemaBoundaryTest {
             "calibration_id", "calibration_snapshot_version", "task_mode",
             // schema 0.2.3 capture preset (CHANGELOG v0.2.3)
             "capture_preset", "frame_process_divisor", "frame_gap_threshold_ms", "face_delegate", "face_blendshapes", "perf_hint_target_ms",
-            "frame_long_gap_threshold_ms", "camera_id", "lens_facing", "foldable",
+            "frame_long_gap_threshold_ms", "camera_id", "lens_facing", "hinge_sensor",
         )
         assertEquals(expected, names(SessionHeader.serializer().descriptor))
         assertEquals("16:9", SessionHeader.aspectRatioOf("1280x720"))
