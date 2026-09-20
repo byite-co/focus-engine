@@ -77,8 +77,13 @@ class SchemaBoundaryTest {
             "power_state",
         )
         assertEquals(expected, names(SecondRecord.serializer().descriptor))
-        assertEquals("0.2.1", FocusSchema.FEATURE_SCHEMA_VERSION)
+        assertEquals("0.2.2", FocusSchema.FEATURE_SCHEMA_VERSION)
         assertEquals("0.2.0", FocusSchema.SPEC_VERSION)
+    }
+
+    @Test
+    fun zoneStatusHasTheUncalibratedValueOfSchema022() {
+        assertEquals(listOf("in_zone", "outside", "no_head_pose", "uncalibrated"), names(ZoneStatus.serializer().descriptor))
     }
 
     @Test

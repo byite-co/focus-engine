@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="focus_engine_notif_channel">측정 세션</string>
+    <string name="focus_engine_notif_title">focus-engine 측정 중</string>
+</resources>

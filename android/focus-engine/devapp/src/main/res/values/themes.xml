@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 액션바 없는 테마. edge-to-edge 인셋은 MainActivity 가 루트 뷰 패딩으로 처리한다(spike-r1 과 같은 방식). -->
+    <style name="Theme.FocusDev" parent="android:Theme.DeviceDefault.DayNight">
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowNoTitle">true</item>
+    </style>
+</resources>

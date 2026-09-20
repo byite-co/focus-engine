@@ -82,12 +82,17 @@ enum class ScreenState { ON_UNLOCKED, ON_LOCKED, OFF }
 @Serializable
 enum class AppState { FOREGROUND, BACKGROUND }
 
-/** Head pose versus the registered work zones (schema 0.2.1). `zone_id` is set only for IN_ZONE. */
+/**
+ * Head pose versus the registered work zones (schema 0.2.1). `zone_id` is set only for IN_ZONE.
+ * UNCALIBRATED (schema 0.2.2): no zones exist yet — before calibration and while it runs. Every
+ * V0-B record carries it, whether or not a face was seen.
+ */
 @Serializable
 enum class ZoneStatus {
     @SerialName("in_zone") IN_ZONE,
     @SerialName("outside") OUTSIDE,
     @SerialName("no_head_pose") NO_HEAD_POSE,
+    @SerialName("uncalibrated") UNCALIBRATED,
 }
 
 /** Power state machine position (spec 7장). P0_PRIME/P1_PRIME are the spec's P0′/P1′. */
