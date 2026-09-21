@@ -4,7 +4,12 @@ import android.app.KeyguardManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.os.BatteryManager
+import android.os.Handler
 import android.os.PowerManager
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ProcessLifecycleOwner
@@ -12,12 +17,37 @@ import co.byite.focus.core.aggregate.DeviceSample
 import co.byite.focus.core.model.AppState
 import co.byite.focus.core.model.ScreenState
 
-/** Thermal, battery, screen/keyguard and app-visibility state, read once per bucket close. */
-class DeviceStatusReader(private val context: Context) {
+/**
+ * Thermal, battery, screen/keyguard, app-visibility and (foldables) hinge-angle state, read once per second on the
+ * status thread (binder calls never run on the analysis or aggregation thread; directive D 정정 3).
+ */
+class DeviceStatusReader(private val context: Context) : SensorEventListener {
     private val pm = context.getSystemService(PowerManager::class.java)
     private val bm = context.getSystemService(BatteryManager::class.java)
     private val km = context.getSystemService(KeyguardManager::class.java)
+    private val sm = context.getSystemService(SensorManager::class.java)
+    private val hinge: Sensor? = sm?.getDefaultSensor(Sensor.TYPE_HINGE_ANGLE)
     private val packageName = context.packageName
+    @Volatile private var hingeAngleDeg: Double? = null
+
+    /** True when a hinge-angle sensor was detected; false means "no sensor, fold state unknown", not "not foldable". */
+    val hingeSensor: Boolean get() = hinge != null
+
+    /** Listen to the hinge angle on [handler]'s thread for the session; no-op without the sensor. */
+    fun startHingeMonitor(handler: Handler): Boolean {
+        val s = hinge ?: return false
+        return sm.registerListener(this, s, SensorManager.SENSOR_DELAY_NORMAL, handler)
+    }
+
+    fun stopHingeMonitor() {
+        if (hinge != null) sm?.unregisterListener(this)
+    }
+
+    override fun onSensorChanged(event: SensorEvent) {
+        if (event.sensor.type == Sensor.TYPE_HINGE_ANGLE) hingeAngleDeg = event.values[0].toDouble()
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 
     fun read(): DeviceSample {
         val interactive = pm.isInteractive
@@ -37,6 +67,7 @@ class DeviceStatusReader(private val context: Context) {
             isDeviceIdle = pm.isDeviceIdleMode,
             screenState = screen,
             appState = app,
+            hingeAngleDeg = hingeAngleDeg,
         )
     }
 

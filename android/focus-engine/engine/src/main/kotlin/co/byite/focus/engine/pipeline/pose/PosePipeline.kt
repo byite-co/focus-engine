@@ -20,8 +20,8 @@ data class PoseFeatures(
     val frameHeightPx: Int,
 )
 
-/** MediaPipe Pose Landmarker (lite), VIDEO mode, CPU, num_poses = 1. Scheduling (1 fps / 3 fps) is the camera pipeline's. */
-class PosePipeline(context: Context) : AutoCloseable {
+/** MediaPipe Pose Landmarker (lite), VIDEO mode, CPU, num_poses = 1. Scheduling (1 fps / 3 fps) is the camera pipeline's; the run happens on the [PoseWorker] thread. */
+class PosePipeline(context: Context) : AutoCloseable, PoseInference {
     private val landmarker: PoseLandmarker = PoseLandmarker.createFromOptions(
         context,
         PoseLandmarker.PoseLandmarkerOptions.builder()
@@ -37,7 +37,7 @@ class PosePipeline(context: Context) : AutoCloseable {
     private var lastRotation = -1
     private var options: ImageProcessingOptions? = null
 
-    fun process(frame: RgbaFrame, timestampMs: Long): PoseFeatures {
+    override fun process(frame: RgbaFrame, timestampMs: Long): PoseFeatures {
         val opts = optionsFor(frame.rotationDegrees)
         val t0 = SystemClock.elapsedRealtimeNanos()
         val result = frame.toMPImage().use { landmarker.detectForVideo(it, opts, timestampMs) }

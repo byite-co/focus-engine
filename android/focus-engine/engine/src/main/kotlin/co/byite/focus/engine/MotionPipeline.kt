@@ -11,8 +11,10 @@ import co.byite.focus.core.aggregate.ImuSample
 import co.byite.focus.engine.timebase.Timebase
 
 /**
- * Accelerometer at 5 Hz (spec 1장 파이프라인 IMU 5Hz). Emits [ImuSample] scalars on the given handler
- * thread; pickup / shake / re-dock classification is V0-F's and needs the dock posture from V0-C.
+ * Accelerometer at 5 Hz (spec 1장 파이프라인 IMU 5Hz). Sensor events arrive on [handler]'s thread (the status
+ * thread) and leave as [ImuSample] scalars through [onSample], which the service posts to the aggregation
+ * queue (directive D 정정 3: the IMU never touches the aggregator). Pickup / shake / re-dock classification is
+ * V0-F's and needs the dock posture from V0-C.
  */
 class MotionPipeline(
     context: Context,
@@ -22,6 +24,7 @@ class MotionPipeline(
 ) : SensorEventListener {
     private val sm = context.getSystemService(SensorManager::class.java)
     private val accel: Sensor? = sm?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+    @Volatile private var stopped = false
     var samples: Long = 0L
         private set
 
@@ -31,12 +34,14 @@ class MotionPipeline(
         return sm.registerListener(this, s, PERIOD_US, handler)
     }
 
+    /** Stop step 1: no more samples leave after this returns (events already queued on [handler] are dropped). */
     fun stop() {
+        stopped = true
         sm?.unregisterListener(this)
     }
 
     override fun onSensorChanged(event: SensorEvent) {
-        if (event.sensor.type != Sensor.TYPE_ACCELEROMETER) return
+        if (stopped || event.sensor.type != Sensor.TYPE_ACCELEROMETER) return
         val cb = SystemClock.elapsedRealtimeNanos()
         val mono = timebase.imuToMono(event.timestamp, cb)
         samples++

@@ -2,12 +2,14 @@ package co.byite.focus.engine.pipeline.face
 
 import android.content.Context
 import android.os.SystemClock
+import co.byite.focus.engine.FaceDelegate
 import co.byite.focus.engine.pipeline.RgbaFrame
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.core.Delegate
 import com.google.mediapipe.tasks.vision.core.ImageProcessingOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarker
+import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarkerResult
 import kotlin.math.sqrt
 
 /** Scalars a face frame yields. Landmarks and matrices stay inside [FacePipeline]. */
@@ -20,24 +22,37 @@ data class FaceFeatures(
     val jitterJ: Double? = null,
     /** Face Landmarker wall time (ms). */
     val inferMs: Double,
+    /** Landmarks → scalars wall time (ms): head pose, face width, jitter. */
+    val postMs: Double = 0.0,
     /** False when the transformation matrix did not look column-major affine (logged once). */
     val transformOk: Boolean = true,
 )
 
 /**
- * MediaPipe Face Landmarker, VIDEO mode, CPU, num_faces = 1, blendshapes + transformation matrix on
- * (spec 1장 파이프라인). Head pose via [HeadPose], face width = distance between face-oval landmarks
- * 234 and 454 in buffer pixels, jitter via [RigidJitter] (similarity residual ÷ inter-ocular distance,
- * frame pairs with head rotation > 30°/s excluded).
+ * One Face Landmarker run before post-processing (directive D 정정 3: `frames_processed` is fixed here).
+ * The result object never leaves the pipeline package.
  */
-class FacePipeline(context: Context) : AutoCloseable {
+class FaceInference internal constructor(internal val result: FaceLandmarkerResult, val inferMs: Double)
+
+/**
+ * MediaPipe Face Landmarker, VIDEO mode, num_faces = 1, transformation matrix on, delegate and blendshape
+ * output per preset (spec 1장 파이프라인, directive D presets B·D). Head pose via [HeadPose], face width =
+ * distance between face-oval landmarks 234 and 454 in buffer pixels, jitter via [RigidJitter] (similarity
+ * residual ÷ inter-ocular distance, frame pairs with head rotation > 30°/s excluded).
+ */
+class FacePipeline(context: Context, val delegate: FaceDelegate = FaceDelegate.CPU, val blendshapes: Boolean = true) : AutoCloseable {
     private val landmarker: FaceLandmarker = FaceLandmarker.createFromOptions(
         context,
         FaceLandmarker.FaceLandmarkerOptions.builder()
-            .setBaseOptions(BaseOptions.builder().setModelAssetPath(MODEL_ASSET).setDelegate(Delegate.CPU).build())
+            .setBaseOptions(
+                BaseOptions.builder()
+                    .setModelAssetPath(MODEL_ASSET)
+                    .setDelegate(if (delegate == FaceDelegate.GPU) Delegate.GPU else Delegate.CPU)
+                    .build(),
+            )
             .setRunningMode(RunningMode.VIDEO)
             .setNumFaces(1)
-            .setOutputFaceBlendshapes(true)
+            .setOutputFaceBlendshapes(blendshapes)
             .setOutputFacialTransformationMatrixes(true)
             .build(),
     )
@@ -47,16 +62,25 @@ class FacePipeline(context: Context) : AutoCloseable {
     private var options: ImageProcessingOptions? = null
 
     /** Runs on the analysis thread. [timestampMs] must increase strictly between calls. */
-    fun process(frame: RgbaFrame, timestampMs: Long): FaceFeatures {
+    fun process(frame: RgbaFrame, timestampMs: Long): FaceFeatures = extract(infer(frame, timestampMs), frame)
+
+    /** Stage "face_infer": the landmarker call only. Throws when the landmarker fails (`face_inference_errors`). */
+    fun infer(frame: RgbaFrame, timestampMs: Long): FaceInference {
         val opts = optionsFor(frame.rotationDegrees)
         val t0 = SystemClock.elapsedRealtimeNanos()
         val result = frame.toMPImage().use { landmarker.detectForVideo(it, opts, timestampMs) }
-        val inferMs = (SystemClock.elapsedRealtimeNanos() - t0) / 1e6
+        return FaceInference(result, (SystemClock.elapsedRealtimeNanos() - t0) / 1e6)
+    }
+
+    /** Stage "face_post": landmarks and matrix → scalars. */
+    fun extract(inference: FaceInference, frame: RgbaFrame): FaceFeatures {
+        val t0 = SystemClock.elapsedRealtimeNanos()
+        val result = inference.result
         val faces = result.faceLandmarks()
         val matrices = result.facialTransformationMatrixes().orElse(null)
         if (faces.isEmpty() || matrices == null || matrices.isEmpty()) {
             jitter.reset()
-            return FaceFeatures(detected = false, inferMs = inferMs)
+            return FaceFeatures(detected = false, inferMs = inference.inferMs, postMs = (SystemClock.elapsedRealtimeNanos() - t0) / 1e6)
         }
         val lm = faces[0]
         val m = matrices[0]
@@ -89,7 +113,8 @@ class FacePipeline(context: Context) : AutoCloseable {
             rollDeg = angles.rollDeg,
             faceWidthPx = faceWidth,
             jitterJ = j,
-            inferMs = inferMs,
+            inferMs = inference.inferMs,
+            postMs = (SystemClock.elapsedRealtimeNanos() - t0) / 1e6,
             transformOk = ok,
         )
     }

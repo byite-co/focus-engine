@@ -8,12 +8,20 @@
     <string name="btn_battery_settings">배터리 최적화 설정 열기</string>
     <string name="label_markers">구간 마커</string>
     <string name="marker_front">정면</string>
-    <string name="marker_still">정지</string>
+    <string name="marker_still">가만히</string>
     <string name="marker_bow">숙임</string>
     <string name="marker_prone">엎드림</string>
     <string name="marker_away">자리비움</string>
     <string name="marker_empty_chair">빈의자</string>
     <string name="marker_clear">마커 해제</string>
+    <string name="label_preset">프리셋 (R4 실험, 세션마다 하나)</string>
+    <string name="preset_button">%1$s: %2$s</string>
+    <string name="preset_a">1280x720 16:9, Face CPU, blendshape on, 매 프레임 (기준)</string>
+    <string name="preset_b">A 에서 blendshape off</string>
+    <string name="preset_c">640x360 16:9 (없으면 가장 가까운 16:9, 그것도 없으면 640x480 = C2)</string>
+    <string name="preset_d">A 에서 Face GPU delegate</string>
+    <string name="preset_e">A 에서 Face 12fps (격프레임)</string>
+    <string name="preset_g">A 에서 Face 분석 스레드에 PerformanceHint 세션 (목표 35ms)</string>
     <string name="label_status">상태</string>
     <string name="label_log_path">세션 로그</string>
     <string name="label_summary">마지막 요약</string>

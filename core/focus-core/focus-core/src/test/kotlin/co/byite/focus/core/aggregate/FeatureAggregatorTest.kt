@@ -11,6 +11,7 @@ import co.byite.focus.core.model.ZoneStatus
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -21,20 +22,27 @@ class FeatureAggregatorTest {
 
     private fun ns(ms: Long): Long = ms * 1_000_000L
     /** Aggregator with the first-frame scene sample the device layer guarantees (session start = first processed frame). */
-    private fun agg(delay: Long = 300) = FeatureAggregator(t0, Synth.UTC0, closeDelayMs = delay).also { it.onScene(SceneSample(ns(t0 + 5), 118.0, 4.0, 9.0)) }
+    private fun agg(delay: Long = 300, gapThresholdNs: Long = FeatureAggregator.DEFAULT_GAP_THRESHOLD_NS) =
+        FeatureAggregator(t0, Synth.UTC0, closeDelayMs = delay, gapThresholdNs = gapThresholdNs).also { it.onScene(SceneSample(ns(t0 + 5), 118.0, 4.0, 9.0)) }
 
-    private fun frame(ms: Long, face: Boolean = true, yaw: Double = 1.0, pitch: Double = -5.0, roll: Double = 0.5, width: Double = 200.0, j: Double? = 0.01, infer: Double = 15.0) =
-        if (face) FrameSample(ns(t0 + ms), 30_000_000L, true, yaw, pitch, roll, width, j, infer)
-        else FrameSample(ns(t0 + ms), 30_000_000L, false, faceInferMs = infer)
+    private fun sample(ms: Long, face: Boolean = true, yaw: Double = 1.0, pitch: Double = -5.0, roll: Double = 0.5, width: Double = 200.0, j: Double? = 0.01, wrap: Double = 0.5, post: Double = 0.2, total: Double = 20.0) =
+        if (face) FrameSample(ns(t0 + ms), 30_000_000L, true, yaw, pitch, roll, width, j, wrap, post, total)
+        else FrameSample(ns(t0 + ms), 30_000_000L, false, wrapMs = wrap, facePostMs = post, totalMs = total)
 
-    private fun pose(ms: Long, cx: Double = 640.0, cy: Double = 700.0, w: Double = 300.0, vis: Double = 0.9, head: Boolean = true, offset: Double? = -0.8, infer: Double = 30.0) =
-        PoseSample(ns(t0 + ms), infer, true, vis, cx, cy, w, head, if (head) offset else null, 720, 1280)
+    /** The analyzer path of one processed frame: received → processed (+ sample). */
+    private fun FeatureAggregator.frame(ms: Long, face: Boolean = true, yaw: Double = 1.0, pitch: Double = -5.0, roll: Double = 0.5, width: Double = 200.0, j: Double? = 0.01, infer: Double = 15.0, total: Double = 20.0) {
+        onFrameReceived(ns(t0 + ms))
+        onFrameProcessed(ProcessedFrame(ns(t0 + ms), infer, sample(ms, face, yaw, pitch, roll, width, j, total = total)))
+    }
+
+    private fun pose(ms: Long, cx: Double = 640.0, cy: Double = 700.0, w: Double = 300.0, vis: Double = 0.9, head: Boolean = true, offset: Double? = -0.8, infer: Double = 30.0, wait: Double = 2.0) =
+        PoseSample(ns(t0 + ms), infer, true, vis, cx, cy, w, head, if (head) offset else null, 720, 1280, waitMs = wait)
 
     @Test
     fun bucketsAlignToSessionStartAndCloseAfterTheDelay() {
         val a = agg()
         a.onFrameRequested(ns(t0 + 10))
-        a.onFrame(frame(10))
+        a.frame(10)
         assertTrue(a.closeBuckets(t0 + 1000, device).isEmpty(), "bucket 0 ends at +1000 but the delay has not passed")
         assertTrue(a.closeBuckets(t0 + 1299, device).isEmpty())
         val closed = a.closeBuckets(t0 + 1300, device)
@@ -43,16 +51,19 @@ class FeatureAggregatorTest {
         assertEquals(t0, s.tMonoMs)
         assertEquals(Synth.UTC0, s.tUtcMs)
         assertEquals(1, s.framesRequested)
+        assertEquals(1, s.framesAnalyzerReceived)
         assertEquals(1, s.framesProcessed)
+        assertEquals(1, s.framesSampleApplied)
         assertEquals(0, s.framesDropped)
         assertEquals(1.0, s.faceDetectRatio)
         assertEquals(1L, a.closedBuckets)
+        assertEquals(300L, FeatureAggregator.DEFAULT_CLOSE_DELAY_MS, "정정 3: the close delay stays at 300 ms")
     }
 
     @Test
     fun emptySecondsStillProduceRecords() {
         val a = agg()
-        a.onFrame(frame(2500))
+        a.frame(2500)
         val closed = a.closeBuckets(t0 + 3300, device)
         assertEquals(listOf(t0, t0 + 1000, t0 + 2000), closed.map { it.second.tMonoMs })
         assertEquals(0, closed[0].second.framesProcessed)
@@ -62,45 +73,128 @@ class FeatureAggregatorTest {
     }
 
     @Test
-    fun requestedProcessedAndDroppedAreCountedSeparately() {
+    fun frameCountersSplitDropsIntoBackpressureUnprocessedPostFaceAndLate() {
         val a = agg()
         for (i in 0 until 24) a.onFrameRequested(ns(t0 + i * 41L))
-        for (i in 0 until 20) a.onFrame(frame(i * 41L))
-        val s = a.closeBuckets(t0 + 1300, device)[0].second
+        // 20 received: 14 processed with sample, 2 processed without sample (post-face failure), 1 face error, 1 pre-face error, 2 skipped
+        for (i in 0 until 20) a.onFrameReceived(ns(t0 + i * 41L))
+        for (i in 0 until 14) a.onFrameProcessed(ProcessedFrame(ns(t0 + i * 41L), 15.0, sample(i * 41L)))
+        for (i in 14 until 16) a.onFrameProcessed(ProcessedFrame(ns(t0 + i * 41L), 15.0, null))
+        a.onFaceInferenceError(ns(t0 + 16 * 41L))
+        a.onPreFaceError(ns(t0 + 17 * 41L))
+        a.onFrameSkipped(ns(t0 + 18 * 41L))
+        a.onFrameSkipped(ns(t0 + 19 * 41L))
+        val (s, raw) = a.closeBuckets(t0 + 1300, device)[0]
         assertEquals(24, s.framesRequested)
-        assertEquals(20, s.framesProcessed)
-        assertEquals(4, s.framesDropped)
+        assertEquals(20, s.framesAnalyzerReceived)
+        assertEquals(2, s.framesSkippedIntentional)
+        assertEquals(16, s.framesProcessed)
+        assertEquals(14, s.framesSampleApplied)
+        assertEquals(0, s.framesSampleLateDropped)
+        assertEquals(4, s.backpressureDrops)
+        assertEquals(2, s.framesUnprocessedUnexpected)
+        assertEquals(2, s.framesPostFaceFailed)
+        assertEquals(4 + 2 + 2, s.framesDropped)
+        assertEquals(22, s.framesTargeted)
+        assertEquals(1, raw.faceInferenceErrors)
+        assertEquals(1, raw.preFaceErrors)
+        assertEquals(1.0, s.faceDetectRatio, "face frames ÷ applied samples: the two post-face failures have no known face state")
+        val t = a.totals
+        assertEquals(24L, t.framesRequested)
+        assertEquals(20L, t.framesAnalyzerReceived)
+        assertEquals(16L, t.framesProcessed)
+        assertEquals(14L, t.framesSampleEnqueued)
+        assertEquals(2L, t.framesPostFaceFailed)
+        assertEquals(emptyList(), CounterConsistency.check(t))
     }
 
     @Test
-    fun withoutCaptureResultsRequestedFallsBackToProcessed() {
+    fun withoutCaptureResultsRequestedFallsBackToReceived() {
         val a = agg()
-        for (i in 0 until 20) a.onFrame(frame(i * 41L))
+        for (i in 0 until 20) a.frame(i * 41L)
+        a.onFrameSkipped(ns(t0 + 900))
+        a.onFrameReceived(ns(t0 + 900))
         val s = a.closeBuckets(t0 + 1300, device)[0].second
-        assertEquals(20, s.framesRequested)
+        assertEquals(21, s.framesRequested)
         assertEquals(0, s.framesDropped)
     }
 
     @Test
-    fun gapsAreMeasuredBetweenProcessedFramesAcrossBuckets() {
-        val a = agg()
-        a.onFrame(frame(900))
-        a.onFrame(frame(1000)) // gap 100 ms, belongs to bucket 1
-        a.onFrame(frame(1041))
-        a.onFrame(frame(1200)) // gap 159 ms
+    fun gapsAreMeasuredBetweenProcessedFramesAcrossBucketsAgainstBothThresholds() {
+        val a = agg(gapThresholdNs = 167_000_000L) // preset E
+        a.frame(900)
+        a.frame(1000) // gap 100 ms, belongs to bucket 1
+        a.frame(1041)
+        a.frame(1200) // gap 159 ms
+        a.frame(1400) // gap 200 ms
         val closed = a.closeBuckets(t0 + 2300, device)
         assertNull(closed[0].second.maxFrameGapMs)
         assertEquals(0, closed[0].second.gapsOver80Ms)
-        assertEquals(159L, closed[1].second.maxFrameGapMs)
-        assertEquals(2, closed[1].second.gapsOver80Ms)
+        assertEquals(200L, closed[1].second.maxFrameGapMs)
+        assertEquals(3, closed[1].second.gapsOver80Ms)
+        assertEquals(1, closed[1].second.gapsOverThreshold)
     }
 
     @Test
-    fun faceScalarsAreAveragedOverFaceFramesOnly() {
+    fun longGapsAndGapCausesNameTheSlowestStageOfThePreviousCycle() {
+        val a = agg() // thresholds 80 ms / 200 ms; expected interval = 40 ms
+        // frame 0: a long cycle dominated by Face → the gap that follows is attributed to Face
+        a.onFrameReceived(ns(t0))
+        a.onFrameProcessed(ProcessedFrame(ns(t0), 60.0, FrameSample(ns(t0), 1_000_000L, false, wrapMs = 1.0, facePostMs = 0.5, totalMs = 70.0, sceneMs = 3.0, poseCopyMs = 2.0, enqueueMs = 0.1)))
+        a.frame(100) // gap 100 ms > 80: cause Face
+        // frame at 100 had total 20 ms (< 40): the next gap is not the analyzer's
+        a.frame(350) // gap 250 ms > 200: cause other, long gap
+        // a cycle where the pose copy dominated
+        a.onFrameReceived(ns(t0 + 400))
+        a.onFrameProcessed(ProcessedFrame(ns(t0 + 400), 5.0, FrameSample(ns(t0 + 400), 1_000_000L, false, wrapMs = 1.0, facePostMs = 0.5, totalMs = 45.0, poseCopyMs = 30.0, enqueueMs = 0.1)))
+        a.frame(500) // gap 100: cause pose copy
+        a.frame(541) // gap 41: no cause
+        val (s, raw) = a.closeBuckets(t0 + 1300, device)[0]
+        assertEquals(3, s.gapsOverThreshold)
+        assertEquals(1, s.gapsOverLongThreshold)
+        assertEquals(mapOf("변환·전처리" to 0, "Face" to 1, "scene" to 0, "Pose 복사" to 1, "큐 적재" to 0, "그 외" to 1), raw.gapCauses)
+        assertEquals(3, raw.gapCauses.values.sum())
+    }
+
+    @Test
+    fun stageStatsCarryP95AndMaxAndTheHingeAngle() {
         val a = agg()
-        a.onFrame(frame(0, yaw = 10.0, pitch = -10.0, roll = 2.0, width = 100.0, j = 0.02, infer = 10.0))
-        a.onFrame(frame(41, yaw = 20.0, pitch = -20.0, roll = 4.0, width = 300.0, j = 0.04, infer = 30.0))
-        a.onFrame(frame(82, face = false, infer = 20.0))
+        a.onFrameReceived(ns(t0))
+        a.onFrameProcessed(ProcessedFrame(ns(t0), 10.0, FrameSample(ns(t0), 1_000_000L, false, wrapMs = 1.0, facePostMs = 0.2, totalMs = 12.0, enqueueMs = 0.05)))
+        a.onFrameReceived(ns(t0 + 41))
+        a.onFrameProcessed(ProcessedFrame(ns(t0 + 41), 10.0, FrameSample(ns(t0 + 41), 1_000_000L, false, wrapMs = 3.0, facePostMs = 0.4, totalMs = 14.0, enqueueMs = 0.15)))
+        a.onPoseRequested(ns(t0 + 5), 1.0)
+        a.onPose(pose(5, infer = 30.0))
+        a.onPoseRequested(ns(t0 + 700), 1.0)
+        a.onPose(pose(700, infer = 50.0))
+        val raw = a.closeBuckets(t0 + 1300, device.copy(hingeAngleDeg = 178.5))[0].raw
+        assertEquals(2.0, raw.stageWrapMsMean!!, 1e-12)
+        assertEquals(3.0, raw.stageWrapMsP95)
+        assertEquals(3.0, raw.stageWrapMsMax)
+        assertEquals(0.4, raw.stageFacePostMsP95)
+        assertEquals(0.15, raw.stageEnqueueMsMax)
+        assertEquals(0.1, raw.stageEnqueueMsMean!!, 1e-12)
+        assertEquals(50.0, raw.poseInferMsP95)
+        assertEquals(178.5, raw.hingeAngleDeg)
+    }
+
+    @Test
+    fun gapIsCountedEvenWhenTheSampleIsMissing() {
+        val a = agg()
+        a.frame(0)
+        a.onFrameReceived(ns(t0 + 200))
+        a.onFrameProcessed(ProcessedFrame(ns(t0 + 200), 15.0, null))
+        val s = a.closeBuckets(t0 + 1300, device)[0].second
+        assertEquals(200L, s.maxFrameGapMs)
+        assertEquals(1, s.gapsOver80Ms)
+    }
+
+    @Test
+    fun faceScalarsAreAveragedOverFaceFramesOnlyAndStageTimingsOverAppliedSamples() {
+        val a = agg()
+        a.frame(0, yaw = 10.0, pitch = -10.0, roll = 2.0, width = 100.0, j = 0.02, infer = 10.0, total = 12.0)
+        a.frame(41, yaw = 20.0, pitch = -20.0, roll = 4.0, width = 300.0, j = 0.04, infer = 30.0, total = 36.0)
+        a.frame(82, face = false, infer = 20.0, total = 24.0)
         val (s, raw) = a.closeBuckets(t0 + 1300, device)[0]
         assertEquals(2.0 / 3.0, s.faceDetectRatio, 1e-12)
         assertEquals(15.0, s.yawMean)
@@ -112,14 +206,23 @@ class FeatureAggregatorTest {
         assertEquals(30.0, raw.faceInferMsP95)
         assertEquals(30.0, raw.faceInferMsMax)
         assertEquals(30.0, raw.frameLatencyMsMean)
+        assertEquals(24.0, raw.frameTotalMsMean)
+        assertEquals(36.0, raw.frameTotalMsP95)
+        assertEquals(36.0, raw.frameTotalMsMax)
+        assertEquals(0.5, raw.stageWrapMsMean!!, 1e-12)
+        assertEquals(0.2, raw.stageFacePostMsMean!!, 1e-12)
+        assertEquals(0.0, raw.stageSceneMsMean, "the fixture scene sample has computeMs 0")
     }
 
     @Test
     fun poseFieldsComeFromTheLastDetectedSampleAndAreNormalised() {
         val a = agg()
-        a.onPose(pose(100, cx = 100.0, cy = 200.0, w = 100.0, vis = 0.5, head = false, infer = 20.0))
-        a.onPose(pose(500, cx = 360.0, cy = 640.0, w = 180.0, vis = 0.95, head = true, offset = -0.7, infer = 40.0))
-        a.onPose(PoseSample(ns(t0 + 900), 25.0, detected = false, frameWidthPx = 720, frameHeightPx = 1280))
+        a.onPoseRequested(ns(t0 + 100), copyMs = 1.5)
+        a.onPoseRequested(ns(t0 + 500), copyMs = 2.5)
+        a.onPoseRequested(ns(t0 + 900), copyMs = 3.5)
+        assertTrue(a.onPose(pose(100, cx = 100.0, cy = 200.0, w = 100.0, vis = 0.5, head = false, infer = 20.0, wait = 1.0)))
+        assertTrue(a.onPose(pose(500, cx = 360.0, cy = 640.0, w = 180.0, vis = 0.95, head = true, offset = -0.7, infer = 40.0, wait = 3.0)))
+        assertTrue(a.onPose(PoseSample(ns(t0 + 900), 25.0, detected = false, frameWidthPx = 720, frameHeightPx = 1280, waitMs = 5.0)))
         val (s, raw) = a.closeBuckets(t0 + 1300, device)[0]
         assertEquals(0.95, s.shoulderVisibilityMin)
         assertTrue(s.headLandmarkPresent)
@@ -128,9 +231,19 @@ class FeatureAggregatorTest {
         assertEquals(0.5, raw.shoulderCenterY)
         assertEquals(0.25, raw.shoulderWidth)
         assertEquals(3, raw.poseSamples)
+        assertEquals(3, raw.poseRequested)
+        assertEquals(3, raw.poseCompleted)
+        assertEquals(3, raw.poseApplied)
+        assertEquals(0, raw.poseSuperseded)
+        assertEquals(0, raw.poseLateDropped)
         assertEquals((20.0 + 40.0 + 25.0) / 3, raw.poseInferMsMean!!, 1e-12)
         assertEquals(40.0, raw.poseInferMsMax)
+        assertEquals(3.0, raw.poseWaitMsMean!!, 1e-12)
+        assertEquals(2.5, raw.poseFrameCopyMsMean!!, 1e-12)
+        assertEquals(3.5, raw.poseFrameCopyMsP95)
+        assertEquals(3.5, raw.poseFrameCopyMsMax)
         assertNull(s.poseMotion, "no reference one second earlier")
+        assertEquals(emptyList(), CounterConsistency.check(a.totals))
     }
 
     @Test
@@ -155,19 +268,66 @@ class FeatureAggregatorTest {
     }
 
     @Test
+    fun aLatePoseResultIsDroppedAndCountedInTheOldestOpenBucket() {
+        val a = agg()
+        a.onPoseRequested(ns(t0 + 900), copyMs = 1.0)
+        a.closeBuckets(t0 + 1300, device) // bucket 0 closed
+        assertFalse(a.onPose(pose(900)))
+        a.onPoseRequested(ns(t0 + 1500), copyMs = 1.0)
+        a.onPoseSuperseded(ns(t0 + 1500)) // replaced in the slot by the request at +1700
+        a.onPoseRequested(ns(t0 + 1700), copyMs = 1.0)
+        a.onPoseError(ns(t0 + 1700))
+        val raw = a.closeBuckets(t0 + 2300, device)[0].raw
+        assertEquals(0, raw.poseSamples)
+        assertEquals(1, raw.poseCompleted)
+        assertEquals(1, raw.poseLateDropped)
+        assertEquals(1, raw.poseSuperseded)
+        assertEquals(1, raw.poseErrors)
+        assertEquals(2, raw.poseRequested)
+        val t = a.totals
+        assertEquals(3L, t.poseRequested)
+        assertEquals(1L, t.poseCompleted)
+        assertEquals(0L, t.poseApplied)
+        assertEquals(1L, t.poseLateDropped)
+        assertEquals(emptyList(), CounterConsistency.check(t))
+    }
+
+    @Test
+    fun aLateFrameSampleIsCountedButNotApplied() {
+        val a = agg()
+        a.onFrameRequested(ns(t0 + 900))
+        a.onFrameReceived(ns(t0 + 900))
+        a.closeBuckets(t0 + 1300, device)
+        a.onFrameProcessed(ProcessedFrame(ns(t0 + 900), 15.0, sample(900)))
+        val s = a.closeBuckets(t0 + 2300, device)[0].second
+        assertEquals(1, s.framesProcessed, "attributed to the oldest open bucket")
+        assertEquals(0, s.framesSampleApplied)
+        assertEquals(1, s.framesSampleLateDropped)
+        assertEquals(0, s.framesAnalyzerReceived)
+        assertEquals(0, s.framesUnprocessedUnexpected, "clamped per bucket")
+        assertEquals(1, s.framesDropped)
+        val t = a.totals
+        assertEquals(1L, t.framesSampleLateDropped)
+        assertEquals(0L, t.framesSampleApplied)
+        assertEquals(emptyList(), CounterConsistency.check(t), "session totals stay conserved")
+    }
+
+    @Test
     fun sceneLumaIsMeasuredAndCarriesForwardOnlyWhenTheBucketHasNoSample() {
         val a = FeatureAggregator(t0, Synth.UTC0)
-        a.onScene(SceneSample(ns(t0 + 100), 100.0, 3.0, 8.0))
-        a.onScene(SceneSample(ns(t0 + 600), 120.0, 2.0, 10.0))
+        a.onScene(SceneSample(ns(t0 + 100), 100.0, 3.0, 8.0, computeMs = 1.0))
+        a.onScene(SceneSample(ns(t0 + 600), 120.0, 2.0, 10.0, computeMs = 3.0))
         a.onScene(SceneSample(ns(t0 + 2100), 90.0, 1.0, 7.0))
         val closed = a.closeBuckets(t0 + 3300, device)
         assertEquals(110.0, closed[0].second.sceneLuma)
         assertEquals(2.0, closed[0].raw.tileTextureMin)
         assertEquals(9.0, closed[0].raw.tileTextureMedian)
         assertEquals(2, closed[0].raw.sceneSamples)
+        assertEquals(2.0, closed[0].raw.stageSceneMsMean)
         assertEquals(110.0, closed[1].second.sceneLuma, "no sample in the bucket: last measured value")
         assertEquals(0, closed[1].raw.sceneSamples)
         assertNull(closed[1].raw.tileTextureMin)
+        assertNull(closed[1].raw.stageSceneMsMean)
         assertNull(closed[1].second.bgTileTextureRatio)
         assertEquals(90.0, closed[2].second.sceneLuma)
     }
@@ -175,7 +335,7 @@ class FeatureAggregatorTest {
     @Test
     fun aBucketClosedBeforeAnySceneSampleIsAContractViolationNotAConstant() {
         val a = FeatureAggregator(t0, Synth.UTC0)
-        a.onFrame(frame(0))
+        a.frame(0)
         assertFailsWith<IllegalStateException> { a.closeBuckets(t0 + 1300, device) }
     }
 
@@ -196,16 +356,16 @@ class FeatureAggregatorTest {
     fun segmentLabelIsTheOneActiveAtBucketStart() {
         val a = agg()
         a.setSegmentLabel("정면", t0 + 1500)
-        a.setSegmentLabel("정지", t0 + 3000)
+        a.setSegmentLabel("가만히", t0 + 3000)
         a.setSegmentLabel(null, t0 + 4200)
         val closed = a.closeBuckets(t0 + 6300, device)
-        assertEquals(listOf(null, null, "정면", "정지", "정지", null), closed.map { it.raw.segmentLabel })
+        assertEquals(listOf(null, null, "정면", "가만히", "가만히", null), closed.map { it.raw.segmentLabel })
     }
 
     @Test
     fun placeholdersForFieldsWithoutCalibrationOrGates() {
         val a = agg()
-        a.onFrame(frame(0))
+        a.frame(0)
         val s = a.closeBuckets(t0 + 1300, device)[0].second
         assertNull(s.rawState)
         assertNull(s.finalState)
@@ -223,28 +383,53 @@ class FeatureAggregatorTest {
     }
 
     @Test
-    fun lateAndEarlyInputsAreCountedAndDropped() {
+    fun inputsOutsideTheSessionWindowAreNotCounted() {
         val a = agg()
-        a.onFrame(frame(-10))
-        assertEquals(1L, a.inputsBeforeStart)
-        a.closeBuckets(t0 + 1300, device)
-        a.onFrame(frame(500))
+        a.onFrameRequested(ns(t0 - 10)) // held before the start: outside the window
+        a.onFrameReceived(ns(t0 - 10))
+        assertEquals(2L, a.inputsBeforeStart)
         a.onFrameRequested(ns(t0 + 500))
+        a.frame(500)
+        a.stopInputs(t0 + 1000)
+        a.onFrameRequested(ns(t0 + 1000)) // capture result at the fence: excluded
+        a.onFrameRequested(ns(t0 + 1500))
+        assertEquals(2L, a.inputsAfterFence)
+        a.onFrameRequested(ns(t0 + 999)) // still inside: in flight before the fence
+        assertEquals(t0 + 1000, a.stopFenceMonoMs)
+        val closed = a.finish(t0 + 1000, device)
+        assertEquals(1, closed.size)
+        assertEquals(2, closed[0].second.framesRequested)
+        assertEquals(1, closed[0].second.framesProcessed)
+        a.onFrameRequested(ns(t0 + 700)) // after finish: rejected
+        assertEquals(3L, a.inputsAfterFence)
+        val t = a.totals
+        assertEquals(2L, t.framesRequested)
+        assertEquals(1L, t.framesAnalyzerReceived)
+        assertEquals(emptyList(), CounterConsistency.check(t))
+    }
+
+    @Test
+    fun lateSceneAndImuInputsAreCountedAndDropped() {
+        val a = agg()
+        a.closeBuckets(t0 + 1300, device)
+        a.onScene(SceneSample(ns(t0 + 500), 1.0, 1.0, 1.0))
+        a.onImu(ImuSample(ns(t0 + 500), 0.0, 0.0, 0.0))
         assertEquals(2L, a.lateInputs)
         val next = a.closeBuckets(t0 + 2300, device)
         assertEquals(1, next.size)
-        assertEquals(0, next[0].second.framesProcessed)
+        assertEquals(0, next[0].raw.sceneSamples)
     }
 
     @Test
     fun finishClosesCompleteBucketsOnlyAndDropsThePartialOne() {
         val a = agg()
-        a.onFrame(frame(0))
-        a.onFrame(frame(1000))
-        a.onFrame(frame(2000))
+        a.frame(0)
+        a.frame(1000)
+        a.frame(2000)
         val closed = a.finish(t0 + 2500, device)
         assertEquals(listOf(t0, t0 + 1000), closed.map { it.second.tMonoMs })
         assertEquals(2L, a.closedBuckets)
+        assertEquals(3L, a.totals.framesProcessed, "the totals keep the frame of the dropped partial bucket")
     }
 
     @Test
@@ -266,9 +451,11 @@ class FeatureAggregatorTest {
             a.setSegmentLabel("정면", t0)
             for (i in 0 until 48) {
                 a.onFrameRequested(ns(t0 + i * 41L))
-                a.onFrame(frame(i * 41L, yaw = i * 0.1, j = if (i == 0) null else 0.005))
+                a.frame(i * 41L, yaw = i * 0.1, j = if (i == 0) null else 0.005)
             }
+            a.onPoseRequested(ns(t0 + 10), 1.0)
             a.onPose(pose(10))
+            a.onPoseRequested(ns(t0 + 1010), 1.0)
             a.onPose(pose(1010, cx = 650.0))
             a.onScene(SceneSample(ns(t0 + 10), 118.0, 5.0, 12.0))
             a.onImu(ImuSample(ns(t0 + 0), 0.1, 7.2, 6.6))
