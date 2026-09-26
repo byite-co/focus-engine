@@ -1,8 +1,8 @@
 # core/focus-core
 
-순수 로직 코어(Kotlin JVM). 스펙 v0.2.0 + CHANGELOG v0.2.1·v0.2.2·v0.2.3 의 기록 스키마(0.2.3; 0.2.1·0.2.2 로그도 읽는다), StateFinalizer, 로그 재생, GT 대조 도구를 담는다.
+순수 로직 코어(Kotlin JVM). 스펙 v0.2.0 + CHANGELOG v0.2.1~v0.2.4 의 기록 스키마(0.2.4; 0.2.1~0.2.3 로그도 읽는다), StateFinalizer, 로그 재생, GT 대조 도구를 담는다.
 게이트 규칙 전체는 아직 없고 `GateEngine` 인터페이스, 비교용 `NaiveBaselineEngine`, 폰 게이트의 IMU 부분(`PhoneGateTracker`)만 있다.
-지시문은 `directives/B-focus-core.md`(+ V0-B 추가는 `directives/C-v0ab-raw-features.md`, R4 계수·요약은 `directives/D-r4-perf-experiments.md`), 정본은 `docs/focus/`(동결), 설계 변경은 `CHANGELOG.md` v0.2.1·v0.2.2·v0.2.3 과 `docs/research-notes/RN-001-v0.2.1-spec-clarifications.md`, `RN-002-mediapipe-telemetry-and-jitter.md`, `RN-003-r4-presets-counters-and-threads.md`.
+지시문은 `directives/B-focus-core.md`(+ V0-B 추가는 `directives/C-v0ab-raw-features.md`, R4 계수·요약은 `directives/D-r4-perf-experiments.md`, 처리 슬롯·timestamp 영역은 `directives/E-camera-fps-and-skip-fix.md`), 정본은 `docs/focus/`(동결), 설계 변경은 `CHANGELOG.md` v0.2.1~v0.2.4 와 `docs/research-notes/RN-001-v0.2.1-spec-clarifications.md`, `RN-002-mediapipe-telemetry-and-jitter.md`, `RN-003-r4-presets-counters-and-threads.md`.
 
 ## 구성
 
@@ -16,14 +16,14 @@
 
 | 패키지 | 내용 |
 |---|---|
-| `model` | `State`(우선순위 포함), `InvalidReason`, `Event`, `SessionHeader`, `SecondRecord`(스키마 0.2.1), `IntervalRecord`, `SessionEnd`, `CalibrationSnapshot`, `TimebaseRecord`, `V0bRawRecord`(V0-B 원시 스칼라 줄), `ParameterSet`, `BackdateRules`, `FocusSchema` |
+| `model` | `State`(우선순위 포함), `InvalidReason`, `Event`, `SessionHeader`(0.2.4 카메라 cadence·Face 스케줄 필드), `SecondRecord`(필드는 0.2.3 과 같다), `IntervalRecord`, `SessionEnd`(0.2.4 정지 진단), `CalibrationSnapshot`, `TimebaseRecord`, `V0bRawRecord`(V0-B 원시 스칼라 줄, 0.2.4 슬롯 계수), `ParameterSet`, `BackdateRules`, `FocusSchema` |
 | `engine` | `GateEngine`·`GateDecision`, `FaceBand`(얼굴 검출 2단 임계값), `NaiveBaselineEngine`, `PhoneGateTracker`(집어 듦·재거치·재캘리브레이션 상태 기계) |
 | `finalizer` | `StateFinalizer`: raw/final 분리, 30초 확정 버퍼, 소급 덮어쓰기 표, flushNow, lifecycle gap, 프로세스 종료 복구 |
 | `log` | `JsonlCodec`, `SessionLog`, `FocusJson` |
 | `replay` | `ReplayRunner`: 로그 → 엔진 → finalizer 재실행 |
 | `gt` | GT 파서·lint, behavior 카탈로그, expected_state 생성기, 초 단위 diff, 합격선, 콘솔 표 |
-| `aggregate` | `FeatureAggregator`: 기기 층의 프레임·Pose·Scene·IMU 스칼라(`FrameSample`/`ProcessedFrame`, `PoseSample`, `SceneSample`, `ImuSample`, `DeviceSample`)를 세션 시작에 정렬한 1초 버킷으로 집계해 `SecondRecord` + `V0bRawRecord` 를 낸다(V0-A/B, 지시문 C·D). 단일 스레드 소유, 결정적, 시계 없음. `CounterTotals`·`CounterConsistency`: 세션 총계와 보존식 검사. `StopSequence`: 정상 종료 순서 7단계(지시문 D 정정 5) |
-| `report` | `V0bReport`: V0-B/R4 세션 요약(계수 검증 줄, 전체, 화면 on/off 비교 행, 프리셋 합격, 화면 상태 구간표, 10초 추이표, 마커별). 실시간 경로와 프로세스 종료 복원이 같은 함수를 쓴다 |
+| `aggregate` | `FeatureAggregator`: 기기 층의 프레임·Pose·Scene·IMU 스칼라(`FrameSample`/`ProcessedFrame`, `PoseSample`, `SceneSample`, `ImuSample`, `DeviceSample`)를 세션 시작에 정렬한 1초 버킷으로 집계해 `SecondRecord` + `V0bRawRecord` 를 낸다(V0-A/B, 지시문 C·D·E). 단일 스레드 소유, 결정적, 시계 없음. `CameraStamp`(raw identity + mono 위치)·`CameraCounterSink`: 카메라 기원 계수 이벤트. `FrameScheduler`: 처리 슬롯 스케줄러(지시문 E 3장)와 분석 스레드의 계수 glue. `GapThresholds`: 갭 임계 공식(1.5배·4.5배). `CounterTotals`·`CounterConsistency`: 세션 총계와 보존식 검사(슬롯 보존식 포함). `StopSequence`: 정상 종료 순서(지시문 D 정정 5 + 지시문 E 슬롯 CLOSE) |
+| `report` | `V0bReport`: V0-B/R4 세션 요약(첫 줄 `비교 가능` / `비교 불가: <사유들>` / `짝 비교 판정 비적용: Hvar 가변 cadence`(`Comparability`, E2 3장), 계수 검증·cadence 불일치·stop_integrity_failed 원인·순서 역전·fps unset 줄, 프리셋 제목, 카메라 cadence 줄, 전체, 슬롯·진단 계수, 갭 임계 실제값, 화면 on/off 비교 행, 프리셋 합격(slot_miss_ratio; 고정 AE range 요청에만 판정), 화면 상태 구간표, 10초 추이표, 마커별). 실시간 경로와 프로세스 종료 복원이 같은 함수를 쓴다 |
 
 ## 빌드·테스트
 
@@ -70,15 +70,17 @@ JDK 17 이상. Kotlin 2.2, kotlinx-serialization 1.9, kotlin.test.
   `pose_motion` 의 기준 표본은 0.9~3초 전의 가장 최근 Pose 표본. `scene_luma` 는 항상 측정값이고 버킷에 표본이 없을 때만 직전 값; 표본이 한 번도 없는데
   버킷을 닫으면 예외(세션은 첫 처리 프레임에서 시작해야 한다는 계약).
 - **계수(v0.2.3, 지시문 D)**: 집계기는 한 스레드(aggregation 큐)만 접근하고 파이프라인은 스칼라 표본을 그 큐에 post 만 한다. 입력 API 는 `onFrameRequested`(CaptureResult),
-  `onFrameReceived`(analyzer 콜백), `onFrameSkipped`, `onFaceInferenceError`, `onPreFaceError`, `onFrameProcessed(ProcessedFrame)`(Face 추론 성공 = `frames_processed` 확정; 표본이 있으면 반영), `onPoseRequested(ns, copyMs)`, `onPoseSuperseded`,
-  `onPoseError`, `onPose`, `onScene`, `onImu`, `stopInputs(fence)`. 세션 창 `sessionStartCaptureTs ≤ captureTs < stopFenceCaptureTs` 밖의 입력은 `CounterTotals.inputsBeforeStart`/`inputsAfterFence` 로 센다.
+  `onFrameReceived`(analyzer 콜백), `onFrameSkipped`, `onFaceInferenceError`, `onPreFaceError`, `onFrameProcessed(ProcessedFrame)`(Face 추론 성공 = `frames_processed` 확정; 표본이 있으면 반영), `onPoseRequested(stamp, copyMs)`, `onPoseSuperseded`,
+  `onPoseError`, `onPose`, `onScene`, `onImu`, `stopInputs(fence, fenceRaw)`. 카메라 기원 입력은 `CameraStamp(rawSensorTs, captureMonoNs)` 를 받고(Long 오버로드는 raw == mono 인 REALTIME 축약), 세션 창 `sessionStartRawTs ≤ rawSensorTs < stopFenceRawTs` 밖의 입력은 `CounterTotals.inputsBeforeStart`/`inputsAfterFence` 로 센다.
   닫힌 버킷에 도착한 **계수**는 가장 오래된 열린 버킷에 귀속해 총계를 보존하고, 닫힌 버킷에 도착한 **표본**은 버리고 센다(`frames_sample_late_dropped`, `pose_late_dropped`; scene·IMU 는 `lateInputs`).
   `frames_requested` 는 capture result 수(한 번도 없으면 수신 수). `frames_dropped` = 백프레셔 + unprocessed_unexpected + post_face_failed + sample_late_dropped(초당 값은 항마다 0 에서 자른다).
-  갭은 처리 프레임(Face 추론 성공)의 capture timestamp 차이: `gaps_over_80ms`(고정 80ms), `gaps_over_threshold`(프리셋 임계, 생성자 `gapThresholdNs`), `gaps_over_long_threshold`(긴 임계, `longGapThresholdNs`, 합격선 0).
-  임계 초과 갭마다 직전 처리 프레임 사이클의 가장 긴 단계를 원인으로 센다(`gap_cause_*`; 사이클이 임계 ÷ 2 보다 짧거나 표본이 없으면 `other`).
-  `totals` 는 버킷과 무관한 세션 총계이고 `CounterConsistency.check(totals, framesCancelledAtStop, poseCancelledAtStop)` 가 보존식 6개를 검사한다.
-- **정상 종료 순서(`StopSequence`)**: ① 입력 정지 + fence + 분석 스레드 idle(상한 500ms, 넘으면 `WorkGeneration` 을 올려 늦은 결과를 차단하고 `frames_cancelled_at_stop`) → ② Pose 대기 슬롯 폐쇄 → ③ 실행 중 Pose 상한 500ms(넘으면 generation 을 올려 차단, `pose_cancelled_at_stop`) → ④ 큐 barrier·drain →
-  ⑤ `StopFinalizer.finish(fence)`(fence 이전에 끝난 완전한 버킷만; `session_end` 는 fence 시각, `t_utc = t_start_utc + (fence − t_start_mono)`; fence 가 서면 tick 도 그 뒤 버킷을 닫지 않는다) → ⑥ 보존식 검사 → ⑦ `session_end`·요약. 람다로 기기 층이 채우고 순서·fence·차단은 `StopSequenceTest`·`StopFinalizerTest` 가 검사한다.
+  갭은 처리 프레임(Face 추론 성공)의 capture timestamp(mono) 차이: `gaps_over_80ms`(고정 80ms), `gaps_over_threshold`(생성자 `gapThresholdNs` = 기대 처리 간격 × 1.5, `GapThresholds`), `gaps_over_long_threshold`(`longGapThresholdNs` = × 4.5, 합격선 0).
+  임계 초과 갭마다 직전 처리 프레임 사이클의 가장 긴 단계를 원인으로 센다(`gap_cause_*`; 사이클이 기대 처리 간격보다 짧거나 표본이 없으면 `other`). fps unset(고정 AE range 없음, E2 1장)이면 `learnThresholdsFromWarmup = true` 로 만들고: 임계가 없는 채로 시작해 마지막 워밍업 버킷(60번째)이 닫힐 때 워밍업 버킷들의 초당 CaptureResult 간격 중앙값의 중앙값을 진단용 기대 간격으로 배워(`learnedExpectedIntervalNs`) 그 뒤 × 1.5 / 4.5 를 적용한다; 그 전에는 `gaps_over_threshold`·`gaps_over_long_threshold` 를 세지 않는다(`gaps_over_80ms`·최대 갭은 그대로). 학습 시점은 capture timestamp 가 워밍업 끝 이상인 첫 처리 프레임(그 프레임의 갭부터 적용; tick 시각에 의존하지 않는다), 그런 프레임 없이 마지막 워밍업 버킷이 닫히면 그때.
+  `totals` 는 버킷과 무관한 세션 총계이고 `CounterConsistency.check(totals, framesCancelledAtStop, poseCancelledAtStop)` 가 보존식 7개(슬롯 포함)를 검사한다.
+- **timestamp 영역(v0.2.4 (b), 지시문 E 4장)**: raw = 프레임 identity(세션 소속, 슬롯, 카메라 계수 보존식), mono = 위치(버킷, 갭, 지연, JSONL 시간축). 버킷 index 는 raw 소속을 먼저 확정한 뒤 mono 위치를 [첫 버킷, 마지막 버킷] 으로 clamp 한다(`rawSensorTs ≥ sessionStartRawTs` 인데 mono 가 시작 전이면 첫 버킷, `rawSensorTs < stopFenceRawTs` 인데 mono 가 fence 뒤면 마지막 버킷에 applied). 마지막 버킷 = `lastPartialBucketIndex(fence − start) = (fence − start − 1) ÷ period`(E2 2.1; fence 가 정확히 버킷 경계면 그 앞 버킷 — `(fence − start) ÷ period` 는 fence 에서 시작하는, 절대 emit 되지 않는 버킷을 가리켜 applied 로 센 프레임이 레코드에서 사라졌다). clamp 는 late 규칙과 별개다(원래 버킷이 이미 닫혔으면 `*_late_dropped`). IMU 는 mono 창. 생성자 `sessionStartRawNs`, `stopInputs(fenceMonoMs, fenceRawNs)`(기기 층이 `fenceMono − offsetSnapshot` 으로 계산). CaptureResult 진단 계수 `captureResultsBeforeStart/AfterFence/AfterClose/OutOfOrder`(`session_end` 줄에도). 정상 종료 무결성은 `StopIntegrity`: `failed = afterClose > 0 OR !captureResultDrainComplete OR !aggregationQueueDrained`, 원인별 `reasons`(E2 2.2).
+- **처리 슬롯(v0.2.4 (a), 지시문 E 2·3장, `FrameScheduler`)**: 분석 스레드가 소유하고 `CameraCounterSink`(집계기 또는 post 하는 listener)로 계수를 낸다. 입력은 CaptureResult raw ts 스트림(`onCaptureResult`); CaptureResult 보다 먼저 온 analyzer 프레임(`onFrameReceived`)은 그 raw ts 로 스트림에 들어가고 뒤의 CaptureResult 는 중복. anchor = 창 안 첫 raw ts, `next_due = anchor`; `ts ≥ next_due − 카메라 프레임 간격/2` 를 처음 만족하는 프레임을 선택(`onSlotExpected`), 선택 뒤 `next_due += 주기`, 캡처 공백이면 `next_due > ts` 까지 catch-up(위상 유지; 24fps → 15Hz 는 0, 83.3, 125, 208.3, 250, 333.3 …). `processPeriodNs = null` 이면 모든 CaptureResult 가 슬롯(Face 매 프레임 구성). `onFaceSucceeded` → `filled`; 뒤 프레임 수신 시 남은 옛 슬롯·pre-face/Face 오류·`close()` → `missed`. 세 계수는 독립 terminal counter 다. `onSessionStart(first)` 가 시작 전 CaptureResult 를 창으로 걸러 replay 하고, `fence(raw)` 뒤의 CaptureResult·프레임은 거부, `close()` 뒤의 CaptureResult 는 `onCaptureResultAfterClose`. `SlotSchedulingTest` (a)~(r) 가 실제 스케줄러·집계기·StopSequence·V0bReport 로 지시문 E 9장과 E2 를 검사한다.
+- **정상 종료 순서(`StopSequence`)**: ① 입력 정지 + fence(mono·raw) + CaptureResult 콜백 drain(`drainCaptureResults` → `capture_result_drain_complete`) + 분석 스레드 idle(상한 500ms, 넘으면 `WorkGeneration` 을 올려 늦은 결과를 차단하고 `frames_cancelled_at_stop`) → ② 슬롯 scheduler CLOSE(`closeSlotScheduler`; 미해결 슬롯 missed) → ③ Pose 대기 슬롯 폐쇄 → ④ 실행 중 Pose 상한 500ms(넘으면 generation 을 올려 차단, `pose_cancelled_at_stop`) → ⑤ 큐 barrier·drain(`aggregation_queue_drained`) →
+  ⑥ `StopFinalizer.finish(fence)`(fence 이전에 끝난 완전한 버킷만; `session_end` 는 fence 시각, `t_utc = t_start_utc + (fence − t_start_mono)`; fence 가 서면 tick 도 그 뒤 버킷을 닫지 않는다) → ⑦ 보존식 검사 → ⑧ `session_end`(진단 계수 4종, drain 플래그 2종, `stop_integrity_failed` = 세 원인의 OR)·요약. 람다로 기기 층이 채우고 순서·fence·차단은 `StopSequenceTest`·`StopFinalizerTest`·`SlotSchedulingTest` 가 검사한다.
   `frames_processed` 는 "Face 추론이 성공했다"는 뜻의 카운터이고 실제 증가는 aggregation 스레드가 `ProcessedFrame` 을 적용할 때 일어난다.
 
 ## 데이터 경계
@@ -87,9 +89,10 @@ JDK 17 이상. Kotlin 2.2, kotlinx-serialization 1.9, kotlin.test.
 `calibration` 줄(`CalibrationSnapshot`)에 한해 이름이 정해진 고정 길이 수치 목록만 허용한다: `zones`(≤ 3), `dock_gravity_vector`(3), `bg_tile_texture_baseline`(16), `bg_tile_mask`(16).
 `SchemaBoundaryTest` 가 `SerialDescriptor` 를 훑어 이 규칙을 검사하고 `SecondRecord`·`SessionHeader`·`CalibrationSnapshot`·`V0bRawRecord` 필드 목록을 고정한다. `v0b_raw` 줄은 배열·목록 없이 스칼라만 허용한다.
 
-## 세션 JSONL 형식 (feature_schema_version 0.2.3)
+## 세션 JSONL 형식 (feature_schema_version 0.2.4)
 
 첫 줄은 세션 header, 이후 한 줄에 객체 하나. `type` 키로 구분한다(없으면 키로 추론). 빈 줄과 모르는 키는 무시한다.
+아래 예시는 0.2.1 로그(호환 판독 예시)다. 0.2.3·0.2.4 가 header·`v0b_raw`·`session_end` 에 더한 필드는 예시 뒤의 목록에 있고, 없으면 문서화된 기본값으로 읽는다.
 시간이 있는 줄(calibration, timebase, interval, second, v0b_raw)은 시간 순으로 쓴다. 같은 시각이면 second 뒤에 v0b_raw 가 온다.
 `JsonlCodec.encodeHeader/encodeSecond/encodeV0bRaw/...` 는 줄 하나씩 만드는 인코더로, 기기 층의 스트리밍 기록이 쓴다.
 
@@ -131,7 +134,7 @@ JDK 17 이상. Kotlin 2.2, kotlinx-serialization 1.9, kotlin.test.
 - `calibration`: `calibration_id, version, t_mono_ms, zones(≤3: zone_id, yaw·pitch 중심·반폭), torso_center_x·y, torso_width(정규화), m0_pose, pose_jitter_floor, m0, jitter_floor, jitter_j_baseline, dock_gravity_vector(3), dock_accel_variance, scene_luma_baseline, bg_tile_texture_baseline(16), bg_tile_mask(16)`. 세션 시작과 재거치 재캘리브레이션 뒤.
 - `timebase`: `t_mono_ms, camera_ts_source, camera_to_mono_offset_ns, imu_to_mono_offset_ns`. 세션 시작과 1분마다.
 - `interval`: lifecycle gap 한 구간. `state` 는 `reason.state` 와 같아야 한다(`APP_SWITCH → PHONE`, `SCREEN_LOCK → PAUSED`).
-- `session_end`: `t_mono_ms, t_utc_ms, reason ∈ {USER, LIFECYCLE_GAP_TIMEOUT, PROCESS_DEATH_RECOVERED, UNKNOWN}`.
+- `session_end`: `t_mono_ms, t_utc_ms, reason ∈ {USER, LIFECYCLE_GAP_TIMEOUT, PROCESS_DEATH_RECOVERED, UNKNOWN}`; 0.2.4 정상 종료 진단(옛 로그·복원은 null): `capture_results_before_start`, `capture_results_after_fence`, `capture_results_after_close`, `capture_results_out_of_order`, `capture_result_drain_complete`, `aggregation_queue_drained`, `stop_integrity_failed`(= `after_close > 0 OR !capture_result_drain_complete OR !aggregation_queue_drained`, E2 2.2). 정상 종료의 `t_mono_ms` 는 stop fence 다.
 - `v0b_raw` (V0-B 단계, 지시문 C·D; 같은 `t_mono_ms` 의 `second` 줄과 짝): 캘리브레이션 전 원시 스칼라. `segment_label`(개발 앱 구간 마커, string?),
   `shoulder_center_x`·`shoulder_center_y`·`shoulder_width`(upright 정규화, 버킷의 마지막 검출 Pose 표본), `pose_samples`(= `pose_applied`),
   `tile_texture_min`·`tile_texture_median`(4×4 tile 의 Y 표준편차), `scene_samples`, `face_infer_ms_mean`·`_p95`·`_max`, `pose_infer_ms_mean`·`_max`,
@@ -139,10 +142,12 @@ JDK 17 이상. Kotlin 2.2, kotlinx-serialization 1.9, kotlin.test.
   갭 원인(0.2.3) `gap_cause_wrap`·`gap_cause_face`·`gap_cause_scene`·`gap_cause_pose_copy`·`gap_cause_enqueue`·`gap_cause_other`,
   Pose 계수(0.2.3) `pose_requested`·`pose_completed`·`pose_applied`·`pose_superseded`·`pose_late_dropped`·`pose_errors`, 오류 계수(0.2.3) `face_inference_errors`·`pre_face_errors`,
   `imu_samples`, `accel_x_mean`·`accel_y_mean`·`accel_z_mean`·`accel_variance`(축별 분산 합), `thermal_status`,
-  `battery_pct`, `battery_current_ua`, `battery_voltage_mv`, `is_interactive`, `is_device_idle`, `hinge_angle_deg`(폴더블). 재생·GT 대조는 이 줄을 읽지 않는다.
-- header 의 0.2.3 추가(지시문 D): `capture_preset`(A, B, C, C2, D, E, G; 없으면 null), `frame_process_divisor`(1; E 는 2), `frame_gap_threshold_ms`(80; E 는 167 @24fps), `frame_long_gap_threshold_ms`(200; E 는 417),
+  `battery_pct`, `battery_current_ua`, `battery_voltage_mv`, `is_interactive`, `is_device_idle`, `hinge_angle_deg`(폴더블),
+  처리 슬롯 계수(0.2.4, 독립 terminal counter) `processing_slots_expected`·`processing_slots_filled`·`processing_slots_missed`(요약의 `slot_miss_ratio = missed ÷ expected`), CaptureResult raw 간격 통계 `capture_interval_ms_median`·`_p95`·`_max`. 재생·GT 대조는 이 줄을 읽지 않는다.
+- header 의 0.2.3 추가(지시문 D): `capture_preset`(A, B, C, C2, D, E, G, 0.2.4 부터 E15, H12, H15, Hvar; 없으면 null), `frame_process_divisor`(1; E 는 2; 0.2.4 판독은 `face_process_period_ns` 우선), `frame_gap_threshold_ms`·`frame_long_gap_threshold_ms`(0.2.4 부터 ns 값의 반올림; fps unset 의 매 프레임 프리셋은 null),
   `face_delegate`(CPU/GPU), `face_blendshapes`, `perf_hint_target_ms`(G 의 hint 세션이 실제로 만들어졌을 때만), `camera_id`, `lens_facing`, `hinge_sensor`(힌지 센서 감지 여부; false 는 "센서 없음, 접힘 상태 미상"). `camera_resolution` 은 CameraX 가 실제로 정한 해상도이며
   `SessionHeader.cameraAspectRatio` 가 종횡비("16:9")를 계산한다.
+- header 의 0.2.4 추가(지시문 E): `camera_fps_request_lower`·`camera_fps_request_upper`(요청 AE range; 없으면 null = **fps unset(가변)**, `nominal_fps` 0; 고정 = lower == upper, 판정은 고정에만), `camera_fps_ranges_supported`("[7,15],[24,24],…"), `face_schedule`{every_frame, slot}, `face_process_period_ns`(기대 처리 간격; Hvar 는 상한 기준; fps unset 의 매 프레임 프리셋은 null — 진단용 간격은 워밍업에서 배운다), `frame_gap_threshold_ns`·`frame_long_gap_threshold_ns`(실제 적용값 = 간격 × 1.5 / 4.5; 위와 같이 null 가능).
 
 재생은 로그의 `raw_state`·`final_state`·`invalid_reason`·`candidate_*` 와 출력 사건을 버리고 다시 계산한다. 입력 사건(`user_redock_tap`, `zone_added`)만 엔진에 넣는다. 다시 계산한 출력 사건은 로그의 출력 사건과 종류·`t_mono_ms` 로 비교해 리포트에 남긴다.
 

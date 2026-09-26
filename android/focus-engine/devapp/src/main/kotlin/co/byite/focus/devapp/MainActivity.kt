@@ -24,6 +24,7 @@ import androidx.core.graphics.Insets
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.Lifecycle
+import co.byite.focus.engine.CameraCapabilities
 import co.byite.focus.engine.CapturePreset
 import co.byite.focus.engine.CaptureService
 import co.byite.focus.engine.DeviceStatusReader
@@ -103,16 +104,28 @@ class MainActivity : ComponentActivity() {
         findViewById<Button>(R.id.btn_marker_clear).also { markerButtons += it }.setOnClickListener { setMarker(null) }
     }
 
-    /** One radio button per capture preset (directive D); the last choice is remembered. */
+    /**
+     * One radio button per capture preset (directives D·E); the last choice is remembered. The H variants are listed
+     * only when the front camera offers their AE range (H12 [12,12], H15 [15,15], Hvar a variable range with upper bound
+     * 15); E15 is always listed. The ranges the camera offers are shown under the list.
+     */
     private fun buildPresetButtons() {
-        val last = CapturePreset.byId(prefs.lastPreset)
-        for (p in CapturePreset.entries) {
+        val ranges = CameraCapabilities.frontCameraFpsRanges(this)
+        val available = if (ranges == null) CapturePreset.entries.filter { !it.isCameraCadencePreset } else CapturePreset.availableOn(ranges)
+        val last = CapturePreset.byId(prefs.lastPreset).takeIf { it in available } ?: CapturePreset.DEFAULT
+        for (p in available) {
             val b = RadioButton(this)
             b.id = View.generateViewId()
             b.text = getString(R.string.preset_button, p.id, presetSummary(p))
             b.tag = p.id
             b.isChecked = p == last
             presetGroup.addView(b)
+        }
+        val hidden = CapturePreset.entries.filter { it !in available }
+        findViewById<TextView>(R.id.fps_ranges).text = if (ranges == null) {
+            getString(R.string.fps_ranges_unknown)
+        } else {
+            getString(R.string.fps_ranges, ranges.joinToString(" ")) + if (hidden.isEmpty()) "" else "\n" + getString(R.string.presets_hidden, hidden.joinToString(", ") { it.id })
         }
     }
 
@@ -122,7 +135,11 @@ class MainActivity : ComponentActivity() {
         CapturePreset.C -> getString(R.string.preset_c)
         CapturePreset.D -> getString(R.string.preset_d)
         CapturePreset.E -> getString(R.string.preset_e)
+        CapturePreset.E15 -> getString(R.string.preset_e15)
         CapturePreset.G -> getString(R.string.preset_g)
+        CapturePreset.H12 -> getString(R.string.preset_h12)
+        CapturePreset.H15 -> getString(R.string.preset_h15)
+        CapturePreset.Hvar -> getString(R.string.preset_hvar)
     }
 
     private fun selectedPreset(): CapturePreset {

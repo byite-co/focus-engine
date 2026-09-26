@@ -1,41 +1,134 @@
 package co.byite.focus.engine
 
+import co.byite.focus.core.aggregate.GapThresholds
+import co.byite.focus.core.model.FaceSchedule
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
-/** Presets of directive D: C's resolution fallback, E's every-other-frame rule, gap thresholds, G's hint target. */
+/** Presets of directives D and E: C's resolution fallback, the slot presets, the camera-cadence presets and their availability, gap thresholds. */
 class CapturePresetTest {
+    private val galaxyRanges = listOf(FpsRange(7, 15), FpsRange(10, 30), FpsRange(12, 12), FpsRange(15, 15), FpsRange(24, 24), FpsRange(30, 30))
+
     @Test
-    fun presetsDifferFromAInExactlyOneThing() {
+    fun presetsDifferFromAInOneThing() {
         val a = CapturePreset.A
         assertEquals(FaceDelegate.CPU, a.faceDelegate)
         assertTrue(a.faceBlendshapes)
         assertEquals(1, a.frameProcessDivisor)
         assertNull(a.perfHintTargetMs)
+        assertNull(a.faceRateHz)
+        assertEquals(CameraFpsRequest.Default, a.cameraFps)
         assertEquals(1280 to 720, a.requestedWidth to a.requestedHeight)
         assertFalse(CapturePreset.B.faceBlendshapes)
         assertEquals(640 to 360, CapturePreset.C.requestedWidth to CapturePreset.C.requestedHeight)
         assertEquals(FaceDelegate.GPU, CapturePreset.D.faceDelegate)
-        assertEquals(2, CapturePreset.E.frameProcessDivisor)
+        assertEquals(12, CapturePreset.E.faceRateHz)
+        assertEquals(2, CapturePreset.E.frameProcessDivisor, "legacy header field kept for E")
+        assertEquals(15, CapturePreset.E15.faceRateHz)
+        assertEquals(CameraFpsRequest.Default, CapturePreset.E15.cameraFps, "E15 keeps the 24 fps camera")
         assertEquals(35, CapturePreset.G.perfHintTargetMs)
-        assertEquals(35, CapturePreset.PERF_HINT_TARGET_MS)
-        assertEquals(listOf("A", "B", "C", "D", "E", "G"), CapturePreset.entries.map { it.id })
+        assertEquals(CameraFpsRequest.Fixed(12), CapturePreset.H12.cameraFps)
+        assertEquals(CameraFpsRequest.Fixed(15), CapturePreset.H15.cameraFps)
+        assertEquals(CameraFpsRequest.VariableUpper(15), CapturePreset.Hvar.cameraFps)
+        for (h in listOf(CapturePreset.H12, CapturePreset.H15, CapturePreset.Hvar)) {
+            assertNull(h.faceRateHz, "${h.id}: Face on every frame, the camera cadence is the only variable")
+            assertEquals(FaceSchedule.EVERY_FRAME, h.faceSchedule)
+            assertTrue(h.isCameraCadencePreset)
+        }
+        assertEquals(FaceSchedule.SLOT, CapturePreset.E.faceSchedule)
+        assertEquals(FaceSchedule.SLOT, CapturePreset.E15.faceSchedule)
+        assertEquals(listOf("A", "B", "C", "D", "E", "E15", "G", "H12", "H15", "Hvar"), CapturePreset.entries.map { it.id })
         assertEquals(CapturePreset.A, CapturePreset.byId(null))
         assertEquals(CapturePreset.A, CapturePreset.byId("F"), "F (ROI crop) is not implemented; unknown ids fall back to A")
-        assertEquals(CapturePreset.E, CapturePreset.byId("E"))
+        assertEquals(CapturePreset.Hvar, CapturePreset.byId("Hvar"))
     }
 
     @Test
-    fun gapThresholdIs80msForEveryFramePresetsAndTwiceTheExpectedIntervalForE() {
-        for (p in CapturePreset.entries) if (p.frameProcessDivisor == 1) assertEquals(80, p.gapThresholdMs(24), p.id)
-        assertEquals(167, CapturePreset.E.gapThresholdMs(24))
-        assertEquals(133, CapturePreset.E.gapThresholdMs(30))
-        for (p in CapturePreset.entries) if (p.frameProcessDivisor == 1) assertEquals(200, p.longGapThresholdMs(24), p.id)
-        assertEquals(417, CapturePreset.E.longGapThresholdMs(24), "5 × 83.3 ms")
-        assertEquals(333, CapturePreset.E.longGapThresholdMs(30))
+    fun fpsRequestsSelectTheirRangeAndTheHVariantsAreListedOnlyWhenSupported() {
+        assertEquals(FpsRange(24, 24), CameraFpsRequest.Default.select(galaxyRanges))
+        assertEquals(FpsRange(30, 30), CameraFpsRequest.Default.select(listOf(FpsRange(15, 30), FpsRange(30, 30))))
+        assertNull(CameraFpsRequest.Default.select(listOf(FpsRange(15, 30))), "no [24,24] and no [30,30]: no request, HAL default")
+        assertTrue(CameraFpsRequest.Default.isAvailable(listOf(FpsRange(15, 30))), "the default presets always run")
+        assertEquals(FpsRange(12, 12), CameraFpsRequest.Fixed(12).select(galaxyRanges))
+        assertEquals(FpsRange(7, 15), CameraFpsRequest.VariableUpper(15).select(galaxyRanges), "the only variable range under the bound")
+        assertEquals(FpsRange(10, 15), CameraFpsRequest.VariableUpper(15).select(listOf(FpsRange(7, 15), FpsRange(10, 15), FpsRange(15, 30))), "E2 1장: the narrowest variable range under the bound (highest lower bound), closest to fixed 15")
+        assertEquals(FpsRange(10, 15), CameraFpsRequest.VariableUpper(15).select(listOf(FpsRange(10, 15), FpsRange(15, 15))))
+        assertNull(CameraFpsRequest.VariableUpper(15).select(listOf(FpsRange(15, 15), FpsRange(24, 24))), "[15,15] is fixed, not variable")
+        val only15 = listOf(FpsRange(8, 15), FpsRange(15, 15), FpsRange(24, 24))
+        assertEquals(listOf("A", "B", "C", "D", "E", "E15", "G", "H15", "Hvar"), CapturePreset.availableOn(only15).map { it.id }, "[12,12] missing: H12 hidden, E15 always shown")
+        assertEquals(CapturePreset.entries, CapturePreset.availableOn(galaxyRanges))
+        assertEquals(listOf("A", "B", "C", "D", "E", "E15", "G"), CapturePreset.availableOn(listOf(FpsRange(24, 24), FpsRange(30, 30))).map { it.id })
+    }
+
+    @Test
+    fun gapThresholdsAreTheFormulaOfTheExpectedProcessingInterval() {
+        // every-frame presets at 24 fps: 62.5 / 187.5 ms — same classification as the old 80 / 200 ms
+        for (p in listOf(CapturePreset.A, CapturePreset.B, CapturePreset.C, CapturePreset.D, CapturePreset.G)) {
+            assertEquals(GapThresholds.frameIntervalNs(24), p.faceProcessPeriodNs(24), p.id)
+            assertEquals(62_500_000L, p.gapThresholdNs(24), p.id)
+            assertEquals(63, p.gapThresholdMs(24), p.id)
+            assertEquals(188, p.longGapThresholdMs(24), p.id)
+            assertNull(p.slotPeriodNs())
+        }
+        // slot presets: the slot period, whatever the camera cadence
+        assertEquals(GapThresholds.periodNs(12.0), CapturePreset.E.faceProcessPeriodNs(24))
+        assertEquals(125, CapturePreset.E.gapThresholdMs(24))
+        assertEquals(375, CapturePreset.E.longGapThresholdMs(24))
+        assertEquals(GapThresholds.periodNs(15.0), CapturePreset.E15.faceProcessPeriodNs(24))
+        assertEquals(100, CapturePreset.E15.gapThresholdMs(24))
+        assertEquals(300, CapturePreset.E15.longGapThresholdMs(24))
+        assertEquals(GapThresholds.periodNs(12.0), CapturePreset.E.slotPeriodNs())
+        // camera-cadence presets: the camera frame interval at their cadence
+        assertEquals(125, CapturePreset.H12.gapThresholdMs(12))
+        assertEquals(375, CapturePreset.H12.longGapThresholdMs(12))
+        assertEquals(100, CapturePreset.H15.gapThresholdMs(15))
+        assertEquals(300, CapturePreset.H15.longGapThresholdMs(15))
+        assertEquals(100, CapturePreset.Hvar.gapThresholdMs(15), "Hvar: computed at the upper bound, reported as n/a and never judged")
+    }
+
+    @Test
+    fun fpsUnsetAssumesNoCadence() {
+        // E2 1장: neither [24,24] nor [30,30] offered — the default request selects nothing and the plan carries no expected interval
+        val noFixed = listOf(FpsRange(15, 30), FpsRange(7, 15))
+        assertNull(CameraFpsRequest.Default.select(noFixed))
+        val a = CapturePreset.A.cadencePlan(null, noFixed)
+        assertTrue(a.fpsUnset)
+        assertNull(a.nominalFps)
+        assertNull(a.faceProcessPeriodNs, "an every-frame preset has no expected interval: the aggregator learns a diagnostic one from the warm-up")
+        assertNull(a.gapThresholdNs)
+        assertNull(a.longGapThresholdNs)
+        assertNull(a.gapThresholdMs)
+        assertEquals(CadencePlan.NOMINAL_FPS_UNSET, a.nominalFpsForHeader)
+        assertEquals(GapThresholds.frameIntervalNs(30), a.slotToleranceIntervalNs, "the tolerance basis is the fastest cadence the camera offers — a bound, not an assumed 30 fps expected interval")
+        // a slot preset keeps its slot period on an unset camera; thresholds follow the period, the tolerance is the same bound
+        val e15 = CapturePreset.E15.cadencePlan(null, noFixed)
+        assertTrue(e15.fpsUnset)
+        assertEquals(GapThresholds.periodNs(15.0), e15.faceProcessPeriodNs)
+        assertEquals(100, e15.gapThresholdMs)
+        assertEquals(300, e15.longGapThresholdMs)
+        assertEquals(GapThresholds.frameIntervalNs(30), e15.slotToleranceIntervalNs)
+        // no ranges reported at all: the fallback bound
+        assertEquals(GapThresholds.frameIntervalNs(CadencePlan.FALLBACK_TOLERANCE_FPS), CapturePreset.A.cadencePlan(null, emptyList()).slotToleranceIntervalNs)
+        // a fixed request: everything as before
+        val h12 = CapturePreset.H12.cadencePlan(FpsRange(12, 12), galaxyRanges)
+        assertFalse(h12.fpsUnset)
+        assertEquals(12, h12.nominalFps)
+        assertEquals(12, h12.nominalFpsForHeader)
+        assertEquals(GapThresholds.frameIntervalNs(12), h12.faceProcessPeriodNs)
+        assertEquals(125, h12.gapThresholdMs)
+        assertEquals(375, h12.longGapThresholdMs)
+        assertEquals(GapThresholds.frameIntervalNs(12), h12.slotToleranceIntervalNs)
+        val e = CapturePreset.E.cadencePlan(FpsRange(24, 24), galaxyRanges)
+        assertEquals(GapThresholds.periodNs(12.0), e.faceProcessPeriodNs)
+        assertEquals(GapThresholds.frameIntervalNs(24), e.slotToleranceIntervalNs)
+        // Hvar: the upper bound is the nominal cadence (diagnostic thresholds), never unset
+        val hvar = CapturePreset.Hvar.cadencePlan(FpsRange(10, 15), listOf(FpsRange(7, 15), FpsRange(10, 15), FpsRange(15, 30)))
+        assertFalse(hvar.fpsUnset)
+        assertEquals(15, hvar.nominalFps)
+        assertEquals(100, hvar.gapThresholdMs)
     }
 
     @Test
@@ -52,24 +145,5 @@ class CapturePresetTest {
         val a = PresetResolution.choose(CapturePreset.A, listOf(FrameSize(640, 480)))
         assertEquals(FrameSize(1280, 720), a.size, "other presets request their nominal size; CameraX picks the closest")
         assertEquals("A", a.presetId)
-    }
-
-    @Test
-    fun everyOtherFrameRuleSkipsByCaptureTimestampNotByArrivalParity() {
-        val r = FrameSkipRule(2, 24)
-        val period = 1_000_000_000L / 24
-        assertEquals((1.5 * 1_000_000_000.0 / 24).toLong(), r.minIntervalNs)
-        assertFalse(r.shouldSkip(0), "the first frame is processed")
-        r.onProcessed(0)
-        assertTrue(r.shouldSkip(period), "41.7 ms after the last processed frame: skip")
-        assertFalse(r.shouldSkip(2 * period), "83.3 ms: process")
-        r.onProcessed(2 * period)
-        // the camera dropped the frame at 3·period: the one at 4·period is processed, the phase does not slip
-        assertFalse(r.shouldSkip(4 * period))
-        r.onProcessed(4 * period)
-        assertTrue(r.shouldSkip(5 * period))
-        val every = FrameSkipRule(1, 24)
-        every.onProcessed(0)
-        assertFalse(every.shouldSkip(1), "divisor 1 never skips")
     }
 }

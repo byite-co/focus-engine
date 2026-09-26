@@ -20,6 +20,8 @@ class RgbaFrame(
     val rotationDegrees: Int,
     /** Capture timestamp on the monotonic clock (ns). */
     val captureMonoNs: Long,
+    /** Raw camera `SENSOR_TIMESTAMP` (`ImageInfo.timestamp`): the frame identity (directive E 4장). */
+    val rawSensorTs: Long = captureMonoNs,
 ) {
     /** MediaPipe view over [pixels]; zero-copy. */
     fun toMPImage(): MPImage = ByteBufferImageBuilder(pixels, width, height, MPImage.IMAGE_FORMAT_RGBA).build()

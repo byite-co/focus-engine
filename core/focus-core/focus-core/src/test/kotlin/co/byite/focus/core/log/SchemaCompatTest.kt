@@ -1,9 +1,13 @@
 package co.byite.focus.core.log
 
+import co.byite.focus.core.report.ComparisonState
+import co.byite.focus.core.report.StopDiagnostics
 import co.byite.focus.core.report.V0bReport
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 /** Schema 0.2.3 is additive: a 0.2.2 session (no preset fields, no new counters) decodes with the documented defaults. */
 class SchemaCompatTest {
@@ -46,9 +50,39 @@ class SchemaCompatTest {
         assertEquals(0, r.preFaceErrors)
         assertNull(r.frameTotalMsMean)
         assertNull(r.poseFrameCopyMsMean)
+        // schema 0.2.4 additions default to "unknown" / 0
+        assertEquals(0, r.processingSlotsExpected)
+        assertEquals(0, r.processingSlotsFilled)
+        assertEquals(0, r.processingSlotsMissed)
+        assertNull(r.captureIntervalMsMedian)
+        assertNull(h.cameraFpsRequestLower)
+        assertNull(h.cameraFpsRequestFixed)
+        assertEquals("unset", h.cameraFpsRequestLabel)
+        assertNull(h.faceSchedule)
+        assertNull(h.faceProcessPeriodNs)
+        assertNull(h.frameGapThresholdNs)
+        assertNull(log.sessionEnd!!.stopIntegrityFailed)
+        assertNull(log.sessionEnd!!.captureResultsAfterClose)
+        assertNull(log.sessionEnd!!.captureResultsOutOfOrder)
+        assertNull(log.sessionEnd!!.captureResultDrainComplete)
+        assertNull(log.sessionEnd!!.aggregationQueueDrained)
+        assertFalse(h.cameraFpsRequestRecorded)
+        assertFalse(h.cameraFpsUnset, "an older log does not know its request: 'unset', not 'fps unset(가변)'")
         val summary = V0bReport.build(log)
         assertEquals(2L, summary.overall.framesDropped)
         assertEquals("1280x720 (16:9) @ 24fps", summary.overall.camera)
+        // an older log keeps its rounded ms thresholds as the counted values, but a request that is not recorded is not judged (E2 1장: only a fixed request is)
+        assertEquals(80.0, summary.overall.thresholds.gapMs)
+        assertEquals("80ms", summary.overall.thresholds.gapCountedLabel)
+        assertEquals("n/a", summary.overall.thresholds.gapLabel)
+        assertFalse(summary.overall.thresholds.applicable)
+        assertFalse(summary.pass.judged)
+        assertEquals(V0bReport.REASON_FPS_NOT_RECORDED, summary.pass.notJudgedReason)
+        assertNull(summary.overall.cadence.mismatch)
+        assertEquals(0L, summary.overall.slots.expected)
+        assertEquals(StopDiagnostics.UNKNOWN, summary.overall.diagnostics)
+        assertEquals(ComparisonState.NOT_COMPARABLE, summary.comparability.state)
+        assertTrue(V0bReport.REASON_FPS_NOT_RECORDED in summary.comparability.reasons, summary.comparability.toString())
     }
 
     @Test

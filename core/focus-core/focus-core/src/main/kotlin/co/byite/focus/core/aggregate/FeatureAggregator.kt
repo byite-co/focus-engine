@@ -7,6 +7,7 @@ import co.byite.focus.core.model.SecondRecord
 import co.byite.focus.core.model.V0bRawRecord
 import co.byite.focus.core.model.ZoneStatus
 import co.byite.focus.core.util.Stats
+import kotlin.math.roundToLong
 import kotlin.math.sqrt
 
 /** One closed bucket: the schema-0.2.3 [SecondRecord] plus the paired [V0bRawRecord]. */
@@ -16,17 +17,24 @@ data class AggregatedSecond(val second: SecondRecord, val raw: V0bRawRecord)
  * One frame on which Face inference succeeded (directive D 정정 3·4·5). Posted to the aggregation queue as a
  * single message right after the analyzer finished with the frame: `frames_processed` is fixed by the Face
  * result alone, [sample] carries the scalars when the stages after Face also succeeded and is null when they
- * failed (`frames_post_face_failed`).
+ * failed (`frames_post_face_failed`). [rawSensorTs] is the frame identity (directive E 4장); it defaults to the
+ * mono value for REALTIME cameras.
  */
 data class ProcessedFrame(
     val captureMonoNs: Long,
     /** Face Landmarker wall time (ms). */
     val faceInferMs: Double,
     val sample: FrameSample? = null,
+    val rawSensorTs: Long = captureMonoNs,
 ) {
+    val stamp: CameraStamp get() = CameraStamp(rawSensorTs, captureMonoNs)
+
     init {
         require(faceInferMs >= 0.0) { "faceInferMs must not be negative (t=$captureMonoNs)" }
-        sample?.let { require(it.captureMonoNs == captureMonoNs) { "sample timestamp must match (t=$captureMonoNs)" } }
+        sample?.let {
+            require(it.captureMonoNs == captureMonoNs) { "sample timestamp must match (t=$captureMonoNs)" }
+            require(it.rawSensorTs == rawSensorTs) { "sample raw timestamp must match (raw=$rawSensorTs)" }
+        }
     }
 }
 
@@ -41,11 +49,30 @@ data class ProcessedFrame(
  * results and analyzer callbacks for frames captured inside it have arrived. Every bucket up to
  * the last closable one is emitted, empty ones included (V0-A 통과 기준 "초당 레코드 누락 0").
  *
- * Session window (정정 5, 명확화): only inputs with `sessionStartCaptureTs ≤ captureTs < stopFenceCaptureTs`
- * are counted; earlier ones go to [CounterTotals.inputsBeforeStart], later ones (after [stopInputs]) to
- * [CounterTotals.inputsAfterFence]. Counters that reach the aggregator after their bucket closed are attributed
- * to the oldest open bucket so that the session totals ([totals]) stay conserved; feature samples that arrive
- * late are discarded and counted (`frames_sample_late_dropped`, `pose_late_dropped`, [CounterTotals.otherLateInputs]).
+ * Session window (정정 5, 명확화; directive E 4장 timestamp 영역 계약): a camera-origin input belongs to the session
+ * exactly when `sessionStartRawTs ≤ rawSensorTs < stopFenceRawTs` on the **raw** camera clock ([CameraStamp]);
+ * earlier ones go to [CounterTotals.inputsBeforeStart], later ones (after [stopInputs]) to
+ * [CounterTotals.inputsAfterFence]. An input admitted by its raw timestamp is never rejected again because of its
+ * mono position: the bucket index is the mono position clamped to `[first bucket, last bucket]`
+ * ([lastPartialBucketIndex] = `(fence − start − 1) ÷ period`), so a first frame converted with an older offset lands in
+ * bucket 0 and a pre-fence frame whose mono value passed the mono fence lands in the last bucket the session holds and
+ * counts as applied. The clamp is not the late rule: a sample whose
+ * bucket already closed (end + [closeDelayMs]) is still `frames_sample_late_dropped` / `pose_late_dropped`.
+ * Inputs without a camera timestamp (IMU) keep the mono window. Counters that reach the aggregator after their
+ * bucket closed are attributed to the oldest open bucket so that the session totals ([totals]) stay conserved;
+ * feature samples that arrive late are discarded and counted (`frames_sample_late_dropped`, `pose_late_dropped`,
+ * [CounterTotals.otherLateInputs]).
+ *
+ * Processing slots (directive E 2장, schema 0.2.4): the [FrameScheduler] emits `expected` / `filled` / `missed` as
+ * three independent terminal counters through [CameraCounterSink]; this class only counts them per bucket and in
+ * the totals. Gap thresholds are the formula of [GapThresholds] applied to the preset's expected processing
+ * interval, passed in as ns. A session without a fixed AE request and without a slot period ("fps unset", E2 1장)
+ * has no expected interval at the start: with [learnThresholdsFromWarmup] the diagnostic interval is the median of
+ * the per-second capture-interval medians of the warm-up buckets (the first [FocusSchema.WARMUP_MS]; the statistic the
+ * summary's warm-up row shows, chosen because per-second records carry no arrays). It is learned by capture timestamp,
+ * at the first processed frame stamped at or after the warm-up end (so every frame of second 60 on is counted against
+ * it, whatever the bucket-closing tick does), or when the last warm-up bucket closes if no such frame came; before that
+ * no gap is over any threshold, and the summary shows the thresholds as n/a.
  *
  * V0-B has no calibration and no gates, so the fields that depend on them are left empty:
  * `raw_state`, `final_state`, `invalid_reason`, `candidate_*`, `events`, `torso_*_ratio`,
@@ -59,16 +86,50 @@ class FeatureAggregator(
     private val tStartUtcMs: Long,
     /** Grace after a bucket's end before it is closed. */
     private val closeDelayMs: Long = DEFAULT_CLOSE_DELAY_MS,
-    /** Preset gap threshold counted in `gaps_over_threshold` (80 ms for every-frame presets, 2 × expected interval otherwise). */
+    /** Gap threshold counted in `gaps_over_threshold`: expected processing interval × 1.5 ([GapThresholds]); default = 80 ms for older callers. */
     private val gapThresholdNs: Long = DEFAULT_GAP_THRESHOLD_NS,
-    /** Preset long-gap threshold counted in `gaps_over_long_threshold` (200 ms for every-frame presets, 5 × expected interval otherwise). */
+    /** Long-gap threshold counted in `gaps_over_long_threshold`: expected processing interval × 4.5; default = 200 ms for older callers. */
     private val longGapThresholdNs: Long = DEFAULT_LONG_GAP_THRESHOLD_NS,
-) {
+    /** Raw camera timestamp (ns) of the first analyzer frame = start of the raw session window (directive E 4장). Defaults to the mono start (REALTIME camera). */
+    private val sessionStartRawNs: Long = tStartMonoMs * NS_PER_MS,
+    /**
+     * Expected interval between processed frames (ns), the cycle-length criterion of the gap-cause attribution: a cycle
+     * shorter than it means the analyzer was not the bottleneck. Presets pass their expected processing interval;
+     * the default is the legacy `threshold ÷ 2` (40 ms at the 80 ms default) for callers that pass no threshold.
+     */
+    private val expectedIntervalNs: Long = gapThresholdNs / 2,
+    /**
+     * fps unset (E2 1장): ignore the three values above and learn the diagnostic expected interval from the warm-up
+     * ([learnedExpectedIntervalNs]); thresholds are the formula of that interval from the moment it is known.
+     */
+    val learnThresholdsFromWarmup: Boolean = false,
+) : CameraCounterSink {
     init {
         require(closeDelayMs >= 0) { "closeDelayMs must not be negative" }
         require(gapThresholdNs > 0) { "gapThresholdNs must be positive" }
         require(longGapThresholdNs >= gapThresholdNs) { "longGapThresholdNs must not be below gapThresholdNs" }
+        require(expectedIntervalNs > 0) { "expectedIntervalNs must be positive" }
     }
+
+    // thresholds in force: the constructor values, or null until the warm-up median is learned (fps unset)
+    private var gapNs: Long? = if (learnThresholdsFromWarmup) null else gapThresholdNs
+    private var longGapNs: Long? = if (learnThresholdsFromWarmup) null else longGapThresholdNs
+    private var expectedNs: Long? = if (learnThresholdsFromWarmup) null else expectedIntervalNs
+    /** Per-second capture-interval medians (ms) of the warm-up buckets already emitted, by bucket index. */
+    private val warmupIntervalMedians = HashMap<Long, Double>()
+
+    /** fps unset: the diagnostic expected interval learned from the warm-up; null before the warm-up ends or without capture results. */
+    var learnedExpectedIntervalNs: Long? = null
+        private set
+
+    /** Gap threshold in force (ns), null while unknown (fps unset before the warm-up ends). */
+    val currentGapThresholdNs: Long? get() = gapNs
+
+    /** Long-gap threshold in force (ns), null while unknown. */
+    val currentLongGapThresholdNs: Long? get() = longGapNs
+
+    /** Expected processing interval in force (ns), null while unknown. */
+    val currentExpectedIntervalNs: Long? get() = expectedNs
 
     /** Stage times of the last processed frame, kept to name the cause of the next over-threshold gap. */
     private class PrevCycle(val faceInferMs: Double, val sample: FrameSample?)
@@ -119,16 +180,26 @@ class FeatureAggregator(
         var sxx = 0.0
         var syy = 0.0
         var szz = 0.0
+        // processing slots (schema 0.2.4): three independent terminal counters
+        var slotsExpected = 0
+        var slotsFilled = 0
+        var slotsMissed = 0
+        /** Raw-clock intervals between consecutive capture results whose later one fell into this bucket (ns). */
+        val captureIntervalsNs = ArrayList<Long>()
     }
 
     private val startNs = tStartMonoMs * NS_PER_MS
+    private val periodNs = FocusSchema.RECORD_PERIOD_MS * NS_PER_MS
     private var fenceNs: Long? = null
+    /** Raw stop fence (`stopFenceMonoNs − offsetSnapshot`, computed by the device layer); null until [stopInputs]. */
+    private var fenceRawNs: Long? = null
     private var finished = false
     private val open = HashMap<Long, Bucket>()
     private var nextToClose = 0L
     private var lastProcessedNs = Long.MIN_VALUE
     private var prevCycle: PrevCycle? = null
     private var captureResultsSeen = false
+    private var lastCaptureRawNs = Long.MIN_VALUE
     private var lastSceneLuma: Double? = null
     private val recentPoses = ArrayList<PoseSample>()
     private val labelChanges = ArrayList<Pair<Long, String?>>()
@@ -151,6 +222,13 @@ class FeatureAggregator(
     private var tOtherLate = 0L
     private var tBeforeStart = 0L
     private var tAfterFence = 0L
+    private var tSlotsExpected = 0L
+    private var tSlotsFilled = 0L
+    private var tSlotsMissed = 0L
+    private var tCaptureBeforeStart = 0L
+    private var tCaptureAfterFence = 0L
+    private var tCaptureAfterClose = 0L
+    private var tCaptureOutOfOrder = 0L
 
     /** Session-wide counters for the conservation check at a normal stop. */
     val totals: CounterTotals
@@ -161,6 +239,9 @@ class FeatureAggregator(
             poseRequested = tPoseRequested, poseSuperseded = tPoseSuperseded, poseCompleted = tPoseCompleted,
             poseApplied = tPoseApplied, poseLateDropped = tPoseLate, poseErrors = tPoseErrors,
             otherLateInputs = tOtherLate, inputsBeforeStart = tBeforeStart, inputsAfterFence = tAfterFence,
+            processingSlotsExpected = tSlotsExpected, processingSlotsFilled = tSlotsFilled, processingSlotsMissed = tSlotsMissed,
+            captureResultsBeforeStart = tCaptureBeforeStart, captureResultsAfterFence = tCaptureAfterFence, captureResultsAfterClose = tCaptureAfterClose,
+            captureResultsOutOfOrder = tCaptureOutOfOrder,
         )
 
     /** Scene / IMU inputs that arrived after their bucket had been closed (dropped). */
@@ -182,42 +263,96 @@ class FeatureAggregator(
     /** Stop fence (ms, monotonic) once [stopInputs] was called. */
     val stopFenceMonoMs: Long? get() = fenceNs?.let { it / NS_PER_MS }
 
-    // ---- inputs: frame counters (analysis thread → queue)
+    /** Raw stop fence (ns, camera clock) once [stopInputs] was called. */
+    val stopFenceRawNs: Long? get() = fenceRawNs
 
-    /** A frame the camera produced (Camera2 capture result), by capture time. Defines `frames_requested`. */
-    fun onFrameRequested(captureMonoNs: Long) {
-        val b = counterBucket(captureMonoNs) ?: return
+    /** Start of the raw session window (ns, camera clock). */
+    val sessionStartRawTs: Long get() = sessionStartRawNs
+
+    // ---- inputs: frame counters (analysis thread → queue). The Long overloads are the REALTIME shorthand (raw == mono).
+
+    /** A frame the camera produced (Camera2 capture result). Defines `frames_requested`; the raw interval to the previous capture result is the cadence sample. */
+    override fun onFrameRequested(stamp: CameraStamp) {
+        val raw = stamp.rawSensorTs
+        if (raw < sessionStartRawNs) tCaptureBeforeStart++
+        else if (finished || fenceRawNs?.let { raw >= it } == true) tCaptureAfterFence++
+        val b = counterBucket(stamp) ?: return
         captureResultsSeen = true
         b.requested++
         tRequested++
+        if (lastCaptureRawNs != Long.MIN_VALUE && raw > lastCaptureRawNs) b.captureIntervalsNs.add(raw - lastCaptureRawNs)
+        if (raw > lastCaptureRawNs) lastCaptureRawNs = raw
     }
 
+    fun onFrameRequested(captureMonoNs: Long) = onFrameRequested(CameraStamp.realtime(captureMonoNs))
+
     /** The ImageAnalysis callback received a frame (before any skip / processing decision). */
-    fun onFrameReceived(captureMonoNs: Long) {
-        val b = counterBucket(captureMonoNs) ?: return
+    override fun onFrameReceived(stamp: CameraStamp) {
+        val b = counterBucket(stamp) ?: return
         b.received++
         tReceived++
     }
 
-    /** A received frame skipped on purpose (every-other-frame preset, power-state skip). */
-    fun onFrameSkipped(captureMonoNs: Long) {
-        val b = counterBucket(captureMonoNs) ?: return
+    fun onFrameReceived(captureMonoNs: Long) = onFrameReceived(CameraStamp.realtime(captureMonoNs))
+
+    /** A received frame skipped on purpose (not a processing slot in presets E / E15, power-state skip). */
+    override fun onFrameSkipped(stamp: CameraStamp) {
+        val b = counterBucket(stamp) ?: return
         b.skipped++
         tSkipped++
     }
 
+    fun onFrameSkipped(captureMonoNs: Long) = onFrameSkipped(CameraStamp.realtime(captureMonoNs))
+
     /** The Face Landmarker threw on this frame. */
-    fun onFaceInferenceError(captureMonoNs: Long) {
-        val b = counterBucket(captureMonoNs) ?: return
+    override fun onFaceInferenceError(stamp: CameraStamp) {
+        val b = counterBucket(stamp) ?: return
         b.faceErrors++
         tFaceErrors++
     }
 
+    fun onFaceInferenceError(captureMonoNs: Long) = onFaceInferenceError(CameraStamp.realtime(captureMonoNs))
+
     /** Another error before Face inference (non-monotonic timestamp, wrap failure, pipelines not ready). */
-    fun onPreFaceError(captureMonoNs: Long) {
-        val b = counterBucket(captureMonoNs) ?: return
+    override fun onPreFaceError(stamp: CameraStamp) {
+        val b = counterBucket(stamp) ?: return
         b.preFaceErrors++
         tPreFaceErrors++
+    }
+
+    fun onPreFaceError(captureMonoNs: Long) = onPreFaceError(CameraStamp.realtime(captureMonoNs))
+
+    // ---- inputs: processing slots (FrameScheduler on the analysis thread → queue). Three independent terminal counters.
+
+    /** The scheduler selected a processing opportunity. */
+    override fun onSlotExpected(stamp: CameraStamp) {
+        val b = counterBucket(stamp) ?: return
+        b.slotsExpected++
+        tSlotsExpected++
+    }
+
+    /** Face inference succeeded on the frame of a selected slot. */
+    override fun onSlotFilled(stamp: CameraStamp) {
+        val b = counterBucket(stamp) ?: return
+        b.slotsFilled++
+        tSlotsFilled++
+    }
+
+    /** A selected slot terminated without a Face success (backpressure, pre-Face error, Face error, unresolved at CLOSE). */
+    override fun onSlotMissed(stamp: CameraStamp) {
+        val b = counterBucket(stamp) ?: return
+        b.slotsMissed++
+        tSlotsMissed++
+    }
+
+    /** A capture result reached the scheduler after its CLOSE. Counted whatever its window; a normal stop has none (`stop_integrity_failed`). */
+    override fun onCaptureResultAfterClose(stamp: CameraStamp) {
+        tCaptureAfterClose++
+    }
+
+    /** An in-window capture result that trailed a newer evaluated timestamp (diagnostic; E2 2.3). */
+    override fun onCaptureResultOutOfOrder(stamp: CameraStamp) {
+        tCaptureOutOfOrder++
     }
 
     /**
@@ -226,12 +361,14 @@ class FeatureAggregator(
      * (`frames_sample_applied`); a sample for a closed bucket is discarded and counted (`frames_sample_late_dropped`).
      */
     fun onFrameProcessed(frame: ProcessedFrame) {
-        val k = bucketIndex(frame.captureMonoNs) ?: return
+        val k = cameraBucketIndex(frame.stamp) ?: return
         val late = k < nextToClose
         val b = open.getOrPut(if (late) nextToClose else k) { Bucket() }
         b.processed++
         tProcessed++
         b.faceInferMs.add(frame.faceInferMs)
+        // fps unset: the first frame captured at or after the warm-up end fixes the diagnostic thresholds before its gap is judged
+        if (learnThresholdsFromWarmup && learnedExpectedIntervalNs == null && frame.captureMonoNs >= startNs + WARMUP_BUCKETS * periodNs) learnFromWarmup()
         if (lastProcessedNs != Long.MIN_VALUE) {
             val gap = frame.captureMonoNs - lastProcessedNs
             if (gap <= 0L) {
@@ -240,11 +377,13 @@ class FeatureAggregator(
                 b.gapCount++
                 if (gap > b.maxGapNs) b.maxGapNs = gap
                 if (gap > GAP_80MS_NS) b.gapsOver80++
-                if (gap > gapThresholdNs) {
+                val gapT = gapNs
+                val longT = longGapNs
+                if (gapT != null && gap > gapT) {
                     b.gapsOverThreshold++
                     b.gapCauses[gapCause(prevCycle)]++
                 }
-                if (gap > longGapThresholdNs) b.gapsOverLong++
+                if (longT != null && gap > longT) b.gapsOverLong++
             }
         }
         if (frame.captureMonoNs > lastProcessedNs) {
@@ -280,12 +419,13 @@ class FeatureAggregator(
     /**
      * Which stage of the previous processed frame's cycle explains a gap over the threshold (원래 지시문 D 2번):
      * the longest of wrap / Face (inference + post) / scene / pose copy / enqueue when that cycle took at least the
-     * expected frame interval (threshold ÷ 2), i.e. the analyzer was the bottleneck; otherwise "other" (no sample,
-     * or a cycle short enough that the camera or the system must have stalled). Index into [V0bRawRecord.GAP_CAUSE_ORDER].
+     * expected processing interval ([expectedIntervalNs]), i.e. the analyzer was the bottleneck; otherwise "other" (no
+     * sample, or a cycle short enough that the camera or the system must have stalled). Index into [V0bRawRecord.GAP_CAUSE_ORDER].
      */
     private fun gapCause(prev: PrevCycle?): Int {
         val sample = prev?.sample ?: return GAP_CAUSE_OTHER
-        val expectedIntervalMs = gapThresholdNs / 2.0 / NS_PER_MS
+        val expected = expectedNs ?: return GAP_CAUSE_OTHER
+        val expectedIntervalMs = expected.toDouble() / NS_PER_MS
         if (sample.totalMs < expectedIntervalMs) return GAP_CAUSE_OTHER
         val stages = doubleArrayOf(sample.wrapMs, prev.faceInferMs + sample.facePostMs, sample.sceneMs ?: 0.0, sample.poseCopyMs ?: 0.0, sample.enqueueMs)
         var best = 0
@@ -296,31 +436,37 @@ class FeatureAggregator(
     // ---- inputs: pose worker (analysis thread / worker → queue)
 
     /** A frame was deep-copied and handed to the Pose worker; [copyMs] is the copy time on the analysis thread. */
-    fun onPoseRequested(captureMonoNs: Long, copyMs: Double) {
+    fun onPoseRequested(stamp: CameraStamp, copyMs: Double) {
         require(copyMs >= 0.0) { "copyMs must not be negative" }
-        val b = counterBucket(captureMonoNs) ?: return
+        val b = counterBucket(stamp) ?: return
         b.poseRequested++
         b.poseCopyMs.add(copyMs)
         tPoseRequested++
     }
 
+    fun onPoseRequested(captureMonoNs: Long, copyMs: Double) = onPoseRequested(CameraStamp.realtime(captureMonoNs), copyMs)
+
     /** A waiting request was replaced by a newer frame before the worker took it. */
-    fun onPoseSuperseded(captureMonoNs: Long) {
-        val b = counterBucket(captureMonoNs) ?: return
+    fun onPoseSuperseded(stamp: CameraStamp) {
+        val b = counterBucket(stamp) ?: return
         b.poseSuperseded++
         tPoseSuperseded++
     }
 
+    fun onPoseSuperseded(captureMonoNs: Long) = onPoseSuperseded(CameraStamp.realtime(captureMonoNs))
+
     /** The Pose Landmarker threw on this request. */
-    fun onPoseError(captureMonoNs: Long) {
-        val b = counterBucket(captureMonoNs) ?: return
+    fun onPoseError(stamp: CameraStamp) {
+        val b = counterBucket(stamp) ?: return
         b.poseErrors++
         tPoseErrors++
     }
 
+    fun onPoseError(captureMonoNs: Long) = onPoseError(CameraStamp.realtime(captureMonoNs))
+
     /** A finished Pose run. Returns true when it was applied to its bucket, false when the bucket had closed (counted as late). */
     fun onPose(sample: PoseSample): Boolean {
-        val k = bucketIndex(sample.captureMonoNs) ?: return false
+        val k = cameraBucketIndex(sample.stamp) ?: return false
         val late = k < nextToClose
         val b = open.getOrPut(if (late) nextToClose else k) { Bucket() }
         b.poseCompleted++
@@ -344,12 +490,13 @@ class FeatureAggregator(
     // ---- inputs: scene, IMU
 
     fun onScene(sample: SceneSample) {
-        val b = featureBucket(sample.captureMonoNs) ?: return
+        val b = featureBucket(cameraBucketIndex(sample.stamp)) ?: return
         b.scenes.add(sample)
     }
 
+    /** IMU samples have no camera timestamp: the mono window applies (directive E 4장). */
     fun onImu(sample: ImuSample) {
-        val b = featureBucket(sample.tMonoNs) ?: return
+        val b = featureBucket(monoBucketIndex(sample.tMonoNs)) ?: return
         b.imuN++
         b.sx += sample.ax
         b.sy += sample.ay
@@ -368,12 +515,19 @@ class FeatureAggregator(
     // ---- stop / closing
 
     /**
-     * Accept fence (정정 5 · 명확화): from now on inputs stamped at or after [fenceMonoMs] are not counted.
-     * Inputs captured before the fence that are still in flight are accepted until [finish].
+     * Accept fence (정정 5 · 명확화; directive E 4·5장): from now on camera inputs with `rawSensorTs ≥ fenceRawNs` and
+     * IMU inputs at or after [fenceMonoMs] are not counted. Camera inputs captured before the raw fence that are
+     * still in flight are accepted until [finish], whatever their mono position (clamped to the last bucket, [lastPartialBucketIndex]).
+     * [fenceRawNs] = `fenceMono − offsetSnapshot` with the camera offset frozen at the fence; it defaults to the
+     * mono value (REALTIME camera). A raw fence before the raw start (a session shorter than the offset drift on an
+     * UNKNOWN camera) is clamped to the start: the window is then empty rather than inverted. The first call wins.
      */
-    fun stopInputs(fenceMonoMs: Long) {
+    fun stopInputs(fenceMonoMs: Long, fenceRawNs: Long = fenceMonoMs * NS_PER_MS) {
         require(fenceMonoMs >= tStartMonoMs) { "the fence cannot precede the session start" }
-        if (fenceNs == null) fenceNs = fenceMonoMs * NS_PER_MS
+        if (fenceNs == null) {
+            fenceNs = fenceMonoMs * NS_PER_MS
+            this.fenceRawNs = maxOf(fenceRawNs, sessionStartRawNs)
+        }
     }
 
     /** Close every bucket whose end + [closeDelayMs] ≤ [nowMonoMs], oldest first. Never a bucket ending after the stop fence. */
@@ -407,6 +561,12 @@ class FeatureAggregator(
 
     private fun emit(k: Long, b: Bucket, device: DeviceSample): AggregatedSecond {
         val start = bucketStart(k)
+        val captureIntervals = b.captureIntervalsNs.map { it.toDouble() / NS_PER_MS }
+        val captureIntervalMedian = Stats.medianOf(captureIntervals)
+        if (learnThresholdsFromWarmup && learnedExpectedIntervalNs == null && k < WARMUP_BUCKETS) {
+            captureIntervalMedian?.let { warmupIntervalMedians[k] = it }
+            if (k == WARMUP_BUCKETS - 1) learnFromWarmup() // no frame at or after the warm-up end was processed: learn as the last warm-up bucket closes
+        }
         val lastPose = b.poses.lastOrNull { it.hasShoulders }
         val headPresent = lastPose?.headLandmarkPresent ?: false
         val luma = if (b.scenes.isNotEmpty()) b.scenes.sumOf { it.lumaMean } / b.scenes.size else lastSceneLuma
@@ -506,6 +666,12 @@ class FeatureAggregator(
             poseErrors = b.poseErrors,
             faceInferenceErrors = b.faceErrors,
             preFaceErrors = b.preFaceErrors,
+            processingSlotsExpected = b.slotsExpected,
+            processingSlotsFilled = b.slotsFilled,
+            processingSlotsMissed = b.slotsMissed,
+            captureIntervalMsMedian = captureIntervalMedian,
+            captureIntervalMsP95 = Stats.percentileNearestRankOf(captureIntervals, 0.95),
+            captureIntervalMsMax = captureIntervals.maxOrNull(),
             imuSamples = b.imuN,
             accelXMean = if (b.imuN > 0) b.sx / b.imuN else null,
             accelYMean = if (b.imuN > 0) b.sy / b.imuN else null,
@@ -535,6 +701,26 @@ class FeatureAggregator(
         return sqrt(dx * dx + dy * dy) / cur.shoulderWidthPx!!
     }
 
+    /**
+     * fps unset: the diagnostic expected interval = median of the per-second capture-interval medians of the warm-up
+     * buckets 0 … [WARMUP_BUCKETS] − 1 (the same statistic the summary's warm-up row shows): the medians recorded when
+     * a bucket was emitted, and the current median of the warm-up buckets still open. Nothing is learned when the
+     * warm-up had no capture results.
+     */
+    private fun learnFromWarmup() {
+        val medians = ArrayList<Double>()
+        for (k in 0 until WARMUP_BUCKETS) {
+            val m = warmupIntervalMedians[k] ?: open[k]?.let { b -> Stats.medianOf(b.captureIntervalsNs.map { it.toDouble() / NS_PER_MS }) }
+            if (m != null) medians.add(m)
+        }
+        val medianMs = Stats.medianOf(medians) ?: return
+        val learned = (medianMs * NS_PER_MS).roundToLong().coerceAtLeast(1L)
+        learnedExpectedIntervalNs = learned
+        expectedNs = learned
+        gapNs = GapThresholds.gapThresholdNs(learned)
+        longGapNs = GapThresholds.longGapThresholdNs(learned)
+    }
+
     private fun variance(sum: Double, sumSq: Double, n: Int): Double {
         val mean = sum / n
         return (sumSq / n - mean * mean).coerceAtLeast(0.0)
@@ -545,29 +731,58 @@ class FeatureAggregator(
     private fun bucketStart(k: Long): Long = tStartMonoMs + k * FocusSchema.RECORD_PERIOD_MS
     private fun bucketEnd(k: Long): Long = bucketStart(k + 1)
 
-    /** Bucket index of [captureNs] inside the session window, or null (and a counter bump) when it is outside. */
-    private fun bucketIndex(captureNs: Long): Long? {
-        if (captureNs < startNs) {
+    /**
+     * Bucket index of a camera-origin input (directive E 4장): membership by the raw timestamp
+     * (`sessionStartRawTs ≤ raw < stopFenceRawTs`, or null and a counter bump), position by the mono timestamp clamped
+     * to `[bucket 0, last bucket]` ([lastPartialBucketIndex]) so that an admitted input is never rejected again because of its mono value.
+     */
+    private fun cameraBucketIndex(stamp: CameraStamp): Long? {
+        if (stamp.rawSensorTs < sessionStartRawNs) {
+            tBeforeStart++
+            return null
+        }
+        val fence = fenceRawNs
+        if (finished || (fence != null && stamp.rawSensorTs >= fence)) {
+            tAfterFence++
+            return null
+        }
+        return clampedBucketIndex(stamp.captureMonoNs)
+    }
+
+    /** Mono position → bucket index, clamped to the first bucket and (once the fence is up) to the last bucket the session holds ([lastPartialBucketIndex]). */
+    private fun clampedBucketIndex(monoNs: Long): Long {
+        var k = if (monoNs < startNs) 0L else (monoNs - startNs) / periodNs
+        val fence = fenceNs
+        if (fence != null) {
+            val lastPartial = lastPartialBucketIndex(fence - startNs, periodNs)
+            if (k > lastPartial) k = lastPartial
+        }
+        return k
+    }
+
+    /** Bucket index of an input without a camera timestamp (IMU): the mono window, unchanged. */
+    private fun monoBucketIndex(monoNs: Long): Long? {
+        if (monoNs < startNs) {
             tBeforeStart++
             return null
         }
         val fence = fenceNs
-        if (finished || (fence != null && captureNs >= fence)) {
+        if (finished || (fence != null && monoNs >= fence)) {
             tAfterFence++
             return null
         }
-        return (captureNs - startNs) / (FocusSchema.RECORD_PERIOD_MS * NS_PER_MS)
+        return (monoNs - startNs) / periodNs
     }
 
     /** Bucket for a counter: its own bucket, or the oldest open bucket when its own has closed (the count is never lost). */
-    private fun counterBucket(captureNs: Long): Bucket? {
-        val k = bucketIndex(captureNs) ?: return null
+    private fun counterBucket(stamp: CameraStamp): Bucket? {
+        val k = cameraBucketIndex(stamp) ?: return null
         return open.getOrPut(if (k < nextToClose) nextToClose else k) { Bucket() }
     }
 
     /** Bucket for a feature sample: its own open bucket, or null (counted late) when it has closed. */
-    private fun featureBucket(captureNs: Long): Bucket? {
-        val k = bucketIndex(captureNs) ?: return null
+    private fun featureBucket(index: Long?): Bucket? {
+        val k = index ?: return null
         if (k < nextToClose) {
             tOtherLate++
             return null
@@ -598,13 +813,27 @@ class FeatureAggregator(
         const val DEFAULT_CLOSE_DELAY_MS: Long = 300L
         const val NS_PER_MS: Long = 1_000_000L
 
+        /** Warm-up buckets whose capture-interval medians teach the fps-unset diagnostic interval (the summary's warm-up row). */
+        const val WARMUP_BUCKETS: Long = FocusSchema.WARMUP_MS / FocusSchema.RECORD_PERIOD_MS
+
+        /**
+         * Index of the last bucket a fenced session can hold: the bucket of the last ns before the fence,
+         * `(fence − start − 1) ÷ period` (E2 2.1). A fence exactly on a bucket boundary therefore points at the bucket
+         * *before* it — the bucket that begins at the fence is never emitted, and an admitted pre-fence frame clamped
+         * there would vanish from the records while still counted as applied. `spanNs ≤ 0` (fence at the start) gives 0.
+         */
+        fun lastPartialBucketIndex(spanNs: Long, periodNs: Long = FocusSchema.RECORD_PERIOD_MS * NS_PER_MS): Long {
+            require(periodNs > 0) { "periodNs must be positive" }
+            return if (spanNs <= 0L) 0L else (spanNs - 1) / periodNs
+        }
+
         /** Threshold of `gaps_over_80ms` (v0-plan V0-A). */
         const val GAP_80MS_NS: Long = 80_000_000L
 
-        /** Default preset threshold (every-frame presets). */
+        /** Default threshold for callers that pass none (older every-frame semantics, 80 ms). Presets use [GapThresholds]. */
         const val DEFAULT_GAP_THRESHOLD_NS: Long = GAP_80MS_NS
 
-        /** Default long-gap threshold (every-frame presets): 200 ms, must be 0 for the pass mark. */
+        /** Default long-gap threshold for callers that pass none (200 ms); must be 0 for the pass mark. */
         const val DEFAULT_LONG_GAP_THRESHOLD_NS: Long = 200_000_000L
 
         // gap-cause indices, same order as V0bRawRecord.GAP_CAUSE_ORDER

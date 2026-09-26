@@ -3,7 +3,7 @@
 - 날짜: 2026-09-20
 - 작성자: CC 세션 D (`claude/hopeful-hamilton-hw6wu1`), 정리·결정 김요섭 (발견: 외부 리뷰)
 - 관련 GT: V0-A 통과 기준 재측정(처리 fps·드롭·갭; `docs/focus/v0-plan-and-gt.md` 2장), R4 예산 확인, T1~T3 자료 수집
-- 관련 지시문·기록: `directives/D-r4-perf-experiments.md`(정정 1~5 통합본), CHANGELOG v0.2.3 (a)(b), `android/focus-engine/README.md`, `core/focus-core/README.md`
+- 관련 지시문·기록: `directives/D-r4-perf-experiments.md`(정정 1~5 통합본), CHANGELOG v0.2.3 (a)(b), `android/focus-engine/README.md`, `core/focus-core/README.md`; 실측 추가분과 후속 설계는 `directives/E-camera-fps-and-skip-fix.md`, CHANGELOG v0.2.4 (a)~(d)
 
 ## 가설
 
@@ -41,6 +41,36 @@ CHANGELOG v0.2.3 (a)(b). `spec_version` "0.2.0" 유지, `feature_schema_version`
 2. 프리셋 A~E, G 와 합격 규칙(off 행 기준, 전력·thermal 병기). F 는 보류: 정정 2 의 절차(A 와 같은 자세에서 yaw·pitch 편향 측정, 허용 2°)는 실기기 반복 측정이 필요하고, 크롭 창 이동에 따른 head pose 편향은 좌표 변환으로 복원할 수 없어(주점 이동) 실측 없이는 검증할 수 없다. 나머지 범위가 이미 크므로 건너뛰고 사유를 보고한다.
 3. 스레드 모델(집계기 단일 소유, 모든 파이프라인은 큐에 post)과 정상 종료 순서 7단계(`StopSequence`).
 4. 다음 실측에서 기록할 것: 프리셋별 요약 전문(합격 줄, on/off 행, 구간표), events.log 의 `stop_sequence`·`counter_mismatch` 줄, `resolution_choice`·`camera_bound` 줄(실제 해상도), 자가 점검 줄(G 의 hint 세션 생성 여부, D 의 GPU 생성 여부).
+
+## 실측 (지시문 E 도착 시점, SM-F966N, 화면 off 행)
+
+지시문 E 의 실측 근거(A·B·C·D·E·G, 같은 기기·같은 자리, 요약의 화면 off 행 기준). 세션 요약 전문은 `gt/sessions/` 의 로그와 함께 두고 git 에는 올리지 않는다.
+
+| 프리셋 | 평균 전류 (mA) | Face ms 평균/p95 | 드롭 | 처리 fps | 비고 |
+|---|---|---|---|---|---|
+| A | 431 | 38.3 / 41.8 | 2.0% | – | 기준 |
+| B | 418 | – | – | – | blendshape off: 전류 차이 없음 |
+| C | 428 | – | – | – | 640x360: 전류 차이 없음 |
+| D | 418 | – | – | – | GPU delegate: 전류 차이 없음 |
+| E | 359 | 56.6 / 60.1 | – | 12.00 | Face 절반: 전류 16% 감소, Face 추론 시간은 길어짐 |
+| G | 496 | – | – | – | PerformanceHint: 전류 15% 증가 |
+
+"–" 는 지시문에 값이 없는 칸이다(지시문은 전류와 A·E 의 Face ms, A 의 드롭, E 의 fps 만 준다).
+
+확정 사실(실측):
+
+1. 해상도(C)·blendshape(B)·GPU delegate(D)는 전류를 바꾸지 못했다. Face 처리 빈도를 절반으로 줄인 E 만 16% 줄었다. 스펙 7장의 부품별 전력 모델은 추론 비용을 과소평가했고 총 전류는 추론 변형에 둔감하다(CHANGELOG v0.2.4 (c)).
+2. E 에서 Face 추론 시간이 A 보다 길다(38 → 57ms): 격프레임은 "같은 추론을 절반만" 하는 것이 아니다.
+3. 화면 off 는 같은 세션 안 on/off 교대에서 Face 14~22%, Pose 25~40% 느리게 한다. 화면 상태와 추론 시간의 인과는 on/off 행 비교로 확인됐다(정정 1 의 미확정 항목 해소).
+4. G 는 A 보다 전류가 15% 많다.
+
+해석·가설(실측이 아닌 판단):
+
+- E 의 Face 시간 증가는 프레임 사이 유휴가 길어지면 코어 클럭이 내려가기 때문일 수 있다. H 세션(카메라 cadence 자체를 낮춤)에서 같은 경향이 나오는지 본다.
+- G 는 전력이 늘어 R4 예산에서 불리해 보인다.
+- 남은 질문: Face 처리 빈도를 같게 두고 카메라 cadence 만 낮추면 전류가 줄어드는가. 이를 위해 지시문 E 가 H12(카메라 [12,12]) ↔ E, H15([15,15]) ↔ E15(24fps, Face 15Hz 슬롯) 짝을 정의했다. 짝 비교는 Face 빈도가 같은 짝만 카메라 효과로 해석한다.
+
+지시문 E 구현(PR #8): 처리 슬롯 계수 3종(독립 terminal counter)과 `expected = filled + missed` 종료 검사, 카메라 timestamp 영역 계약(raw = identity·소속·슬롯, mono = 위치, fence 시 offset freeze, 양끝 버킷 clamp), 갭 임계 공식(1.5배·4.5배), H12/H15/Hvar/E15, 정지 순서(위 결정 3 의 7단계 → 8단계: fence 를 producer 정지 전에 전달하고 CaptureResult 콜백 drain 뒤 슬롯 scheduler CLOSE gate 추가), 힌지 초기값. 리뷰 반영(지시문 E2, 같은 PR): Hvar 는 상한 15 가변 range 중 가장 좁은 것; `[24,24]`·`[30,30]` 이 없는 카메라(fps unset)는 30fps 를 가정하지 않고 워밍업 60초 CaptureResult 간격 중앙값을 진단용 기대 간격으로 쓰며 판정하지 않는다; 종료 clamp 의 마지막 버킷은 `(fence − start − 1) ÷ period`; `stop_integrity_failed` 는 after_close > 0 OR CaptureResult drain 미완료 OR aggregation 큐 drain 미완료(원인별 보존); 슬롯 모드의 순서 역전 CaptureResult > 0 은 비교 불가; 요약 첫 줄은 `비교 가능` / `비교 불가: <사유들>` / `짝 비교 판정 비적용: Hvar 가변 cadence`. 실기기 H 세션 결과는 이 표 아래에 붙인다.
 
 ## 결정한 사람
 

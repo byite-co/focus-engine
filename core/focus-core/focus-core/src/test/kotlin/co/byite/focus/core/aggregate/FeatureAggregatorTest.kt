@@ -39,6 +39,20 @@ class FeatureAggregatorTest {
         PoseSample(ns(t0 + ms), infer, true, vis, cx, cy, w, head, if (head) offset else null, 720, 1280, waitMs = wait)
 
     @Test
+    fun lastPartialBucketIndexIsTheBucketOfTheLastNanosecondBeforeTheFence() {
+        // E2 2.1, ns resolution: (fence − start − 1) ÷ period, never (fence − start) ÷ period
+        val twoS = 2_000_000_000L
+        assertEquals(1L, FeatureAggregator.lastPartialBucketIndex(twoS - 1))
+        assertEquals(1L, FeatureAggregator.lastPartialBucketIndex(twoS), "a fence exactly on the boundary belongs to the bucket before it")
+        assertEquals(2L, FeatureAggregator.lastPartialBucketIndex(twoS + 1))
+        assertEquals(0L, FeatureAggregator.lastPartialBucketIndex(1L))
+        assertEquals(0L, FeatureAggregator.lastPartialBucketIndex(0L), "a fence at the start: the empty session still clamps to bucket 0")
+        assertEquals(0L, FeatureAggregator.lastPartialBucketIndex(1_000_000_000L))
+        assertEquals(3L, FeatureAggregator.lastPartialBucketIndex(3_500_000_000L))
+        assertFailsWith<IllegalArgumentException> { FeatureAggregator.lastPartialBucketIndex(twoS, periodNs = 0L) }
+    }
+
+    @Test
     fun bucketsAlignToSessionStartAndCloseAfterTheDelay() {
         val a = agg()
         a.onFrameRequested(ns(t0 + 10))

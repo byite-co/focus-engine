@@ -1,6 +1,7 @@
 package co.byite.focus.engine.pipeline.pose
 
 import android.os.SystemClock
+import co.byite.focus.core.aggregate.CameraStamp
 import co.byite.focus.core.aggregate.PoseSample
 import co.byite.focus.core.aggregate.WorkGeneration
 import co.byite.focus.engine.pipeline.RgbaFrame
@@ -35,14 +36,16 @@ class PoseWorker(
 ) {
     interface Sink {
         fun onPose(sample: PoseSample)
-        fun onPoseError(captureMonoNs: Long, error: Throwable)
-        fun onPoseSuperseded(captureMonoNs: Long)
+        fun onPoseError(stamp: CameraStamp, error: Throwable)
+        fun onPoseSuperseded(stamp: CameraStamp)
     }
 
-    /** Result of one [submit]: copy time and whether a waiting request was replaced. */
-    data class Submitted(val copyMs: Double, val supersededCaptureNs: Long?)
+    /** Result of one [submit]: copy time and, when a waiting request was replaced, that request's stamp. */
+    data class Submitted(val copyMs: Double, val superseded: CameraStamp?)
 
-    private class Request(val buffer: ByteBuffer, val width: Int, val height: Int, val rotation: Int, val captureNs: Long, val tsMs: Long, val submittedNs: Long, val generation: Long)
+    private class Request(val buffer: ByteBuffer, val width: Int, val height: Int, val rotation: Int, val captureNs: Long, val rawTs: Long, val tsMs: Long, val submittedNs: Long, val generation: Long) {
+        val stamp: CameraStamp get() = CameraStamp(rawTs, captureNs)
+    }
 
     private val lock = ReentrantLock()
     private val changed = lock.newCondition()
@@ -77,7 +80,7 @@ class PoseWorker(
         val t0 = nowNs()
         lock.withLock {
             if (closed) return null
-            val superseded = waiting?.captureNs
+            val superseded = waiting?.stamp
             val target = waiting?.buffer ?: freeBuffer(frame.width * 4 * frame.height)
             val src = frame.pixels
             src.rewind()
@@ -85,7 +88,7 @@ class PoseWorker(
             target.put(src)
             target.rewind()
             src.rewind()
-            waiting = Request(target, frame.width, frame.height, frame.rotationDegrees, frame.captureMonoNs, tsMs, t0, generation.current)
+            waiting = Request(target, frame.width, frame.height, frame.rotationDegrees, frame.captureMonoNs, frame.rawSensorTs, tsMs, t0, generation.current)
             submitted++
             changed.signalAll()
             val copyMs = (nowNs() - t0) / 1e6
@@ -181,7 +184,7 @@ class PoseWorker(
             try {
                 val startNs = nowNs()
                 val waitMs = ((startNs - req.submittedNs) / 1e6).coerceAtLeast(0.0)
-                val frame = RgbaFrame(req.buffer, req.width, req.height, req.rotation, req.captureNs)
+                val frame = RgbaFrame(req.buffer, req.width, req.height, req.rotation, req.captureNs, req.rawTs)
                 val p = inference.process(frame, req.tsMs)
                 val s = p.scalars
                 sample = if (p.detected && s != null) {
@@ -190,10 +193,10 @@ class PoseWorker(
                         shoulderVisibilityMin = s.shoulderVisibilityMin,
                         shoulderCenterXPx = s.shoulderCenterXPx, shoulderCenterYPx = s.shoulderCenterYPx, shoulderWidthPx = s.shoulderWidthPx,
                         headLandmarkPresent = s.headLandmarkPresent, headOffsetBelowShoulderRatio = s.headOffsetBelowShoulderRatio,
-                        frameWidthPx = p.frameWidthPx, frameHeightPx = p.frameHeightPx, waitMs = waitMs,
+                        frameWidthPx = p.frameWidthPx, frameHeightPx = p.frameHeightPx, waitMs = waitMs, rawSensorTs = req.rawTs,
                     )
                 } else {
-                    PoseSample(captureMonoNs = req.captureNs, poseInferMs = p.inferMs, detected = false, frameWidthPx = p.frameWidthPx, frameHeightPx = p.frameHeightPx, waitMs = waitMs)
+                    PoseSample(captureMonoNs = req.captureNs, poseInferMs = p.inferMs, detected = false, frameWidthPx = p.frameWidthPx, frameHeightPx = p.frameHeightPx, waitMs = waitMs, rawSensorTs = req.rawTs)
                 }
             } catch (t: Throwable) {
                 error = t
@@ -209,7 +212,7 @@ class PoseWorker(
                 changed.signalAll()
             }
             if (current) {
-                if (error != null) sink.onPoseError(req.captureNs, error) else sample?.let { sink.onPose(it) }
+                if (error != null) sink.onPoseError(req.stamp, error) else sample?.let { sink.onPose(it) }
             } else {
                 suppressedResults++
             }
