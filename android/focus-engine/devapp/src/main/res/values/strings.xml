@@ -20,8 +20,15 @@
     <string name="preset_b">A 에서 blendshape off</string>
     <string name="preset_c">640x360 16:9 (없으면 가장 가까운 16:9, 그것도 없으면 640x480 = C2)</string>
     <string name="preset_d">A 에서 Face GPU delegate</string>
-    <string name="preset_e">A 에서 Face 12fps (격프레임)</string>
+    <string name="preset_e">카메라 24fps, Face 12Hz 처리 슬롯 (3장 규칙, 주기 83.3ms)</string>
+    <string name="preset_e15">카메라 24fps, Face 15Hz 처리 슬롯 (3장 규칙, 주기 66.7ms)</string>
     <string name="preset_g">A 에서 Face 분석 스레드에 PerformanceHint 세션 (목표 35ms)</string>
+    <string name="preset_h12">카메라 고정 [12,12], Face 매 프레임 (짝: E)</string>
+    <string name="preset_h15">카메라 고정 [15,15], Face 매 프레임 (짝: E15)</string>
+    <string name="preset_hvar">카메라 가변 range(상한 15), Face 매 프레임 (합격 판정 없음, 분포만)</string>
+    <string name="fps_ranges">전면 카메라 AE fps range: %1$s</string>
+    <string name="fps_ranges_unknown">전면 카메라 AE fps range 를 조회하지 못했다 (H 프리셋 숨김)</string>
+    <string name="presets_hidden">이 카메라가 지원하지 않아 숨긴 프리셋: %1$s</string>
     <string name="label_status">상태</string>
     <string name="label_log_path">세션 로그</string>
     <string name="label_summary">마지막 요약</string>

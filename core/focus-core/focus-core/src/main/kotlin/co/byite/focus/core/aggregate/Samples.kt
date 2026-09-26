@@ -4,13 +4,36 @@ import co.byite.focus.core.model.AppState
 import co.byite.focus.core.model.ScreenState
 
 /**
+ * Identity and position of one camera-origin event (directive E 4장 timestamp 영역 계약). Every camera-origin
+ * input — capture result, analyzer frame, [FrameSample], [SceneSample], Pose request and [PoseSample] — carries both:
+ *
+ * - [rawSensorTs] is the camera's own `SENSOR_TIMESTAMP` (ns), identical on the `CaptureResult` and on the
+ *   `ImageProxy` of the same frame. It is the frame **identity**: session membership
+ *   (`sessionStartRawTs ≤ raw < stopFenceRawTs`), the processing-slot scheduler and the camera counter
+ *   conservation relations all use it, never a converted value.
+ * - [captureMonoNs] is the same instant on the session's monotonic clock (`elapsedRealtimeNanos`), converted by
+ *   the device layer's Timebase. It is the **position**: 1-second bucket, gaps, latency and the JSONL time axis.
+ *   On a device whose camera clock is not REALTIME two conversions of the same frame can differ by a few ms,
+ *   which is why frames are never matched or admitted by it.
+ *
+ * On a REALTIME camera the two are equal ([realtime]).
+ */
+data class CameraStamp(val rawSensorTs: Long, val captureMonoNs: Long) {
+    companion object {
+        /** Camera clock == monotonic clock (`SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME`): raw and mono are the same number. */
+        fun realtime(ns: Long): CameraStamp = CameraStamp(ns, ns)
+    }
+}
+
+/**
  * Inputs of the [FeatureAggregator]: what the device layer (CameraPipeline, FacePipeline,
  * PosePipeline, SceneQuality, MotionPipeline) hands over per frame or per sensor sample.
  * Scalars only — the pixels and landmarks never leave those modules (spec 9장 데이터 경계).
  *
  * All times are on the session's monotonic clock (Android `elapsedRealtime`), already converted
  * by the device layer's Timebase from the camera / IMU clocks. Frame values are stamped with the
- * *capture* timestamp, never with the callback arrival time (spec 9장 시간 기준).
+ * *capture* timestamp, never with the callback arrival time (spec 9장 시간 기준). Camera-origin samples also
+ * carry the raw sensor timestamp ([CameraStamp]); it defaults to the mono value for REALTIME cameras and tests.
  *
  * Threading (directive D, 정정 3): every sample is produced on a pipeline thread and *posted* to the
  * aggregation queue; only that queue's thread touches the aggregator.
@@ -40,7 +63,12 @@ data class FrameSample(
     val poseCopyMs: Double? = null,
     /** Time spent posting this frame's messages to the aggregation queue (the final ProcessedFrame post is charged to the next frame). */
     val enqueueMs: Double = 0.0,
+    /** Raw camera `SENSOR_TIMESTAMP` of the frame (identity, directive E 4장); equals [captureMonoNs] on a REALTIME camera. */
+    val rawSensorTs: Long = captureMonoNs,
 ) {
+    /** Identity + position of this frame. */
+    val stamp: CameraStamp get() = CameraStamp(rawSensorTs, captureMonoNs)
+
     init {
         if (!faceDetected) {
             require(yawDeg == null && pitchDeg == null && rollDeg == null && faceWidthPx == null && jitterJ == null) {
@@ -77,7 +105,11 @@ data class PoseSample(
     val frameHeightPx: Int,
     /** Pose request (frame copied on the analysis thread) → inference start on the worker (ms). */
     val waitMs: Double = 0.0,
+    /** Raw camera `SENSOR_TIMESTAMP` of the frame the pose ran on (identity, directive E 4장). */
+    val rawSensorTs: Long = captureMonoNs,
 ) {
+    val stamp: CameraStamp get() = CameraStamp(rawSensorTs, captureMonoNs)
+
     init {
         require(frameWidthPx > 0 && frameHeightPx > 0) { "frame size must be positive (t=$captureMonoNs)" }
         if (!detected) {
@@ -107,7 +139,11 @@ data class SceneSample(
     val tileTextureMedian: Double,
     /** SceneQuality wall time on the analysis thread (ms). */
     val computeMs: Double = 0.0,
+    /** Raw camera `SENSOR_TIMESTAMP` of the frame (identity, directive E 4장). */
+    val rawSensorTs: Long = captureMonoNs,
 ) {
+    val stamp: CameraStamp get() = CameraStamp(rawSensorTs, captureMonoNs)
+
     init {
         require(computeMs >= 0.0) { "timings must not be negative (t=$captureMonoNs)" }
     }

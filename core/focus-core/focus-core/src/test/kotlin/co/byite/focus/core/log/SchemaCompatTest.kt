@@ -1,9 +1,11 @@
 package co.byite.focus.core.log
 
+import co.byite.focus.core.report.StopDiagnostics
 import co.byite.focus.core.report.V0bReport
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 /** Schema 0.2.3 is additive: a 0.2.2 session (no preset fields, no new counters) decodes with the documented defaults. */
 class SchemaCompatTest {
@@ -46,9 +48,29 @@ class SchemaCompatTest {
         assertEquals(0, r.preFaceErrors)
         assertNull(r.frameTotalMsMean)
         assertNull(r.poseFrameCopyMsMean)
+        // schema 0.2.4 additions default to "unknown" / 0
+        assertEquals(0, r.processingSlotsExpected)
+        assertEquals(0, r.processingSlotsFilled)
+        assertEquals(0, r.processingSlotsMissed)
+        assertNull(r.captureIntervalMsMedian)
+        assertNull(h.cameraFpsRequestLower)
+        assertNull(h.cameraFpsRequestFixed)
+        assertEquals("unset", h.cameraFpsRequestLabel)
+        assertNull(h.faceSchedule)
+        assertNull(h.faceProcessPeriodNs)
+        assertNull(h.frameGapThresholdNs)
+        assertNull(log.sessionEnd!!.stopIntegrityFailed)
+        assertNull(log.sessionEnd!!.captureResultsAfterClose)
         val summary = V0bReport.build(log)
         assertEquals(2L, summary.overall.framesDropped)
         assertEquals("1280x720 (16:9) @ 24fps", summary.overall.camera)
+        // an older log keeps its rounded ms thresholds, is judged, and has no cadence verdict
+        assertEquals(80.0, summary.overall.thresholds.gapMs)
+        assertEquals("80ms", summary.overall.thresholds.gapLabel)
+        assertTrue(summary.overall.thresholds.applicable)
+        assertNull(summary.overall.cadence.mismatch)
+        assertEquals(0L, summary.overall.slots.expected)
+        assertEquals(StopDiagnostics.UNKNOWN, summary.overall.diagnostics)
     }
 
     @Test

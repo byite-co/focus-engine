@@ -1,9 +1,9 @@
 package co.byite.focus.core.aggregate
 
 /**
- * Session-wide input counters of the [FeatureAggregator] (directive D 정정 4·5). Every accepted input
- * inside the session window (`sessionStartCaptureTs ≤ captureTs < stopFenceCaptureTs`) is counted
- * here once, independently of the per-second buckets, so the conservation relations can be checked at a
+ * Session-wide input counters of the [FeatureAggregator] (directive D 정정 4·5, directive E 2장). Every accepted input
+ * inside the session window (`sessionStartRawTs ≤ rawSensorTs < stopFenceRawTs`, raw camera timestamps; directive E 4장)
+ * is counted here once, independently of the per-second buckets, so the conservation relations can be checked at a
  * normal stop even though the partial last bucket is never written.
  *
  * Relations (checked by [CounterConsistency]):
@@ -12,6 +12,13 @@ package co.byite.focus.core.aggregate
  * - `processed = sampleEnqueued + postFaceFailed`, `sampleEnqueued = sampleApplied + sampleLateDropped`
  * - `poseRequested = poseSuperseded + poseCompleted + poseErrors + poseCancelledAtStop`
  * - `poseCompleted = poseApplied + poseLateDropped`
+ * - `processingSlotsExpected = processingSlotsFilled + processingSlotsMissed` — three independent terminal counters
+ *   (schema 0.2.4); a bug that loses a slot breaks this relation because `missed` is never derived from the other two.
+ *
+ * Diagnostics outside every relation: capture results stamped before the session start, at or after the raw stop
+ * fence, and after the scheduler's CLOSE. The last one must be 0 at a normal stop: such a capture result is a real
+ * pre-fence frame that is absent from `expected`, so the relations can pass while the stop was not clean
+ * (`stop_integrity_failed`, directive E 2·5장).
  */
 data class CounterTotals(
     val framesRequested: Long = 0,
@@ -30,19 +37,33 @@ data class CounterTotals(
     val poseErrors: Long = 0,
     /** Scene / IMU samples that arrived for a closed bucket (dropped; not part of a conservation relation). */
     val otherLateInputs: Long = 0,
-    /** Inputs stamped before the session start (dropped). */
+    /** Inputs of any kind stamped before the session start (dropped). */
     val inputsBeforeStart: Long = 0,
-    /** Inputs stamped at or after the stop fence (dropped). */
+    /** Inputs of any kind stamped at or after the stop fence (dropped). */
     val inputsAfterFence: Long = 0,
+    // ---- processing slots (schema 0.2.4, directive E 2장): independent terminal counters
+    val processingSlotsExpected: Long = 0,
+    val processingSlotsFilled: Long = 0,
+    val processingSlotsMissed: Long = 0,
+    // ---- diagnostics (schema 0.2.4): capture results outside the raw window / after the scheduler CLOSE
+    val captureResultsBeforeStart: Long = 0,
+    val captureResultsAfterFence: Long = 0,
+    val captureResultsAfterClose: Long = 0,
 ) {
     val backpressureDrops: Long get() = framesRequested - framesAnalyzerReceived
     val framesSampleEnqueued: Long get() = framesSampleApplied + framesSampleLateDropped
     val framesPostFaceFailed: Long get() = framesProcessed - framesSampleEnqueued
     val framesUnprocessedUnexpected: Long get() = framesAnalyzerReceived - framesSkippedIntentional - framesProcessed
+
+    /** `missed ÷ expected` (the counted `missed`, never `expected − filled`); null without expected slots. */
+    val slotMissRatio: Double? get() = if (processingSlotsExpected > 0) processingSlotsMissed.toDouble() / processingSlotsExpected else null
+
+    /** A capture result reached the scheduler after CLOSE: the stop was not clean (directive E 2장). */
+    val stopIntegrityFailed: Boolean get() = captureResultsAfterClose > 0
 }
 
 /**
- * Conservation-relation check run at a normal stop (정정 4·5 4번). Returns one line per broken relation,
+ * Conservation-relation check run at a normal stop (정정 4·5 4번, directive E 2장). Returns one line per broken relation,
  * `"<항목>: 좌변 ≠ 우변 (…)"`, empty when everything adds up. A recovered (process-death) summary skips the
  * check and says so instead.
  */
@@ -78,6 +99,11 @@ object CounterConsistency {
         }
         if (t.poseCompleted != t.poseApplied + t.poseLateDropped) {
             out.add("pose_completed ${t.poseCompleted} ≠ applied ${t.poseApplied} + late_dropped ${t.poseLateDropped}")
+        }
+        // Three independent counters (directive E 최종 정정 1): the relation is only informative because none is derived.
+        val slotRhs = t.processingSlotsFilled + t.processingSlotsMissed
+        if (t.processingSlotsExpected != slotRhs) {
+            out.add("processing_slots_expected ${t.processingSlotsExpected} ≠ filled ${t.processingSlotsFilled} + missed ${t.processingSlotsMissed} = $slotRhs")
         }
         return out
     }

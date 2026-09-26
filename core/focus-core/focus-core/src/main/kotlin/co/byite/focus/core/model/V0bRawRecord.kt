@@ -124,9 +124,25 @@ data class V0bRawRecord(
     @SerialName("is_device_idle") val isDeviceIdle: Boolean,
     /** Latest hinge angle (degrees, `TYPE_HINGE_ANGLE`) at bucket close; null when the device has no hinge sensor or no reading yet. */
     @SerialName("hinge_angle_deg") val hingeAngleDeg: Double? = null,
+
+    // ---- Processing slots (schema 0.2.4, directive E 2장): three independent terminal counters, attributed like the
+    // frame counters (by the frame's capture timestamp, or to the oldest open bucket when that one had closed).
+    // `expected` = the scheduler selected a processing opportunity; `filled` = Face succeeded on that raw timestamp;
+    // `missed` = the slot ended without a Face success. Session totals obey `expected = filled + missed`
+    // (CounterConsistency); `slot_miss_ratio = missed ÷ expected` is derived in the summary, never stored.
+    @SerialName("processing_slots_expected") val processingSlotsExpected: Int = 0,
+    @SerialName("processing_slots_filled") val processingSlotsFilled: Int = 0,
+    @SerialName("processing_slots_missed") val processingSlotsMissed: Int = 0,
+
+    // ---- Camera cadence (schema 0.2.4): intervals between consecutive capture results on the raw camera clock,
+    // attributed to the bucket of the later one (ms; median, nearest-rank p95, max). Null without two capture results.
+    @SerialName("capture_interval_ms_median") val captureIntervalMsMedian: Double? = null,
+    @SerialName("capture_interval_ms_p95") val captureIntervalMsP95: Double? = null,
+    @SerialName("capture_interval_ms_max") val captureIntervalMsMax: Double? = null,
 ) {
     init {
         require(poseSamples >= 0 && sceneSamples >= 0 && imuSamples >= 0) { "sample counters must not be negative (t=$tMonoMs)" }
+        require(processingSlotsExpected >= 0 && processingSlotsFilled >= 0 && processingSlotsMissed >= 0) { "slot counters must not be negative (t=$tMonoMs)" }
         require(poseRequested >= 0 && poseCompleted >= 0 && poseApplied >= 0 && poseSuperseded >= 0 && poseLateDropped >= 0 && poseErrors >= 0) { "pose counters must not be negative (t=$tMonoMs)" }
         require(poseApplied == poseSamples) { "pose_applied must equal pose_samples (t=$tMonoMs)" }
         require(faceInferenceErrors >= 0 && preFaceErrors >= 0) { "error counters must not be negative (t=$tMonoMs)" }

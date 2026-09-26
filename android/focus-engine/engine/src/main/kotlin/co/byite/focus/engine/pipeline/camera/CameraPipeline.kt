@@ -27,14 +27,20 @@ import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.lifecycle.LifecycleOwner
+import co.byite.focus.core.aggregate.CameraCounterSink
+import co.byite.focus.core.aggregate.CameraStamp
 import co.byite.focus.core.aggregate.FrameSample
+import co.byite.focus.core.aggregate.FrameScheduler
+import co.byite.focus.core.aggregate.GapThresholds
 import co.byite.focus.core.aggregate.PoseSample
 import co.byite.focus.core.aggregate.ProcessedFrame
 import co.byite.focus.core.aggregate.SceneSample
+import co.byite.focus.core.model.FaceSchedule
 import co.byite.focus.engine.AnalysisGate
+import co.byite.focus.engine.CameraFpsRequest
 import co.byite.focus.engine.CapturePreset
+import co.byite.focus.engine.FpsRange
 import co.byite.focus.engine.FrameSize
-import co.byite.focus.engine.FrameSkipRule
 import co.byite.focus.engine.PresetResolution
 import co.byite.focus.engine.ResolutionChoice
 import co.byite.focus.engine.pipeline.RgbaFrame
@@ -58,14 +64,25 @@ data class CameraFacts(
     val presetId: String,
     /** "FRONT", "BACK" or "EXTERNAL" (`LENS_FACING`). */
     val lensFacing: String,
+    /** Cadence the thresholds were computed for: the requested range's upper bound (Hvar: 15), 30 when nothing was requested. */
     val nominalFps: Int,
     val fpsSelected: String,
     val fpsAvailable: String,
     val timestampSource: String,
     val stabilization: String,
+    /** Rounded ms of the ns thresholds (legacy header fields). */
     val gapThresholdMs: Int,
     val longGapThresholdMs: Int,
     val perfHint: String,
+    /** Requested AE range, null when nothing was requested (HAL default). */
+    val fpsRequest: FpsRange? = null,
+    /** Every AE range the camera offers. */
+    val fpsRanges: List<FpsRange> = emptyList(),
+    val faceSchedule: FaceSchedule = FaceSchedule.EVERY_FRAME,
+    /** Expected interval between Face-processed frames (ns) and the formula thresholds (directive E 2장). */
+    val faceProcessPeriodNs: Long = 0L,
+    val gapThresholdNs: Long = 0L,
+    val longGapThresholdNs: Long = 0L,
 )
 
 /**
@@ -73,11 +90,17 @@ data class CameraFacts(
  * resolution ([PresetResolution]), [24,24] else [30,30] via Camera2Interop, KEEP_ONLY_LATEST, no Preview,
  * RGBA_8888 output, target rotation fixed to ROTATION_0 (portrait mount).
  *
- * Analysis thread (`focus-analysis`) per received frame: count → skip rule (preset E) → wrap → Face inference
- * (`frames_processed` fixed here) → post-processing → Pose hand-off (deep copy to [PoseWorker], 1 fps / ≥ 3 fps
- * while no face) → SceneQuality (1 Hz) → one [ProcessedFrame] posted through [Listener]. Every stage is timed.
+ * Analysis thread (`focus-analysis`) per received frame: count → slot decision ([FrameScheduler]: every capture
+ * result for every-frame presets, the 3장 slot rule for E / E15) → wrap → Face inference (`frames_processed` and the
+ * slot `filled` fixed here) → post-processing → Pose hand-off (deep copy to [PoseWorker], 1 fps / ≥ 3 fps while no
+ * face) → SceneQuality (1 Hz) → one [ProcessedFrame] posted through [Listener]. Every stage is timed.
  * Preset G adds a PerformanceHintManager session for this thread only and reports each cycle's duration.
  * Only scalars leave; the [Listener] implementation posts them to the aggregation queue (directive D 정정 3).
+ *
+ * Timestamp domains (directive E 4장): every camera-origin event carries a [CameraStamp] — the raw `SENSOR_TIMESTAMP`
+ * (identity: `CaptureResult.SENSOR_TIMESTAMP == ImageProxy.imageInfo.timestamp`, session membership, slots) and its
+ * mono conversion (position). Capture results reach this thread through the capture callback; the scheduler holds the
+ * ones that precede the first analyzer frame and replays them once `sessionStartRawTs` is known.
  */
 @androidx.annotation.OptIn(androidx.camera.camera2.interop.ExperimentalCamera2Interop::class)
 class CameraPipeline(
@@ -86,27 +109,24 @@ class CameraPipeline(
     private val listener: Listener,
     val preset: CapturePreset,
 ) {
-    /** Callbacks run on the analysis thread unless noted. None may touch the aggregator directly. */
-    interface Listener {
-        /** First received frame: the session starts at its capture time (buckets align to it). Called before its [onFrameReceived]. */
-        fun onSessionStart(captureMonoMs: Long, frameWidth: Int, frameHeight: Int)
-
-        /** Camera2 capture result for one frame the HAL produced, stamped on the monotonic clock. May precede [onSessionStart]. */
-        fun onFrameRequested(captureMonoNs: Long)
-        fun onFrameReceived(captureMonoNs: Long)
-        fun onFrameSkipped(captureMonoNs: Long)
-        fun onFaceInferenceError(captureMonoNs: Long)
-        fun onPreFaceError(captureMonoNs: Long)
+    /**
+     * Callbacks run on the analysis thread unless noted. None may touch the aggregator directly. The camera counters
+     * ([CameraCounterSink]: requested / received / skipped / errors / slot expected·filled·missed / after-close) are
+     * emitted by the [FrameScheduler]; the sample callbacks below by this class.
+     */
+    interface Listener : CameraCounterSink {
+        /** First received frame: the session starts at its capture time (buckets align to it, `sessionStartRawTs` = its raw timestamp). Called before its counters. */
+        fun onSessionStart(captureMonoMs: Long, rawSensorTs: Long, frameWidth: Int, frameHeight: Int)
         fun onFrameProcessed(frame: ProcessedFrame)
         fun onScene(sample: SceneSample)
-        fun onPoseRequested(captureMonoNs: Long, copyMs: Double)
-        fun onPoseSuperseded(captureMonoNs: Long)
+        fun onPoseRequested(stamp: CameraStamp, copyMs: Double)
+        fun onPoseSuperseded(stamp: CameraStamp)
 
         /** Pose worker thread. */
         fun onPose(sample: PoseSample)
 
         /** Pose worker thread. */
-        fun onPoseError(captureMonoNs: Long)
+        fun onPoseError(stamp: CameraStamp)
 
         /** Any thread. */
         fun onEvent(message: String)
@@ -118,13 +138,16 @@ class CameraPipeline(
     private var analysis: ImageAnalysis? = null
     private var provider: ProcessCameraProvider? = null
     private var scratch: ByteBuffer? = null
-    private var skipRule: FrameSkipRule? = null
+    /** Slot scheduler + counter glue (core), created at [bind]; analysis thread only. */
+    @Volatile private var scheduler: FrameScheduler? = null
     /** Generation gate of the per-frame work (code review item 2). */
     private val gate = AnalysisGate()
     private var hintSession: PerformanceHintManager.Session? = null
     private var hintReports = 0L
     private var sessionStartMs = -1L
+    private var sessionStartRaw = Long.MIN_VALUE
     private var lastTimestampMs = Long.MIN_VALUE
+    private var captureAfterCloseLogged = 0L
     private var lastPoseBucket = -1L
     private var lastPoseNs = Long.MIN_VALUE
     private var lastSceneBucket = -1L
@@ -150,11 +173,11 @@ class CameraPipeline(
 
     private val poseSink = object : PoseWorker.Sink {
         override fun onPose(sample: PoseSample) = listener.onPose(sample)
-        override fun onPoseError(captureMonoNs: Long, error: Throwable) {
+        override fun onPoseError(stamp: CameraStamp, error: Throwable) {
             listener.onEvent("pose_error ${error.javaClass.simpleName}: ${error.message}")
-            listener.onPoseError(captureMonoNs)
+            listener.onPoseError(stamp)
         }
-        override fun onPoseSuperseded(captureMonoNs: Long) = listener.onPoseSuperseded(captureMonoNs)
+        override fun onPoseSuperseded(stamp: CameraStamp) = listener.onPoseSuperseded(stamp)
     }
 
     /**
@@ -180,7 +203,8 @@ class CameraPipeline(
         val p = pp.process(frame, 0L)
         worker.start()
         val hint = openHintSession()
-        return "OK (프리셋 ${preset.id}: Face ${preset.faceDelegate} blendshape ${if (preset.faceBlendshapes) "on" else "off"} ÷${preset.frameProcessDivisor}, " +
+        val schedule = preset.faceRateHz?.let { "슬롯 ${it}Hz" } ?: "매 프레임"
+        return "OK (프리셋 ${preset.id}: Face ${preset.faceDelegate} blendshape ${if (preset.faceBlendshapes) "on" else "off"} $schedule 카메라 ${preset.cameraFps.label}, " +
             "Face ${"%.1f".format(f.inferMs)}ms, Pose ${"%.1f".format(p.inferMs)}ms, synthetic ${w}x$h grey: face=${f.detected} pose=${p.detected}, perf hint $hint)"
     }
 
@@ -208,15 +232,23 @@ class CameraPipeline(
         val oisModes = c2.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
         val tb = Timebase(c2.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE))
         timebase = tb
-        val has24 = ranges.any { it.lower == 24 && it.upper == 24 }
-        val has30 = ranges.any { it.lower == 30 && it.upper == 30 }
-        val selected: Range<Int>? = when {
-            has24 -> Range(24, 24)
-            has30 -> Range(30, 30)
-            else -> null
+        val supportedRanges = ranges.map { FpsRange(it.lower, it.upper) }
+        val request: FpsRange? = preset.cameraFps.select(supportedRanges)
+        if (request == null && preset.cameraFps != CameraFpsRequest.Default) {
+            listener.onEvent("fps_range_unavailable preset=${preset.id} wanted=${preset.cameraFps.label} supported=${supportedRanges.joinToString(",")}")
+            return false
         }
-        val nominalFps = selected?.upper ?: 30
-        skipRule = FrameSkipRule(preset.frameProcessDivisor, nominalFps)
+        val selected: Range<Int>? = request?.let { Range(it.lower, it.upper) }
+        // the cadence the thresholds are computed for: the requested upper bound (Hvar: 15), 30 for the HAL default
+        val nominalFps = request?.upper ?: 30
+        val processPeriodNs = preset.faceProcessPeriodNs(nominalFps)
+        val frameIntervalNs = GapThresholds.frameIntervalNs(nominalFps)
+        scheduler = FrameScheduler(listener, preset.slotPeriodNs(), frameIntervalNs)
+        listener.onEvent(
+            "fps_request preset=${preset.id} wanted=${preset.cameraFps.label} selected=${request?.toString() ?: "unset"} nominal=$nominalFps " +
+                "face_schedule=${preset.faceSchedule.name.lowercase()} face_period_ns=$processPeriodNs frame_interval_ns=$frameIntervalNs " +
+                "gap_threshold_ns=${GapThresholds.gapThresholdNs(processPeriodNs)} long_gap_threshold_ns=${GapThresholds.longGapThresholdNs(processPeriodNs)} supported=${supportedRanges.joinToString(",")}",
+        )
 
         val supported: List<FrameSize> = c2.getCameraCharacteristic(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             ?.getOutputSizes(ImageFormat.YUV_420_888)?.map { FrameSize(it.width, it.height) } ?: emptyList()
@@ -245,7 +277,7 @@ class CameraPipeline(
                 val ts = result.get(CaptureResult.SENSOR_TIMESTAMP)
                 val fps = result.get(CaptureResult.CONTROL_AE_TARGET_FPS_RANGE)?.let { "[${it.lower},${it.upper}]" }
                 analysisHandler.post {
-                    if (ts != null) listener.onFrameRequested(tb.cameraToMonoNoSample(ts))
+                    if (ts != null) onCaptureResult(ts, tb)
                     if (fps != null && fps != fpsEffective) {
                         listener.onEvent("ae_target_fps_range=$fps (was ${fpsEffective ?: "none"})")
                         fpsEffective = fps
@@ -289,16 +321,37 @@ class CameraPipeline(
             presetId = choice.presetId,
             lensFacing = lensFacing,
             nominalFps = nominalFps,
-            fpsSelected = selected?.let { "[${it.lower},${it.upper}]" } ?: "unset(no [24,24] or [30,30])",
-            fpsAvailable = ranges.joinToString(prefix = "[", postfix = "]") { "[${it.lower},${it.upper}]" },
+            fpsSelected = request?.toString() ?: "unset(no [24,24] or [30,30])",
+            fpsAvailable = supportedRanges.joinToString(prefix = "[", postfix = "]"),
             timestampSource = tb.cameraSourceName,
             stabilization = "video=OFF ois=${if (oisOff) "OFF" else "n/a"}",
             gapThresholdMs = preset.gapThresholdMs(nominalFps),
             longGapThresholdMs = preset.longGapThresholdMs(nominalFps),
             perfHint = if (hintSession != null) "target ${preset.perfHintTargetMs}ms" else "none",
+            fpsRequest = request,
+            fpsRanges = supportedRanges,
+            faceSchedule = preset.faceSchedule,
+            faceProcessPeriodNs = processPeriodNs,
+            gapThresholdNs = GapThresholds.gapThresholdNs(processPeriodNs),
+            longGapThresholdNs = GapThresholds.longGapThresholdNs(processPeriodNs),
         )
         return true
     }
+
+    /** Analysis thread: one capture result (raw `SENSOR_TIMESTAMP`) into the scheduler; it emits `frames_requested` and the slot decision. */
+    private fun onCaptureResult(rawTs: Long, tb: Timebase) {
+        val sch = scheduler ?: return
+        val d = sch.onCaptureResult(CameraStamp(rawTs, tb.cameraToMonoNoSample(rawTs)))
+        if (d == FrameScheduler.CaptureDecision.AFTER_CLOSE && ++captureAfterCloseLogged <= 20) listener.onEvent("capture_result_after_close raw_ts=$rawTs")
+    }
+
+    /** Stop step 1 (analysis thread): `stopFenceRawTs` — capture results and frames at or after it are rejected. */
+    fun applyFence(fenceRawNs: Long) {
+        scheduler?.fence(fenceRawNs)
+    }
+
+    /** Stop step 2 (analysis thread): CLOSE the scheduler; returns the open slots terminated as missed. */
+    fun closeScheduler(): Long = scheduler?.close() ?: 0L
 
     /** Main thread. Stop step 1: no frame reaches [analyze] after this returns (a call already running finishes). */
     fun unbind() {
@@ -344,8 +397,10 @@ class CameraPipeline(
             return
         }
         try {
-            val captureNs = tb.cameraToMono(image.imageInfo.timestamp, entryNs)
+            val rawTs = image.imageInfo.timestamp
+            val captureNs = tb.cameraToMono(rawTs, entryNs)
             val tsMs = captureNs / 1_000_000L
+            val stamp = CameraStamp(rawTs, captureNs)
             if (!firstFrameLogged) {
                 firstFrameLogged = true
                 val plane = image.planes[0]
@@ -357,40 +412,59 @@ class CameraPipeline(
                     }
                 }
             }
+            val sch = scheduler
+            if (sch == null) return // bind() has not run: nothing is counted
             if (sessionStartMs < 0) {
                 sessionStartMs = tsMs
-                listener.onSessionStart(tsMs, image.width, image.height)
+                sessionStartRaw = rawTs
+                listener.onSessionStart(tsMs, rawTs, image.width, image.height)
+                val replay = sch.onSessionStart(stamp)
+                listener.onEvent("session_start_raw raw_ts=$rawTs mono_ns=$captureNs offset_ns=${tb.cameraOffsetNs} replayed_capture_results=${replay.size} before_start=${replay.count { it == FrameScheduler.CaptureDecision.BEFORE_START }}")
             }
             // Gate (code review item 2): a frame that starts after the stop path gave up on this thread posts nothing.
             val frameGeneration = gate.begin(captureNs) ?: return
             var enqueueNs = carriedEnqueueNs
             carriedEnqueueNs = 0L
             val tq0 = SystemClock.elapsedRealtimeNanos()
-            listener.onFrameReceived(captureNs)
+            // received + backpressure resolution + the slot decision, all by the raw timestamp
+            val outcome = sch.onFrameReceived(stamp)
             enqueueNs += SystemClock.elapsedRealtimeNanos() - tq0
+            when (outcome) {
+                FrameScheduler.FrameOutcome.AFTER_FENCE -> {
+                    gate.end(frameGeneration)
+                    return
+                }
+                FrameScheduler.FrameOutcome.OUT_OF_ORDER -> {
+                    nonMonotonic++
+                    if (nonMonotonic <= 20) listener.onEvent("non_monotonic_frame raw_ts=$rawTs ts_ms=$tsMs last=$lastTimestampMs")
+                    if (gate.end(frameGeneration)) sch.onPreFaceError(stamp)
+                    return
+                }
+                FrameScheduler.FrameOutcome.NOT_SLOT -> {
+                    if (gate.end(frameGeneration)) sch.onFrameSkipped(stamp)
+                    return
+                }
+                FrameScheduler.FrameOutcome.SLOT -> Unit
+            }
             val fp = face
             val worker = poseWorker
-            val rule = skipRule
-            if (fp == null || worker == null || rule == null) {
-                if (gate.end(frameGeneration)) listener.onPreFaceError(captureNs)
+            if (fp == null || worker == null) {
+                if (gate.end(frameGeneration)) sch.onPreFaceError(stamp)
                 return
             }
             if (tsMs <= lastTimestampMs) {
+                // MediaPipe VIDEO mode needs strictly increasing ms timestamps; a raw-monotonic frame can still tie at ms resolution
                 nonMonotonic++
-                if (nonMonotonic <= 20) listener.onEvent("non_monotonic_frame ts_ms=$tsMs last=$lastTimestampMs")
-                if (gate.end(frameGeneration)) listener.onPreFaceError(captureNs)
-                return
-            }
-            if (rule.shouldSkip(captureNs)) {
-                if (gate.end(frameGeneration)) listener.onFrameSkipped(captureNs)
+                if (nonMonotonic <= 20) listener.onEvent("non_monotonic_frame_ms raw_ts=$rawTs ts_ms=$tsMs last=$lastTimestampMs")
+                if (gate.end(frameGeneration)) sch.onPreFaceError(stamp)
                 return
             }
             lastTimestampMs = tsMs
             val frame = try {
-                wrap(image, captureNs)
+                wrap(image, captureNs, rawTs)
             } catch (e: Exception) {
                 listener.onEvent("wrap_failed ${e.javaClass.simpleName}: ${e.message}")
-                if (gate.end(frameGeneration)) listener.onPreFaceError(captureNs)
+                if (gate.end(frameGeneration)) sch.onPreFaceError(stamp)
                 return
             }
             val wrapMs = (SystemClock.elapsedRealtimeNanos() - entryNs) / 1e6
@@ -399,11 +473,10 @@ class CameraPipeline(
             } catch (t: Throwable) {
                 faceErrors++
                 if (faceErrors <= 20) listener.onEvent("face_inference_error ${t.javaClass.simpleName}: ${t.message}")
-                if (gate.end(frameGeneration)) listener.onFaceInferenceError(captureNs)
+                if (gate.end(frameGeneration)) sch.onFaceInferenceError(stamp)
                 return
             }
-            // frames_processed is fixed from here on (정정 3), whatever the later stages do.
-            rule.onProcessed(captureNs)
+            // frames_processed and the slot's `filled` are fixed from here on (정정 3), whatever the later stages do.
             var sample: FrameSample? = null
             try {
                 val f = fp.extract(inference, frame)
@@ -421,8 +494,8 @@ class CameraPipeline(
                         lastPoseNs = captureNs
                         poseCopyMs = submitted.copyMs
                         val tq1 = SystemClock.elapsedRealtimeNanos()
-                        submitted.supersededCaptureNs?.let { listener.onPoseSuperseded(it) }
-                        listener.onPoseRequested(captureNs, submitted.copyMs)
+                        submitted.superseded?.let { listener.onPoseSuperseded(it) }
+                        listener.onPoseRequested(stamp, submitted.copyMs)
                         enqueueNs += SystemClock.elapsedRealtimeNanos() - tq1
                     }
                 }
@@ -433,7 +506,7 @@ class CameraPipeline(
                     val st = scene.process(frame)
                     val tq2 = SystemClock.elapsedRealtimeNanos()
                     sceneMs = (tq2 - t0) / 1e6
-                    listener.onScene(SceneSample(captureNs, st.lumaMean, st.tileTextureMin, st.tileTextureMedian, computeMs = sceneMs))
+                    listener.onScene(SceneSample(captureNs, st.lumaMean, st.tileTextureMin, st.tileTextureMedian, computeMs = sceneMs, rawSensorTs = rawTs))
                     enqueueNs += SystemClock.elapsedRealtimeNanos() - tq2
                 }
                 sample = FrameSample(
@@ -447,6 +520,7 @@ class CameraPipeline(
                     sceneMs = sceneMs,
                     poseCopyMs = poseCopyMs,
                     enqueueMs = enqueueNs / 1e6,
+                    rawSensorTs = rawTs,
                 )
             } catch (t: Throwable) {
                 postFaceErrors++
@@ -458,7 +532,8 @@ class CameraPipeline(
             // aggregation thread when this message is applied. A frame cancelled at stop never sends it.
             if (gate.end(frameGeneration)) {
                 val tq3 = SystemClock.elapsedRealtimeNanos()
-                listener.onFrameProcessed(ProcessedFrame(captureNs, inference.inferMs, sample?.copy(totalMs = totalNs / 1e6)))
+                if (!sch.onFaceSucceeded(stamp)) listener.onEvent("slot_not_open_on_face_success raw_ts=$rawTs")
+                listener.onFrameProcessed(ProcessedFrame(captureNs, inference.inferMs, sample?.copy(totalMs = totalNs / 1e6), rawSensorTs = rawTs))
                 carriedEnqueueNs = SystemClock.elapsedRealtimeNanos() - tq3
             }
             hintSession?.let { s ->
@@ -473,7 +548,7 @@ class CameraPipeline(
     }
 
     /** RGBA plane → [RgbaFrame]; zero-copy when the plane has no padding, else a row copy into a scratch buffer. */
-    private fun wrap(image: ImageProxy, captureNs: Long): RgbaFrame {
+    private fun wrap(image: ImageProxy, captureNs: Long, rawTs: Long): RgbaFrame {
         val w = image.width
         val h = image.height
         val plane = image.planes[0]
@@ -498,14 +573,15 @@ class CameraPipeline(
             dst.rewind()
             dst
         }
-        return RgbaFrame(pixels, w, h, image.imageInfo.rotationDegrees, captureNs)
+        return RgbaFrame(pixels, w, h, image.imageInfo.rotationDegrees, captureNs, rawTs)
     }
 
     /** One-line frame-path statistics for the event log. */
     fun stats(): String = "frames zero_copy=$zeroCopyFrames copied=$copiedFrames non_monotonic=$nonMonotonic capture_failures=$captureFailures " +
         "face_inference_errors=$faceErrors post_face_failed=$postFaceErrors outcomes_suppressed_at_stop=${gate.suppressed} " +
         "pose_submitted=${poseWorker?.submitted ?: 0} pose_results_suppressed_at_stop=${poseWorker?.suppressedResults ?: 0} " +
-        "jitter_skipped_fast_rotation=${face?.jitterSkippedFastRotation ?: 0} perf_hint_reports=$hintReports fps_result=${fpsEffective ?: "unknown"}"
+        "jitter_skipped_fast_rotation=${face?.jitterSkippedFastRotation ?: 0} perf_hint_reports=$hintReports fps_result=${fpsEffective ?: "unknown"} " +
+        "session_start_raw=$sessionStartRaw offset_frozen=${timebase?.cameraOffsetFrozen} ${scheduler?.stats() ?: "scheduler=none"}"
 
     companion object {
         const val SELF_CHECK_WIDTH = 640

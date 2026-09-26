@@ -81,7 +81,7 @@ class SchemaBoundaryTest {
             "power_state",
         )
         assertEquals(expected, names(SecondRecord.serializer().descriptor))
-        assertEquals("0.2.3", FocusSchema.FEATURE_SCHEMA_VERSION)
+        assertEquals("0.2.4", FocusSchema.FEATURE_SCHEMA_VERSION)
         assertEquals("0.2.0", FocusSchema.SPEC_VERSION)
     }
 
@@ -103,6 +103,9 @@ class SchemaBoundaryTest {
             "face_inference_errors", "pre_face_errors",
             "imu_samples", "accel_x_mean", "accel_y_mean", "accel_z_mean", "accel_variance",
             "thermal_status", "battery_pct", "battery_current_ua", "battery_voltage_mv", "is_interactive", "is_device_idle", "hinge_angle_deg",
+            // schema 0.2.4 (CHANGELOG v0.2.4): processing slots (independent terminal counters) and capture-result cadence
+            "processing_slots_expected", "processing_slots_filled", "processing_slots_missed",
+            "capture_interval_ms_median", "capture_interval_ms_p95", "capture_interval_ms_max",
         )
         val desc = V0bRawRecord.serializer().descriptor
         assertEquals(expected, names(desc))
@@ -110,6 +113,11 @@ class SchemaBoundaryTest {
             val k = desc.getElementDescriptor(i).kind
             assertTrue(k is PrimitiveKind, "V0bRawRecord.${desc.getElementName(i)} must be a scalar, got $k")
         }
+    }
+
+    @Test
+    fun faceScheduleValuesOfSchema024() {
+        assertEquals(listOf("every_frame", "slot"), names(FaceSchedule.serializer().descriptor))
     }
 
     @Test
@@ -132,6 +140,9 @@ class SchemaBoundaryTest {
             // schema 0.2.3 capture preset (CHANGELOG v0.2.3)
             "capture_preset", "frame_process_divisor", "frame_gap_threshold_ms", "face_delegate", "face_blendshapes", "perf_hint_target_ms",
             "frame_long_gap_threshold_ms", "camera_id", "lens_facing", "hinge_sensor",
+            // schema 0.2.4 camera cadence / Face schedule / exact thresholds (CHANGELOG v0.2.4, directive E)
+            "camera_fps_request_lower", "camera_fps_request_upper", "camera_fps_ranges_supported", "face_schedule",
+            "face_process_period_ns", "frame_gap_threshold_ns", "frame_long_gap_threshold_ns",
         )
         assertEquals(expected, names(SessionHeader.serializer().descriptor))
         assertEquals("16:9", SessionHeader.aspectRatioOf("1280x720"))
@@ -142,7 +153,10 @@ class SchemaBoundaryTest {
     @Test
     fun intervalSessionEndAndTimebaseFields() {
         assertEquals(listOf("t_start_mono_ms", "t_end_mono_ms", "t_start_utc_ms", "t_end_utc_ms", "state", "reason"), names(IntervalRecord.serializer().descriptor))
-        assertEquals(listOf("t_mono_ms", "t_utc_ms", "reason"), names(SessionEnd.serializer().descriptor))
+        assertEquals(
+            listOf("t_mono_ms", "t_utc_ms", "reason", "capture_results_before_start", "capture_results_after_fence", "capture_results_after_close", "stop_integrity_failed"),
+            names(SessionEnd.serializer().descriptor),
+        )
         assertEquals(listOf("t_mono_ms", "camera_ts_source", "camera_to_mono_offset_ns", "imu_to_mono_offset_ns"), names(TimebaseRecord.serializer().descriptor))
     }
 

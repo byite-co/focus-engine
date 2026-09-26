@@ -20,6 +20,7 @@ import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
 import co.byite.focus.core.aggregate.AggregatedSecond
+import co.byite.focus.core.aggregate.CameraStamp
 import co.byite.focus.core.aggregate.CounterTotals
 import co.byite.focus.core.aggregate.DeviceSample
 import co.byite.focus.core.aggregate.FeatureAggregator
@@ -64,6 +65,10 @@ import java.util.concurrent.TimeUnit
  * - `focus-stop`: runs the [StopSequence] of a normal stop.
  * Every pipeline result is a scalar sample *posted* to `focus-aggregate`; nothing else calls the aggregator.
  *
+ * Timestamp domains (directive E 4장): every camera-origin message carries a [CameraStamp] (raw identity + mono
+ * position); the aggregator admits by the raw window `sessionStartRawTs ≤ raw < stopFenceRawTs`. At the stop fence the
+ * camera offset is frozen and `stopFenceRawTs = stopFenceMonoNs − offsetSnapshot`.
+ *
  * Intents: [ACTION_START] (+ [EXTRA_PRESET]), [ACTION_STOP], [ACTION_SET_MARKER] (+ [EXTRA_LABEL]).
  */
 class CaptureService : LifecycleService(), CameraPipeline.Listener {
@@ -101,8 +106,12 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
     private var startUtcMs = 0L
     private var lastTimebaseMs = 0L
     private var latestDevice: DeviceSample? = null
-    /** Capture results that arrived before the first frame fixed the session start. */
-    private val pendingRequested = ArrayList<Long>()
+    private var sessionStartRawNs = 0L
+    /** Camera-counter messages that reached the queue before the first frame started the aggregator (never expected: FIFO order). */
+    private var countersBeforeAggregator = 0L
+    /** Stop fence in both domains, set by stop step 1 on the main thread and read by the stop thread. */
+    @Volatile private var stopFenceRawNs: Long? = null
+    @Volatile private var stopOffsetSnapshotNs: Long? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -144,7 +153,9 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
         stopping = false
         records.clear()
         timebaseLines.clear()
-        pendingRequested.clear()
+        countersBeforeAggregator = 0L
+        stopFenceRawNs = null
+        stopOffsetSnapshotNs = null
         aggregator = null
         header = null
         latestDevice = null
@@ -253,52 +264,58 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
         aggHandler?.post { aggregator?.block() }
     }
 
-    override fun onSessionStart(captureMonoMs: Long, frameWidth: Int, frameHeight: Int) {
+    override fun onSessionStart(captureMonoMs: Long, rawSensorTs: Long, frameWidth: Int, frameHeight: Int) {
         val cam = camera ?: return
         val facts = cam.facts ?: return
         val tb = cam.timebase ?: return
-        aggHandler?.post { startAggregation(captureMonoMs, frameWidth, frameHeight, facts, tb) }
+        aggHandler?.post { startAggregation(captureMonoMs, rawSensorTs, frameWidth, frameHeight, facts, tb) }
     }
 
-    override fun onFrameRequested(captureMonoNs: Long) {
+    /** Camera counters: the scheduler replays pre-start capture results after `onSessionStart`, so the aggregator exists (FIFO); a miss is logged, never buffered. */
+    private inline fun toCounters(crossinline block: FeatureAggregator.() -> Unit) {
         aggHandler?.post {
             val agg = aggregator
             if (agg == null) {
-                if (pendingRequested.size < PENDING_REQUESTED_MAX) pendingRequested.add(captureMonoNs)
+                if (++countersBeforeAggregator <= 5) event("counter_before_aggregator dropped=$countersBeforeAggregator")
             } else {
-                agg.onFrameRequested(captureMonoNs)
+                agg.block()
             }
         }
     }
 
-    override fun onFrameReceived(captureMonoNs: Long) = toAggregator { onFrameReceived(captureMonoNs) }
-    override fun onFrameSkipped(captureMonoNs: Long) = toAggregator { onFrameSkipped(captureMonoNs) }
-    override fun onFaceInferenceError(captureMonoNs: Long) = toAggregator { onFaceInferenceError(captureMonoNs) }
-    override fun onPreFaceError(captureMonoNs: Long) = toAggregator { onPreFaceError(captureMonoNs) }
+    override fun onFrameRequested(stamp: CameraStamp) = toCounters { onFrameRequested(stamp) }
+    override fun onFrameReceived(stamp: CameraStamp) = toCounters { onFrameReceived(stamp) }
+    override fun onFrameSkipped(stamp: CameraStamp) = toCounters { onFrameSkipped(stamp) }
+    override fun onFaceInferenceError(stamp: CameraStamp) = toCounters { onFaceInferenceError(stamp) }
+    override fun onPreFaceError(stamp: CameraStamp) = toCounters { onPreFaceError(stamp) }
+    override fun onSlotExpected(stamp: CameraStamp) = toCounters { onSlotExpected(stamp) }
+    override fun onSlotFilled(stamp: CameraStamp) = toCounters { onSlotFilled(stamp) }
+    override fun onSlotMissed(stamp: CameraStamp) = toCounters { onSlotMissed(stamp) }
+    override fun onCaptureResultAfterClose(stamp: CameraStamp) = toCounters { onCaptureResultAfterClose(stamp) }
     override fun onFrameProcessed(frame: ProcessedFrame) = toAggregator { onFrameProcessed(frame) }
     override fun onScene(sample: SceneSample) = toAggregator { onScene(sample) }
-    override fun onPoseRequested(captureMonoNs: Long, copyMs: Double) = toAggregator { onPoseRequested(captureMonoNs, copyMs) }
-    override fun onPoseSuperseded(captureMonoNs: Long) = toAggregator { onPoseSuperseded(captureMonoNs) }
+    override fun onPoseRequested(stamp: CameraStamp, copyMs: Double) = toAggregator { onPoseRequested(stamp, copyMs) }
+    override fun onPoseSuperseded(stamp: CameraStamp) = toAggregator { onPoseSuperseded(stamp) }
     override fun onPose(sample: PoseSample) = toAggregator { onPose(sample) }
-    override fun onPoseError(captureMonoNs: Long) = toAggregator { onPoseError(captureMonoNs) }
+    override fun onPoseError(stamp: CameraStamp) = toAggregator { onPoseError(stamp) }
     override fun onEvent(message: String) = event(message)
 
     // ---- aggregation thread
 
-    /** The session starts at the first received frame's capture time: buckets align to it and bucket 0 always has a scene sample. */
-    private fun startAggregation(captureMonoMs: Long, frameWidth: Int, frameHeight: Int, facts: CameraFacts, tb: Timebase) {
+    /** The session starts at the first received frame: buckets align to its capture time, the raw window to its raw timestamp, and bucket 0 always has a scene sample. */
+    private fun startAggregation(captureMonoMs: Long, rawSensorTs: Long, frameWidth: Int, frameHeight: Int, facts: CameraFacts, tb: Timebase) {
         if (aggregator != null) return
         timebase = tb
         startMonoMs = captureMonoMs
+        sessionStartRawNs = rawSensorTs
         startUtcMs = System.currentTimeMillis() - (SystemClock.elapsedRealtime() - captureMonoMs)
         val agg = FeatureAggregator(
             startMonoMs, startUtcMs,
-            gapThresholdNs = facts.gapThresholdMs * FeatureAggregator.NS_PER_MS,
-            longGapThresholdNs = facts.longGapThresholdMs * FeatureAggregator.NS_PER_MS,
+            gapThresholdNs = facts.gapThresholdNs,
+            longGapThresholdNs = facts.longGapThresholdNs,
+            sessionStartRawNs = rawSensorTs,
         )
         aggregator = agg
-        for (t in pendingRequested) agg.onFrameRequested(t)
-        pendingRequested.clear()
         val h = SessionHeader(
             sessionId = files!!.sessionId,
             participantId = PARTICIPANT_ID,
@@ -325,6 +342,13 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
             cameraId = facts.cameraId,
             lensFacing = facts.lensFacing,
             hingeSensor = device.hingeSensor,
+            cameraFpsRequestLower = facts.fpsRequest?.lower,
+            cameraFpsRequestUpper = facts.fpsRequest?.upper,
+            cameraFpsRangesSupported = SessionHeader.fpsRangesLabel(facts.fpsRanges.map { it.lower to it.upper }),
+            faceSchedule = facts.faceSchedule,
+            faceProcessPeriodNs = facts.faceProcessPeriodNs,
+            frameGapThresholdNs = facts.gapThresholdNs,
+            frameLongGapThresholdNs = facts.longGapThresholdNs,
         )
         header = h
         logger?.writeHeader(h)
@@ -337,7 +361,7 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
         val mp = MotionPipeline(this, sh, tb) { s -> ag.post { aggregator?.onImu(s) } }
         motion = mp
         val imuOk = mp.start()
-        val hingeOk = device.startHingeMonitor(sh)
+        val hingeOk = device.startHingeMonitor(sh, prefs) { source, value -> event("hinge_initial source=$source value=${value ?: "unknown"} (2초 안에 이벤트 없으면 마지막 값, 그것도 없으면 미상)") }
         // First device sample through the status thread, so the first bucket close never has to read binder state here.
         runOn(sh, 1_000L) { runCatching { device.read() }.getOrNull()?.let { first -> ag.post { if (latestDevice == null) latestDevice = first } } }
         sh.post(statusTick)
@@ -345,6 +369,8 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
             "session_start id=${h.sessionId} t_start_mono_ms=$startMonoMs ${h.cameraResolution} (${h.cameraAspectRatio}) nominal_fps=${facts.nominalFps} preset=${h.capturePreset} " +
                 "divisor=${h.frameProcessDivisor} gap_threshold_ms=${h.frameGapThresholdMs} face=${h.faceDelegate} blendshapes=${h.faceBlendshapes} perf_hint_ms=${h.perfHintTargetMs} " +
                 "camera_id=${h.cameraId} lens=${h.lensFacing} hinge_sensor=${h.hingeSensor} hinge_listener=$hingeOk long_gap_threshold_ms=${h.frameLongGapThresholdMs} " +
+                "fps_request=${h.cameraFpsRequestLabel} fps_supported=${h.cameraFpsRangesSupported} face_schedule=${h.faceSchedule} face_period_ns=${h.faceProcessPeriodNs} " +
+                "gap_threshold_ns=${h.frameGapThresholdNs} long_gap_threshold_ns=${h.frameLongGapThresholdNs} session_start_raw_ns=$rawSensorTs " +
                 "ts_source=${tb.cameraSourceName} imu=$imuOk engine=${BuildConfig.GIT_SHA} battery_opt_ignored=${device.isIgnoringBatteryOptimizations()}",
         )
         scheduleTick()
@@ -414,7 +440,7 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
     private fun finishOnAggregationThread(fenceMonoMs: Long, reason: SessionEndReason): FinishOutcome {
         val agg = aggregator ?: return FinishOutcome(records.toList(), CounterTotals(), StopFinalizer.endAt(fenceMonoMs, startMonoMs, startUtcMs, reason))
         val before = records.size
-        val out = StopFinalizer.finish(agg, fenceMonoMs, startMonoMs, startUtcMs, currentDevice(), reason, records.toList())
+        val out = StopFinalizer.finish(agg, fenceMonoMs, startMonoMs, startUtcMs, currentDevice(), reason, records.toList(), fenceRawNs = stopFenceRawNs)
         val closed = out.records.subList(before, out.records.size)
         for (c in closed) {
             records.add(c)
@@ -428,7 +454,7 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
         val s = c.second
         val r = c.raw
         fun f(x: Double?, d: Int = 1) = Stats.fmt(x, d)
-        return "초 $n · 요청 ${s.framesRequested} 수신 ${s.framesAnalyzerReceived} 건너뜀 ${s.framesSkippedIntentional} 처리 ${s.framesProcessed} 반영 ${s.framesSampleApplied} 드롭 ${s.framesDropped} · 최대갭 ${s.maxFrameGapMs ?: "-"}ms 갭> ${s.gapsOverThreshold}\n" +
+        return "초 $n · 요청 ${s.framesRequested} 수신 ${s.framesAnalyzerReceived} 건너뜀 ${s.framesSkippedIntentional} 처리 ${s.framesProcessed} 반영 ${s.framesSampleApplied} 드롭 ${s.framesDropped} · 슬롯 ${r.processingSlotsFilled}/${r.processingSlotsExpected} miss ${r.processingSlotsMissed} · 최대갭 ${s.maxFrameGapMs ?: "-"}ms 갭> ${s.gapsOverThreshold}\n" +
             "face ${Stats.pct(s.faceDetectRatio, 0)} yaw ${f(s.yawMean)} pitch ${f(s.pitchMean)} roll ${f(s.rollMean)} · 폭 ${f(s.faceWidthPx, 0)}px j ${f(s.jitterJ, 4)}\n" +
             "face ${f(r.faceInferMsMean)}ms 사이클 ${f(r.frameTotalMsMean)}ms pose ${f(r.poseInferMsMean)}ms (요청 ${r.poseRequested} 반영 ${r.poseApplied} 교체 ${r.poseSuperseded} 늦음 ${r.poseLateDropped}) copy ${f(r.poseFrameCopyMsMean, 2)}ms\n" +
             "어깨 vis ${f(s.shoulderVisibilityMin, 2)} 머리 ${if (s.headLandmarkPresent) "Y" else "N"} off ${f(s.headOffsetBelowShoulderRatio, 2)} · 휘도 ${f(s.sceneLuma, 0)} · " +
@@ -463,17 +489,35 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
             stopInputs = {
                 var fence = 0L
                 runOn(mainHandler, 5_000L) {
+                    // directive E 5장: fence first (offset freeze, raw fence), then the producers stop
+                    val snapshot = camera?.timebase?.freezeCameraOffset() ?: 0L
+                    fence = SystemClock.elapsedRealtime()
+                    stopOffsetSnapshotNs = snapshot
+                    stopFenceRawNs = fence * FeatureAggregator.NS_PER_MS - snapshot
                     motion?.stop()
                     device.stopHingeMonitor()
                     camera?.unbind()
-                    fence = SystemClock.elapsedRealtime()
                 }
-                if (fence == 0L) fence = SystemClock.elapsedRealtime()
+                if (fence == 0L) {
+                    fence = SystemClock.elapsedRealtime()
+                    val snapshot = camera?.timebase?.freezeCameraOffset() ?: 0L
+                    stopOffsetSnapshotNs = snapshot
+                    stopFenceRawNs = fence * FeatureAggregator.NS_PER_MS - snapshot
+                }
                 fence
             },
-            raiseFence = { fence -> aggHandler?.post { aggregator?.stopInputs(fence) } },
+            raiseFence = { fence ->
+                val fenceRaw = stopFenceRawNs ?: (fence * FeatureAggregator.NS_PER_MS)
+                analysisHandler?.post { camera?.applyFence(fenceRaw) }
+                aggHandler?.post { aggregator?.stopInputs(fence, fenceRaw) }
+            },
             // On a timeout the in-flight frame is invalidated by its generation: its outcome is never posted nor counted.
             awaitAnalysisIdle = { timeout -> if (awaitIdle(analysisHandler, timeout)) 0L else (camera?.cancelAnalysis() ?: 0L) },
+            closeSlotScheduler = {
+                var closed = 0L
+                runOn(analysisHandler, 2_000L) { closed = camera?.closeScheduler() ?: 0L }
+                closed
+            },
             closePoseSlot = { camera?.closePoseSlot() },
             awaitPoseIdle = { timeout -> camera?.awaitPoseIdle(timeout) ?: 0L },
             drainAggregationQueue = { timeout -> awaitIdle(statusHandler, timeout) && awaitIdle(aggHandler, timeout) },
@@ -496,8 +540,9 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
         }
         if (result != null) {
             event(
-                "stop_sequence steps=${result.steps.joinToString(">")} fence=${result.fenceMonoMs} frames_cancelled=${result.framesCancelledAtStop} " +
-                    "pose_cancelled=${result.poseCancelledAtStop} drained=${result.queueDrained} mismatches=${result.mismatches.size}",
+                "stop_sequence steps=${result.steps.joinToString(">")} fence=${result.fenceMonoMs} fence_raw_ns=${stopFenceRawNs} offset_snapshot_ns=${stopOffsetSnapshotNs} " +
+                    "frames_cancelled=${result.framesCancelledAtStop} slots_closed_as_missed=${result.slotsClosedAsMissed} pose_cancelled=${result.poseCancelledAtStop} drained=${result.queueDrained} " +
+                    "mismatches=${result.mismatches.size} capture_after_close=${result.totals.captureResultsAfterClose} stop_integrity_failed=${result.stopIntegrityFailed}",
             )
         }
         runOn(analysisHandler, 10_000L) {
@@ -547,8 +592,10 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
         val notes = ArrayList<String>()
         if (agg.lateInputs > 0) notes.add("닫힌 버킷에 늦게 도착한 scene/IMU 표본 ${agg.lateInputs}건은 버렸다.")
         if (agg.nonMonotonicFrames > 0) notes.add("capture timestamp 가 역행한 처리 프레임 ${agg.nonMonotonicFrames}개.")
-        if (agg.inputsBeforeStart > 0) notes.add("세션 시작 전 timestamp 의 입력 ${agg.inputsBeforeStart}건은 계수에서 뺐다.")
-        if (agg.inputsAfterFence > 0) notes.add("정지 fence(${r.fenceMonoMs}) 이후 timestamp 의 입력 ${agg.inputsAfterFence}건은 계수에서 뺐다.")
+        if (agg.inputsBeforeStart > 0) notes.add("세션 시작 전 raw timestamp 의 입력 ${agg.inputsBeforeStart}건은 계수에서 뺐다 (CaptureResult ${r.totals.captureResultsBeforeStart}건).")
+        if (agg.inputsAfterFence > 0) notes.add("정지 fence(mono ${r.fenceMonoMs}, raw ${stopFenceRawNs}) 이후 raw timestamp 의 입력 ${agg.inputsAfterFence}건은 계수에서 뺐다 (CaptureResult ${r.totals.captureResultsAfterFence}건).")
+        if (r.slotsClosedAsMissed > 0) notes.add("scheduler CLOSE 때 미해결 슬롯 ${r.slotsClosedAsMissed}개를 missed 로 종결했다.")
+        if (r.stopIntegrityFailed) notes.add("CLOSE 뒤 CaptureResult ${r.totals.captureResultsAfterClose}건이 도착했다(stop_integrity_failed).")
         if (!r.queueDrained) notes.add("aggregation 큐 barrier 가 제한 시간 안에 돌아오지 않았다. 마지막 레코드가 불완전할 수 있다.")
         if (r.framesCancelledAtStop > 0) notes.add("정지 시 분석 스레드의 Face 작업 ${r.framesCancelledAtStop}건이 제한 시간 안에 끝나지 않아 취소로 셌다.")
         val stop = StopSummary(checked = true, mismatches = r.mismatches, framesCancelledAtStop = r.framesCancelledAtStop, poseCancelledAtStop = r.poseCancelledAtStop, totals = r.totals)
@@ -559,7 +606,9 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
             "session_stop reason=$reason records=${records.size} totals requested=${t.framesRequested} received=${t.framesAnalyzerReceived} skipped=${t.framesSkippedIntentional} " +
                 "processed=${t.framesProcessed} applied=${t.framesSampleApplied} sample_late=${t.framesSampleLateDropped} face_err=${t.faceInferenceErrors} pre_face_err=${t.preFaceErrors} " +
                 "pose requested=${t.poseRequested} superseded=${t.poseSuperseded} completed=${t.poseCompleted} applied=${t.poseApplied} late=${t.poseLateDropped} errors=${t.poseErrors} " +
-                "cancelled=${r.poseCancelledAtStop} before_start=${t.inputsBeforeStart} after_fence=${t.inputsAfterFence}",
+                "cancelled=${r.poseCancelledAtStop} before_start=${t.inputsBeforeStart} after_fence=${t.inputsAfterFence} " +
+                "slots expected=${t.processingSlotsExpected} filled=${t.processingSlotsFilled} missed=${t.processingSlotsMissed} " +
+                "capture_before_start=${t.captureResultsBeforeStart} capture_after_fence=${t.captureResultsAfterFence} capture_after_close=${t.captureResultsAfterClose}",
         )
         for (m in r.mismatches) event("counter_mismatch $m")
         files?.let { f ->
@@ -645,12 +694,14 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
             // session at the last record with session_end(PROCESS_DEATH_RECOVERED) (v0.2.1 판정 10) and the
             // recovered summary skips the counter check.
             stopping = true
+            val snapshot = camera?.timebase?.freezeCameraOffset() ?: 0L
+            val fence = SystemClock.elapsedRealtime()
+            val fenceRaw = fence * FeatureAggregator.NS_PER_MS - snapshot
             motion?.stop()
             device.stopHingeMonitor()
             camera?.unbind()
-            val fence = SystemClock.elapsedRealtime()
             runOn(aggHandler, 4_000L) {
-                aggregator?.stopInputs(fence)
+                aggregator?.stopInputs(fence, fenceRaw)
                 closeBuckets(fence, finishing = true)
                 event("service_destroyed fence=$fence records=${records.size}")
                 logger?.close()
@@ -724,7 +775,6 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
         const val PARTICIPANT_ID = "dev"
         /** header calibration_id / calibration_snapshot_version before V0-C (CHANGELOG v0.2.2 (a)). */
         const val NO_CALIBRATION = "none"
-        private const val PENDING_REQUESTED_MAX = 300
         private const val CHANNEL_ID = "focus-engine-capture"
         private const val NOTIFICATION_ID = 11
         private const val WAKE_LOCK_TIMEOUT_MS = 6L * 60 * 60 * 1000

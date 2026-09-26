@@ -1,9 +1,12 @@
 package co.byite.focus.core.report
 
 import co.byite.focus.core.aggregate.CounterTotals
+import co.byite.focus.core.aggregate.FeatureAggregator
 import co.byite.focus.core.log.SessionLog
+import co.byite.focus.core.model.FaceSchedule
 import co.byite.focus.core.model.FocusSchema
 import co.byite.focus.core.model.SecondRecord
+import co.byite.focus.core.model.SessionEnd
 import co.byite.focus.core.model.SessionHeader
 import co.byite.focus.core.model.V0bRawRecord
 import co.byite.focus.core.util.Stats
@@ -21,8 +24,17 @@ data class V0bOverall(
     /** Hinge-sensor line: "힌지 센서 감지: 펼침 100% …", "힌지 센서 없음(접힘 상태 미상)" or "-" for older logs. */
     val foldLine: String,
     val preset: String,
+    /** Rounded ms thresholds of the header (kept for older logs); [thresholds] carries the exact values. */
     val gapThresholdMs: Int,
     val longGapThresholdMs: Int,
+    /** Exact gap thresholds and whether they apply (not for a variable-cadence request). */
+    val thresholds: GapThresholdLine,
+    /** Requested / supported camera fps ranges and the measured cadence (directive E 1장). */
+    val cadence: CadenceStats,
+    /** Processing-slot counters summed over the records (schema 0.2.4). */
+    val slots: SlotCounts,
+    /** Capture-result diagnostics of the stop (live totals or the `session_end` line); nulls when unknown. */
+    val diagnostics: StopDiagnostics,
     val endReason: String,
     /** Session length in seconds: `session_end.t_mono_ms − header.t_start_mono_ms`, or up to the last record when there is no end line. */
     val sessionLengthS: Double,
@@ -55,8 +67,13 @@ data class V0bOverall(
     val screenOffSeconds: Int,
     val idleSeconds: Int,
     val timebaseLines: Int,
+    /** Lowest `battery_pct` seen; the summary warns below [V0bReport.BATTERY_WARN_PCT]. */
+    val batteryMinPct: Int? = null,
 ) {
     val missingSeconds: Long get() = missingRecords + zeroFrameRecords
+    /** Mean current in mA (|µA| ÷ 1000, sign as reported). */
+    val meanCurrentMa: Double? get() = meanCurrentUa?.let { it / 1000.0 }
+    val batteryLow: Boolean get() = batteryMinPct?.let { it < V0bReport.BATTERY_WARN_PCT } ?: false
     val framesRequested: Long get() = frames.requested
     val framesProcessed: Long get() = frames.processed
     val framesDropped: Long get() = frames.dropped
@@ -124,6 +141,88 @@ data class PoseCounts(
     }
 }
 
+/** Processing-slot counters (schema 0.2.4) summed over a set of seconds: three independent counters, the ratio derived from `missed` only. */
+data class SlotCounts(val expected: Long, val filled: Long, val missed: Long) {
+    /** `missed ÷ expected` (never `expected − filled`); null without expected slots. */
+    val missRatio: Double? get() = if (expected > 0) missed.toDouble() / expected else null
+
+    companion object {
+        val ZERO = SlotCounts(0, 0, 0)
+
+        fun of(raws: List<V0bRawRecord>): SlotCounts = SlotCounts(
+            expected = raws.sumOf { it.processingSlotsExpected.toLong() },
+            filled = raws.sumOf { it.processingSlotsFilled.toLong() },
+            missed = raws.sumOf { it.processingSlotsMissed.toLong() },
+        )
+
+        fun of(t: CounterTotals): SlotCounts = SlotCounts(t.processingSlotsExpected, t.processingSlotsFilled, t.processingSlotsMissed)
+    }
+}
+
+/**
+ * Capture-result cadence over a set of seconds: mean fps = Σ `frames_requested` ÷ seconds; the interval median is the
+ * median of the per-second medians, the p95 the nearest-rank p95 of the per-second p95 values, the max the max of the
+ * per-second max (per-second records carry no arrays, so this is the same convention as the stage timings).
+ */
+data class CadenceStats(
+    /** "[24,24]", "[7,15]" or "unset". */
+    val requestLabel: String,
+    /** True fixed, false variable, null when nothing was requested / older log. */
+    val requestFixed: Boolean?,
+    /** Requested cadence (the range's upper bound) when fixed. */
+    val requestedFps: Int?,
+    val rangesSupported: String?,
+    /** Σ frames_requested ÷ seconds. */
+    val measuredFps: Double?,
+    val intervalMedianMs: Double?,
+    val intervalP95Ms: Double?,
+    val intervalMaxMs: Double?,
+    /** Σ frames_analyzer_received ÷ seconds. */
+    val receivedFps: Double?,
+    /** Σ frames_processed ÷ seconds (Face processing fps). */
+    val processedFps: Double?,
+    /** Expected Face rate from the header's `face_process_period_ns`; null in older logs. */
+    val expectedFaceRateHz: Double?,
+) {
+    /** Relative difference of the measured cadence from a fixed request; null when not applicable. */
+    val deviation: Double? get() = if (requestFixed == true && requestedFps != null && requestedFps > 0 && measuredFps != null) (measuredFps - requestedFps) / requestedFps else null
+
+    /** "cadence 불일치": a fixed request whose measured cadence differs by more than 3 % (directive E 1장). Never for a variable range. */
+    val mismatch: Boolean? get() = deviation?.let { abs(it) > V0bReport.CADENCE_TOLERANCE }
+}
+
+/** Exact gap thresholds (ms) as the aggregator counted them, and whether the pass mark may use them. */
+data class GapThresholdLine(
+    val gapMs: Double,
+    val longGapMs: Double,
+    /** Expected processing interval (ms) the formula was applied to; null in older logs. */
+    val expectedIntervalMs: Double?,
+    /** False for a variable-cadence request (Hvar): shown as n/a, never judged. */
+    val applicable: Boolean,
+    /** True when the header carries the exact ns values (0.2.4); false when only the rounded ms fields exist. */
+    val exact: Boolean,
+) {
+    val gapLabel: String get() = if (!applicable) "n/a" else if (exact) "${Stats.fmt(gapMs, 1)}ms" else "${gapMs.toLong()}ms"
+    val longGapLabel: String get() = if (!applicable) "n/a" else if (exact) "${Stats.fmt(longGapMs, 1)}ms" else "${longGapMs.toLong()}ms"
+    /** Label of the threshold the counters were computed against, whether or not it is judged (diagnostic value for Hvar). */
+    val gapCountedLabel: String get() = if (exact) "${Stats.fmt(gapMs, 1)}ms" else "${gapMs.toLong()}ms"
+    val longGapCountedLabel: String get() = if (exact) "${Stats.fmt(longGapMs, 1)}ms" else "${longGapMs.toLong()}ms"
+}
+
+/** Capture-result diagnostics of the stop (directive E 2장); nulls when the log predates them or the stop was not normal. */
+data class StopDiagnostics(
+    val captureResultsBeforeStart: Long?,
+    val captureResultsAfterFence: Long?,
+    val captureResultsAfterClose: Long?,
+    val stopIntegrityFailed: Boolean?,
+) {
+    companion object {
+        val UNKNOWN = StopDiagnostics(null, null, null, null)
+        fun of(t: CounterTotals) = StopDiagnostics(t.captureResultsBeforeStart, t.captureResultsAfterFence, t.captureResultsAfterClose, t.stopIntegrityFailed)
+        fun of(end: SessionEnd?) = if (end == null) UNKNOWN else StopDiagnostics(end.captureResultsBeforeStart, end.captureResultsAfterFence, end.captureResultsAfterClose, end.stopIntegrityFailed)
+    }
+}
+
 /** Weighted mean, nearest-rank p95 of the per-second means, and max of the per-second max of one timed stage. */
 data class StageStat(val mean: Double?, val p95OfSecondMeans: Double?, val max: Double?) {
     companion object {
@@ -160,7 +259,20 @@ data class V0bRow(
     val meanCurrentUa: Double?,
     val meanPowerMw: Double?,
     val maxThermalStatus: Int?,
+    /** Processing slots of these seconds (schema 0.2.4). */
+    val slots: SlotCounts = SlotCounts.ZERO,
+    /** Σ frames_requested ÷ seconds (capture-result cadence). */
+    val requestedFps: Double? = null,
+    /** Σ frames_analyzer_received ÷ seconds. */
+    val receivedFps: Double? = null,
+    /** Capture-result interval statistics of these seconds (median of medians, p95 of p95, max of max; ms). */
+    val captureIntervalMedianMs: Double? = null,
+    val captureIntervalP95Ms: Double? = null,
+    val captureIntervalMaxMs: Double? = null,
+    /** Gaps over the fixed 80 ms (v0-plan V0-A), whatever the preset threshold. */
+    val gapsOver80Ms: Long = 0L,
 ) {
+    val meanCurrentMa: Double? get() = meanCurrentUa?.let { it / 1000.0 }
     val faceInferMsMean: Double? get() = faceInfer.mean
     val faceInferMsP95OfSecondMeans: Double? get() = faceInfer.p95OfSecondMeans
     val faceInferMsMax: Double? get() = faceInfer.max
@@ -174,28 +286,46 @@ data class V0bRow(
     val topGapCauses: List<Pair<String, Long>> get() = gapCauses.entries.filter { it.value > 0 }.sortedByDescending { it.value }.map { it.key to it.value }
 }
 
-/** Preset pass mark on the screen-off row (정정 1 3번, 정정 2 4번). [pass] is null when the off row is empty. */
+/**
+ * Preset pass mark on the screen-off row (정정 1 3번, 정정 2 4번; directive E 2장). [pass] is null when the off row is
+ * empty or when the request is a variable cadence (Hvar): then nothing is judged and only the distributions are
+ * reported. The "드롭" item is `slot_miss_ratio < 1 %` on fixed-cadence presets; the raw drop ratio stays a diagnostic
+ * beside it. A log without slot counters (schema ≤ 0.2.3) falls back to the raw drop ratio.
+ */
 data class V0bPass(
     val preset: String,
     val offSeconds: Int,
+    /** False for a variable-cadence request: no verdict. */
+    val judged: Boolean,
+    /** Expected Face rate × 23.5 / 24 (A 23.5, E·H12 11.75, E15·H15 14.69); `23.5 ÷ divisor` for older logs. */
     val fpsMin: Double,
     val processedFps: Double?,
     val gapRatio: Double?,
-    val dropRatio: Double?,
-    /** Gaps over the long threshold (200 ms; E 417 ms) on the off row; must be 0 (원래 지시문 D 1번). */
+    /** `missed ÷ expected` on the off row (the counted `missed`). */
+    val slotMissRatio: Double?,
+    val slotsExpected: Long,
+    /** `frames_dropped ÷ (requested − skipped)` on the off row: diagnostic beside the slot criterion, the criterion itself without slot counters. */
+    val rawDropRatio: Double?,
+    /** Gaps over the long threshold on the off row; must be 0 (원래 지시문 D 1번). */
     val longGaps: Long,
-    val longGapThresholdMs: Int,
+    val longGapThresholdLabel: String,
+    val offMeanCurrentMa: Double?,
     val offMeanPowerMw: Double?,
     val offMaxThermalStatus: Int?,
 ) {
-    val fpsOk: Boolean? get() = processedFps?.let { it >= fpsMin }
-    val gapOk: Boolean? get() = gapRatio?.let { it < GAP_RATIO_MAX } ?: if (offSeconds > 0) true else null
-    val dropOk: Boolean? get() = dropRatio?.let { it < DROP_RATIO_MAX }
-    val longGapOk: Boolean? get() = if (offSeconds == 0) null else longGaps == 0L
-    val pass: Boolean? get() = if (offSeconds == 0) null else (fpsOk == true && gapOk == true && dropOk == true && longGapOk == true)
+    /** The drop criterion actually applied: slot_miss_ratio when the log has slot counters, else the raw drop ratio. */
+    val dropRatioJudged: Double? get() = if (slotsExpected > 0) slotMissRatio else rawDropRatio
+    val dropCriterion: String get() = if (slotsExpected > 0) "slot_miss_ratio" else "raw 드롭"
+    val fpsOk: Boolean? get() = if (!judged) null else processedFps?.let { it >= fpsMin }
+    val gapOk: Boolean? get() = if (!judged) null else gapRatio?.let { it < GAP_RATIO_MAX } ?: if (offSeconds > 0) true else null
+    val dropOk: Boolean? get() = if (!judged) null else dropRatioJudged?.let { it < DROP_RATIO_MAX }
+    val longGapOk: Boolean? get() = if (!judged || offSeconds == 0) null else longGaps == 0L
+    val pass: Boolean? get() = if (!judged || offSeconds == 0) null else (fpsOk == true && gapOk == true && dropOk == true && longGapOk == true)
 
     companion object {
         const val FPS_MIN_EVERY_FRAME: Double = 23.5
+        /** fps pass line as a fraction of the expected rate: 23.5 / 24. */
+        const val FPS_MIN_FRACTION: Double = FPS_MIN_EVERY_FRAME / 24.0
         const val GAP_RATIO_MAX: Double = 0.01
         const val DROP_RATIO_MAX: Double = 0.01
     }
@@ -322,6 +452,13 @@ object V0bReport {
     const val COUNTER_CHECK_SKIPPED = "계수 검증 생략(비정상 종료)"
     const val COUNTER_MISMATCH_PREFIX = "계수 불일치: "
     const val COUNTER_OK = "계수 보존식: 이상 없음"
+    /** Directive E 1장: a fixed request whose measured cadence differs by more than this is "cadence 불일치". */
+    const val CADENCE_TOLERANCE: Double = 0.03
+    const val CADENCE_MISMATCH_PREFIX = "cadence 불일치: "
+    const val STOP_INTEGRITY_FAILED_PREFIX = "정상 종료 무결성 실패(stop_integrity_failed): "
+    const val NOT_COMPARABLE = "이 세션은 짝 비교에 쓰지 않는다."
+    const val BATTERY_WARN_PCT: Int = 20
+    const val BATTERY_WARNING_PREFIX = "경고: 배터리 20% 미만"
 
     private class Row(val s: SecondRecord, val r: V0bRawRecord?) {
         var warmup = false
@@ -344,7 +481,23 @@ object V0bReport {
         val raws = rows.mapNotNull { it.r }
         var batteryStart: Int? = null
         var batteryEnd: Int? = null
-        for (r in raws) r.batteryPct?.let { if (batteryStart == null) batteryStart = it; batteryEnd = it }
+        var batteryMin: Int? = null
+        for (r in raws) r.batteryPct?.let { if (batteryStart == null) batteryStart = it; batteryEnd = it; batteryMin = minOf(batteryMin ?: it, it) }
+        val thresholds = thresholdLine(h)
+        val cadence = CadenceStats(
+            requestLabel = h.cameraFpsRequestLabel,
+            requestFixed = h.cameraFpsRequestFixed,
+            requestedFps = if (h.cameraFpsRequestFixed == true) h.cameraFpsRequestUpper else null,
+            rangesSupported = h.cameraFpsRangesSupported,
+            measuredFps = all.requestedFps,
+            intervalMedianMs = all.captureIntervalMedianMs,
+            intervalP95Ms = all.captureIntervalP95Ms,
+            intervalMaxMs = all.captureIntervalMaxMs,
+            receivedFps = all.receivedFps,
+            processedFps = all.processedFps,
+            expectedFaceRateHz = h.expectedFaceRateHz,
+        )
+        val diagnostics = stop.totals?.let { StopDiagnostics.of(it) } ?: StopDiagnostics.of(end)
 
         val overall = V0bOverall(
             sessionId = h.sessionId,
@@ -356,6 +509,10 @@ object V0bReport {
             preset = presetLine(h),
             gapThresholdMs = h.frameGapThresholdMs,
             longGapThresholdMs = h.frameLongGapThresholdMs,
+            thresholds = thresholds,
+            cadence = cadence,
+            slots = all.slots,
+            diagnostics = diagnostics,
             endReason = end?.reason?.name ?: "없음 (session_end 줄 없음)",
             sessionLengthS = lengthMs / 1000.0,
             records = records.size,
@@ -381,6 +538,7 @@ object V0bReport {
             screenOffSeconds = raws.count { !it.isInteractive },
             idleSeconds = raws.count { it.isDeviceIdle },
             timebaseLines = log.timebase.size,
+            batteryMinPct = batteryMin,
         )
 
         val off = rowStats(ROW_OFF, rows.filter { !it.warmup && !it.transition && it.screenOn == false })
@@ -390,12 +548,16 @@ object V0bReport {
         val pass = V0bPass(
             preset = h.capturePreset ?: "(없음)",
             offSeconds = off.seconds,
-            fpsMin = V0bPass.FPS_MIN_EVERY_FRAME / h.frameProcessDivisor,
+            judged = thresholds.applicable,
+            fpsMin = h.expectedFaceRateHz?.let { it * V0bPass.FPS_MIN_FRACTION } ?: (V0bPass.FPS_MIN_EVERY_FRAME / h.frameProcessDivisor),
             processedFps = off.processedFps,
             gapRatio = off.gapRatio,
-            dropRatio = off.frames.dropRatio,
+            slotMissRatio = off.slots.missRatio,
+            slotsExpected = off.slots.expected,
+            rawDropRatio = off.frames.dropRatio,
             longGaps = off.gapsOverLongThreshold,
-            longGapThresholdMs = h.frameLongGapThresholdMs,
+            longGapThresholdLabel = thresholds.longGapLabel,
+            offMeanCurrentMa = off.meanCurrentMa,
             offMeanPowerMw = off.meanPowerMw,
             offMaxThermalStatus = off.maxThermalStatus,
         )
@@ -470,9 +632,13 @@ object V0bReport {
         val currents = ArrayList<Double>(); val powers = ArrayList<Double>()
         var thermal: Int? = null
         val causes = LongArray(V0bRawRecord.GAP_CAUSE_ORDER.size)
+        val intervalMedians = ArrayList<Double>(); val intervalP95s = ArrayList<Double>(); var intervalMax: Double? = null
         for (row in rows) {
             val s = row.s
             val r = row.r ?: continue
+            r.captureIntervalMsMedian?.let { intervalMedians.add(it) }
+            r.captureIntervalMsP95?.let { intervalP95s.add(it) }
+            r.captureIntervalMsMax?.let { intervalMax = maxOf(intervalMax ?: it, it) }
             face.add(r.faceInferMsMean, r.faceInferMsMax, s.framesProcessed)
             total.add(r.frameTotalMsMean, r.frameTotalMsMax, s.framesSampleApplied)
             wrap.add(r.stageWrapMsMean, r.stageWrapMsMax, s.framesSampleApplied)
@@ -516,6 +682,27 @@ object V0bReport {
             meanCurrentUa = Stats.meanOf(currents),
             meanPowerMw = Stats.meanOf(powers),
             maxThermalStatus = thermal,
+            slots = SlotCounts.of(raws),
+            requestedFps = if (secs.isNotEmpty()) frames.requested.toDouble() / secs.size else null,
+            receivedFps = if (secs.isNotEmpty()) frames.analyzerReceived.toDouble() / secs.size else null,
+            captureIntervalMedianMs = Stats.medianOf(intervalMedians),
+            captureIntervalP95Ms = Stats.percentileNearestRankOf(intervalP95s, 0.95),
+            captureIntervalMaxMs = intervalMax,
+            gapsOver80Ms = secs.sumOf { it.gapsOver80Ms.toLong() },
+        )
+    }
+
+    /** Exact thresholds from the ns header fields (0.2.4), else the rounded ms fields; not applicable for a variable cadence (Hvar). */
+    fun thresholdLine(h: SessionHeader): GapThresholdLine {
+        val gapNs = h.frameGapThresholdNs
+        val longNs = h.frameLongGapThresholdNs
+        val exact = gapNs != null && longNs != null
+        return GapThresholdLine(
+            gapMs = if (gapNs != null) gapNs.toDouble() / FeatureAggregator.NS_PER_MS else h.frameGapThresholdMs.toDouble(),
+            longGapMs = if (longNs != null) longNs.toDouble() / FeatureAggregator.NS_PER_MS else h.frameLongGapThresholdMs.toDouble(),
+            expectedIntervalMs = h.faceProcessPeriodNs?.let { it.toDouble() / FeatureAggregator.NS_PER_MS },
+            applicable = h.cameraFpsRequestFixed != false,
+            exact = exact,
         )
     }
 
@@ -643,8 +830,18 @@ object V0bReport {
         val parts = ArrayList<String>()
         parts.add("Face ${h.faceDelegate ?: "?"}")
         parts.add("blendshape ${when (h.faceBlendshapes) { true -> "on"; false -> "off"; null -> "?" }}")
-        parts.add(if (h.frameProcessDivisor == 1) "매 프레임" else "${h.frameProcessDivisor}프레임마다 1회")
-        parts.add("갭 임계 ${h.frameGapThresholdMs}ms")
+        val rate = h.expectedFaceRateHz
+        parts.add(
+            when {
+                h.faceSchedule == FaceSchedule.SLOT && rate != null -> "3장 슬롯 Face ${Stats.fmt(rate, 0)}Hz(주기 ${Stats.fmt(1000.0 / rate, 1)}ms)"
+                h.faceSchedule == FaceSchedule.EVERY_FRAME && rate != null -> "매 프레임(기대 ${Stats.fmt(rate, 0)}Hz)"
+                h.frameProcessDivisor == 1 -> "매 프레임"
+                else -> "${h.frameProcessDivisor}프레임마다 1회"
+            },
+        )
+        if (h.cameraFpsRequestLower != null) parts.add("카메라 ${h.cameraFpsRequestLabel}${if (h.cameraFpsRequestFixed == false) " 가변" else ""}")
+        val th = thresholdLine(h)
+        parts.add(if (th.applicable) "갭 임계 ${th.gapLabel}" else "갭 임계 n/a")
         h.perfHintTargetMs?.let { parts.add("perf hint ${it}ms") }
         return "${h.capturePreset ?: "(없음)"} (${parts.joinToString(", ")})"
     }
@@ -655,6 +852,10 @@ object V0bReport {
         fun deg(m: Double?, sd: Double?): String = "${f(m)}° ± ${f(sd)}°"
         fun ok(b: Boolean?): String = when (b) { true -> "OK"; false -> "미달"; null -> "-" }
         fun mA(ua: Double?): String = if (ua == null) "-" else f(ua / 1000.0, 0)
+        val cad = o.cadence
+        val th = o.thresholds
+        val dg = o.diagnostics
+        fun n(x: Long?): String = x?.toString() ?: "-"
         return buildString {
             if (!s.stop.checked) {
                 appendLine(COUNTER_CHECK_SKIPPED)
@@ -663,8 +864,21 @@ object V0bReport {
             } else {
                 for (m in s.stop.mismatches) appendLine(COUNTER_MISMATCH_PREFIX + m)
             }
-            appendLine("focus-engine V0-A/B 요약  세션 ${o.sessionId}  프리셋 ${o.preset}")
+            if (cad.mismatch == true) {
+                appendLine("${CADENCE_MISMATCH_PREFIX}요청 ${cad.requestLabel} 고정, CaptureResult 실측 ${f(cad.measuredFps, 2)}fps (${Stats.pct(cad.deviation, 1)} 차이, 허용 ±${Stats.pct(CADENCE_TOLERANCE, 0)}). $NOT_COMPARABLE")
+            }
+            if (dg.stopIntegrityFailed == true) {
+                appendLine("${STOP_INTEGRITY_FAILED_PREFIX}scheduler CLOSE 뒤 도착한 CaptureResult ${n(dg.captureResultsAfterClose)}건 (fence 전 프레임인데 expected 에 없다). $NOT_COMPARABLE")
+            }
+            if (o.batteryLow) appendLine("${BATTERY_WARNING_PREFIX} (최저 ${o.batteryMinPct}%; 실측 절차는 50% 이상 충전에서 시작한다)")
+            appendLine("프리셋 ${o.preset}  focus-engine V0-A/B 요약  세션 ${o.sessionId}")
             appendLine("기기: ${o.device}  엔진 ${o.algorithmVersion}  카메라 ${if (o.cameraIdLine.isNotEmpty()) o.cameraIdLine + " " else ""}${o.camera}(CameraX 실제 선택)  ${o.foldLine}")
+            appendLine(
+                "카메라 cadence: 요청 AE range ${cad.requestLabel}${when (cad.requestFixed) { true -> " (고정)"; false -> " (가변)"; null -> "" }}, 지원 ${cad.rangesSupported ?: "-"}; " +
+                    "CaptureResult 실측 ${f(cad.measuredFps, 2)}fps (간격 중앙값 ${f(cad.intervalMedianMs, 1)}ms, p95 ${f(cad.intervalP95Ms, 1)}ms, 최대 ${f(cad.intervalMaxMs, 1)}ms), " +
+                    "분석기 수신 ${f(cad.receivedFps, 2)}fps, Face 처리 ${f(cad.processedFps, 2)}fps${cad.expectedFaceRateHz?.let { " (기대 ${f(it, 2)}Hz)" } ?: ""}" +
+                    when (cad.mismatch) { true -> " · cadence 불일치"; false -> " · cadence 일치(±3%)"; null -> "" },
+            )
             appendLine("종료: ${o.endReason}, 세션 길이 ${f(o.sessionLengthS)}s, 초당 레코드 ${o.records}")
             val fr = o.frames
             appendLine(
@@ -675,7 +889,19 @@ object V0bReport {
                 "드롭 ${fr.dropped} = 백프레셔 ${fr.backpressureDrops} + 미처리(예상 밖) ${fr.unprocessedUnexpected} (Face 추론 오류 ${fr.faceInferenceErrors}, Face 이전 오류 ${fr.preFaceErrors}) " +
                     "+ Face 이후 실패 ${fr.postFaceFailed} + 표본 늦어 폐기 ${fr.sampleLateDropped}; 드롭 비율 ${Stats.pct(fr.dropRatio)} (÷ 요청−건너뜀 ${fr.targeted}), 처리 fps ${f(o.processedFps, 2)}",
             )
-            appendLine("갭 > ${o.gapThresholdMs}ms: ${o.gapsOverThreshold} (80ms 초과 ${o.gapsOver80Ms}), 갭 > ${o.longGapThresholdMs}ms: ${o.gapsOverLongThreshold}, 최대 갭 ${o.maxFrameGapMs?.let { "$it ms" } ?: "-"}")
+            val sl = o.slots
+            appendLine(
+                "처리 슬롯(전체): expected ${sl.expected}, filled ${sl.filled}, missed ${sl.missed}, slot_miss_ratio ${Stats.pct(sl.missRatio, 2)}" +
+                    (s.stop.totals?.let { t -> " (세션 총계 fence 까지: ${t.processingSlotsExpected}/${t.processingSlotsFilled}/${t.processingSlotsMissed})" } ?: "") +
+                    "; 진단 계수: capture_results_before_start ${n(dg.captureResultsBeforeStart)}, after_fence ${n(dg.captureResultsAfterFence)}, after_close ${n(dg.captureResultsAfterClose)}; " +
+                    "stop_integrity_failed: ${when (dg.stopIntegrityFailed) { true -> "예"; false -> "아니오"; null -> "-" }}",
+            )
+            appendLine(
+                "갭 임계: ${th.gapLabel} / 긴 갭 ${th.longGapLabel}" +
+                    (th.expectedIntervalMs?.let { " (기대 처리 간격 ${f(it, 1)}ms × 1.5 / 4.5)" } ?: "") +
+                    (if (!th.applicable) " — 가변 cadence: 합격 판정에 쓰지 않음; 기록된 gaps_over_threshold 는 상한 기준 ${th.gapCountedLabel}/${th.longGapCountedLabel} 진단값" else ""),
+            )
+            appendLine("갭 > ${th.gapCountedLabel}: ${o.gapsOverThreshold} (80ms 초과 ${o.gapsOver80Ms}), 갭 > ${th.longGapCountedLabel}: ${o.gapsOverLongThreshold}, 최대 갭 ${o.maxFrameGapMs?.let { "$it ms" } ?: "-"}")
             appendLine("누락된 초: ${o.missingSeconds} (레코드 없는 초 ${o.missingRecords} + 프레임 0인 초 ${o.zeroFrameRecords})")
             appendLine("Face 추론 ms: 평균 ${f(o.faceInferMsMean)}, p95 ${f(o.faceInferMsP95OfSecondMeans)} (초당 평균 기준), 최대 ${f(o.faceInferMsMax)}")
             val p = o.pose
@@ -684,41 +910,51 @@ object V0bReport {
                     "종료 시 취소 ${if (s.stop.checked) s.stop.poseCancelledAtStop.toString() else "-"}; 추론 ms 평균 ${f(o.poseInferMsMean)}, 최대 ${f(o.poseInferMsMax)}",
             )
             appendLine("최고 thermal status: ${o.maxThermalStatus?.let { "$it (${thermalName(it)})" } ?: "-"}")
-            appendLine("배터리: ${o.batteryStartPct ?: "?"}% → ${o.batteryEndPct ?: "?"}%, 평균 전류 ${f(o.meanCurrentUa, 0)} µA, 추정 평균 전력 ${f(o.meanPowerMw)} mW")
+            appendLine("배터리: ${o.batteryStartPct ?: "?"}% → ${o.batteryEndPct ?: "?"}%, 평균 전류 ${f(o.meanCurrentMa, 0)} mA (${f(o.meanCurrentUa, 0)} µA 원값), 추정 평균 전력 ${f(o.meanPowerMw)} mW")
             appendLine("화면 off 행 ${o.screenOffSeconds}, idle 행 ${o.idleSeconds}, timebase 줄 ${o.timebaseLines}")
 
             fun st(x: StageStat, d: Int = 1): String = "${f(x.mean, d)}/${f(x.p95OfSecondMeans, d)}/${f(x.max, d)}"
             appendLine("[비교 통계] 워밍업 ${WARMUP_MS / 1000}s 와 화면 상태 전환 뒤 ${TRANSITION_MS / 1000}s 는 on/off 행에서 제외; ms 는 평균/p95(초당 평균 기준)/최대")
-            appendLine("행 | 초 | fps | 드롭%(백프레셔/미처리/Face후/늦음) | 갭>${o.gapThresholdMs}ms %(수) | 갭>${o.longGapThresholdMs}ms | 최대 갭 | Face ms | 사이클 ms | mA | mW | thermal")
+            appendLine("행 | 초 | fps | slot miss%(missed/expected) | 드롭%(백프레셔/미처리/Face후/늦음) | 갭>${th.gapCountedLabel} %(수) | 갭>${th.longGapCountedLabel} | 최대 갭 | Face ms | 사이클 ms | mA | mW | thermal | 카메라 fps(간격 중앙값/p95/최대 ms)")
             for (r in s.rows) {
                 val rf = r.frames
                 appendLine(
-                    "${r.name} | ${r.seconds} | ${f(r.processedFps, 2)} | ${Stats.pct(rf.dropRatio)} (${rf.backpressureDrops}/${rf.unprocessedUnexpected}/${rf.postFaceFailed}/${rf.sampleLateDropped}) | " +
+                    "${r.name} | ${r.seconds} | ${f(r.processedFps, 2)} | ${Stats.pct(r.slots.missRatio, 2)} (${r.slots.missed}/${r.slots.expected}) | ${Stats.pct(rf.dropRatio)} (${rf.backpressureDrops}/${rf.unprocessedUnexpected}/${rf.postFaceFailed}/${rf.sampleLateDropped}) | " +
                         "${Stats.pct(r.gapRatio, 2)} (${r.gapsOverThreshold}) | ${r.gapsOverLongThreshold} | ${r.maxFrameGapMs?.let { "$it ms" } ?: "-"} | ${st(r.faceInfer)} | ${st(r.frameTotal)} | " +
-                        "${mA(r.meanCurrentUa)} | ${f(r.meanPowerMw, 0)} | ${r.maxThermalStatus ?: "-"}",
+                        "${mA(r.meanCurrentUa)} | ${f(r.meanPowerMw, 0)} | ${r.maxThermalStatus ?: "-"} | ${f(r.requestedFps, 2)} (${f(r.captureIntervalMedianMs, 1)}/${f(r.captureIntervalP95Ms, 1)}/${f(r.captureIntervalMaxMs, 1)})",
                 )
                 appendLine(
                     "    단계 ms: 변환·전처리 ${st(r.wrap, 2)}  face_post ${st(r.facePost, 2)}  scene ${st(r.scene, 2)}  큐 적재 ${st(r.enqueue, 3)}  Pose 복사 ${st(r.poseFrameCopy, 2)}  " +
                         "Pose 추론 ${st(r.poseInfer)} 대기 ${f(r.poseWaitMsMean)}",
                 )
                 val causes = r.topGapCauses
-                appendLine("    갭>${o.gapThresholdMs}ms 원인: " + if (causes.isEmpty()) "없음" else causes.joinToString(", ") { (k, v) -> "$k $v" })
+                appendLine("    갭>${th.gapCountedLabel} 원인: " + if (causes.isEmpty()) "없음" else causes.joinToString(", ") { (k, v) -> "$k $v" })
             }
             val ps = s.pass
-            val verdict = when (ps.pass) { true -> "합격"; false -> "불합격"; null -> "판정 불가(화면 off 행 없음)" }
-            appendLine(
-                "합격(프리셋 ${ps.preset}, 화면 off 행 기준): $verdict — fps ${f(ps.processedFps, 2)} ≥ ${f(ps.fpsMin, 2)} ${ok(ps.fpsOk)}, " +
-                    "갭 초과 ${Stats.pct(ps.gapRatio, 2)} < 1% ${ok(ps.gapOk)}, 드롭 ${Stats.pct(ps.dropRatio, 2)} < 1% ${ok(ps.dropOk)}, " +
-                    "${ps.longGapThresholdMs}ms 초과 갭 ${ps.longGaps} = 0 ${ok(ps.longGapOk)} · " +
-                    "화면 off 평균 전력 ${f(ps.offMeanPowerMw, 0)} mW, 최고 thermal ${ps.offMaxThermalStatus?.let { "$it (${thermalName(it)})" } ?: "-"}",
-            )
+            val offPower = "화면 off 평균 전류 ${f(ps.offMeanCurrentMa, 0)} mA, 전력 ${f(ps.offMeanPowerMw, 0)} mW, 최고 thermal ${ps.offMaxThermalStatus?.let { "$it (${thermalName(it)})" } ?: "-"}"
+            if (!ps.judged) {
+                val off = s.offRow
+                appendLine(
+                    "합격 판정 안 함(프리셋 ${ps.preset}, 가변 cadence ${cad.requestLabel}): 화면 off 행 처리 fps ${f(ps.processedFps, 2)}, slot_miss_ratio ${Stats.pct(ps.slotMissRatio, 2)} (${off.slots.missed}/${off.slots.expected}, 진단값), " +
+                        "raw 드롭 ${Stats.pct(ps.rawDropRatio, 2)}, CaptureResult ${f(off.requestedFps, 2)}fps 간격 중앙값/p95/최대 ${f(off.captureIntervalMedianMs, 1)}/${f(off.captureIntervalP95Ms, 1)}/${f(off.captureIntervalMaxMs, 1)}ms, " +
+                        "처리 프레임 최대 갭 ${off.maxFrameGapMs?.let { "$it ms" } ?: "-"}, 80ms 초과 ${off.gapsOver80Ms}, ${th.gapCountedLabel} 초과 ${off.gapsOverThreshold}, ${th.longGapCountedLabel} 초과 ${off.gapsOverLongThreshold} (진단값) · $offPower",
+                )
+            } else {
+                val verdict = when (ps.pass) { true -> "합격"; false -> "불합격"; null -> "판정 불가(화면 off 행 없음)" }
+                appendLine(
+                    "합격(프리셋 ${ps.preset}, 화면 off 행 기준): $verdict — fps ${f(ps.processedFps, 2)} ≥ ${f(ps.fpsMin, 2)} ${ok(ps.fpsOk)}, " +
+                        "갭 초과 ${Stats.pct(ps.gapRatio, 2)} < 1% ${ok(ps.gapOk)}, 드롭(${ps.dropCriterion}) ${Stats.pct(ps.dropRatioJudged, 2)} < 1% ${ok(ps.dropOk)}" +
+                        (if (ps.slotsExpected > 0) " (raw 드롭 ${Stats.pct(ps.rawDropRatio, 2)} 진단)" else "") + ", " +
+                        "긴 갭(${ps.longGapThresholdLabel} 초과) ${ps.longGaps} = 0 ${ok(ps.longGapOk)} · $offPower",
+                )
+            }
 
             appendLine("[화면 상태 구간] 시작s-끝s | 상태 | 초(제외) | Face ms 평균/p95 | 드롭% | mW")
             for (g in s.screenSegments) {
                 appendLine("${g.startS}-${g.endS} | ${if (g.screenOn) "on" else "off"} | ${g.seconds}(${g.excludedSeconds}) | ${f(g.faceInferMsMean)}/${f(g.faceInferMsP95OfSecondMeans)} | ${Stats.pct(g.dropRatio)} | ${f(g.meanPowerMw, 0)}")
             }
 
-            appendLine("[${s.trendWindowS}초 추이] t(s) | 초 | fps | face% | yaw/pitch/roll° | 드롭% | 갭>${o.gapThresholdMs}ms | Face ms | 사이클 ms | Pose ms | thermal | mA | 화면 on 초")
+            appendLine("[${s.trendWindowS}초 추이] t(s) | 초 | fps | face% | yaw/pitch/roll° | 드롭% | 갭>${th.gapCountedLabel} | Face ms | 사이클 ms | Pose ms | thermal | mA | 화면 on 초")
             for (t in s.trend) {
                 appendLine(
                     "${t.startS} | ${t.seconds} | ${f(t.processedFps, 1)} | ${Stats.pct(t.faceDetectRatio, 0)} | ${f(t.yawMean)}/${f(t.pitchMean)}/${f(t.rollMean)} | ${Stats.pct(t.dropRatio)} | ${t.gapsOverThreshold} | " +

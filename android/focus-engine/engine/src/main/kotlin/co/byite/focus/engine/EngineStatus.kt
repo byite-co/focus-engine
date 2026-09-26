@@ -58,6 +58,13 @@ class EnginePrefs(context: Context) {
         get() = p.getString(KEY_PRESET, null)
         set(v) = p.edit().putString(KEY_PRESET, v).apply()
 
+    /** Last hinge angle reported by the sensor, kept across sessions (directive E 6장); null when never seen. */
+    var lastHingeAngleDeg: Double?
+        get() = if (p.contains(KEY_HINGE)) p.getFloat(KEY_HINGE, 0f).toDouble() else null
+        set(v) {
+            if (v == null) p.edit().remove(KEY_HINGE).apply() else p.edit().putFloat(KEY_HINGE, v.toFloat()).apply()
+        }
+
     private companion object {
         const val KEY_SUMMARY = "last_summary"
         const val KEY_LOG = "last_log_path"
@@ -66,5 +73,6 @@ class EnginePrefs(context: Context) {
         const val KEY_RECOVERED_ID = "last_recovered_session_id"
         const val KEY_SELF_CHECK = "last_self_check"
         const val KEY_PRESET = "last_preset"
+        const val KEY_HINGE = "last_hinge_angle_deg"
     }
 }

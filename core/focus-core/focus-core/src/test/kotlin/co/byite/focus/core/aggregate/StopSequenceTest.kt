@@ -48,6 +48,7 @@ class StopSequenceTest {
         stopInputs = { h.order.add("stop"); t0 + 1500 },
         raiseFence = { fence -> h.order.add("fence"); h.queue.post { h.agg.stopInputs(fence) } },
         awaitAnalysisIdle = { _ -> h.order.add("analysis"); analysisInFlight?.invoke(); 0L },
+        closeSlotScheduler = { h.order.add("close_slots"); 0L },
         closePoseSlot = { h.order.add("slot") },
         awaitPoseIdle = { _ ->
             h.order.add("pose")
@@ -81,7 +82,7 @@ class StopSequenceTest {
         h.queue.post { h.agg.onPoseRequested(ns(t0 + 900), 1.0) }
         val poseResult = { h.queue.post { h.agg.onPose(PoseSample(ns(t0 + 900), 40.0, detected = false, frameWidthPx = 720, frameHeightPx = 1280)) } }
         val r = sequence(h, analysisInFlight = lastFrame, poseInFlight = poseResult, poseFinishesInTime = true, pendingPoseSlot = false).run()
-        assertEquals(listOf("stop", "fence", "analysis", "slot", "pose", "drain", "finish", "write"), h.order)
+        assertEquals(listOf("stop", "fence", "analysis", "close_slots", "slot", "pose", "drain", "finish", "write"), h.order)
         assertEquals(StopSequence.ORDER, r.steps)
         assertTrue(r.queueDrained)
         assertEquals(0L, r.framesCancelledAtStop)
@@ -94,6 +95,9 @@ class StopSequenceTest {
         assertEquals(1, r.records[0].raw.poseApplied)
         assertEquals(t0 + 1500, r.end.tMonoMs, "session_end is the fence")
         assertEquals(Synth.UTC0 + 1500, r.end.tUtcMs)
+        assertEquals(false, r.end.stopIntegrityFailed, "a clean stop: no capture result after CLOSE")
+        assertEquals(0L, r.end.captureResultsAfterClose)
+        assertFalse(r.stopIntegrityFailed)
         assertEquals(r, h.written)
     }
 
