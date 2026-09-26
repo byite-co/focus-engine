@@ -15,8 +15,19 @@ data class FinishOutcome(val records: List<AggregatedSecond>, val totals: Counte
  * logical end (directive E 5장). The end marker also carries the stop diagnostics of schema 0.2.4.
  */
 object StopFinalizer {
-    /** The end marker at the fence: `t_utc = t_start_utc + (fence − t_start_mono)`, plus the capture-result diagnostics when the totals are known. */
-    fun endAt(fenceMonoMs: Long, tStartMonoMs: Long, tStartUtcMs: Long, reason: SessionEndReason, totals: CounterTotals? = null): SessionEnd =
+    /**
+     * The end marker at the fence: `t_utc = t_start_utc + (fence − t_start_mono)`, plus the capture-result diagnostics
+     * when the totals are known and the [StopIntegrity] verdict from them and the two drain flags (unknown = null).
+     */
+    fun endAt(
+        fenceMonoMs: Long,
+        tStartMonoMs: Long,
+        tStartUtcMs: Long,
+        reason: SessionEndReason,
+        totals: CounterTotals? = null,
+        captureResultDrainComplete: Boolean? = null,
+        aggregationQueueDrained: Boolean? = null,
+    ): SessionEnd =
         SessionEnd(
             tMonoMs = fenceMonoMs,
             tUtcMs = tStartUtcMs + (fenceMonoMs - tStartMonoMs),
@@ -24,7 +35,10 @@ object StopFinalizer {
             captureResultsBeforeStart = totals?.captureResultsBeforeStart,
             captureResultsAfterFence = totals?.captureResultsAfterFence,
             captureResultsAfterClose = totals?.captureResultsAfterClose,
-            stopIntegrityFailed = totals?.stopIntegrityFailed,
+            captureResultsOutOfOrder = totals?.captureResultsOutOfOrder,
+            captureResultDrainComplete = captureResultDrainComplete,
+            aggregationQueueDrained = aggregationQueueDrained,
+            stopIntegrityFailed = if (totals == null) null else StopIntegrity.of(totals, captureResultDrainComplete, aggregationQueueDrained).failed,
         )
 
     fun finish(

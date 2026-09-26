@@ -2,14 +2,18 @@ package co.byite.focus.core.report
 
 import co.byite.focus.core.Synth
 import co.byite.focus.core.aggregate.CounterTotals
+import co.byite.focus.core.aggregate.StopIntegrity
 import co.byite.focus.core.log.JsonlCodec
 import co.byite.focus.core.log.SessionLog
+import co.byite.focus.core.model.FaceSchedule
 import co.byite.focus.core.model.SecondRecord
 import co.byite.focus.core.model.SessionEnd
 import co.byite.focus.core.model.SessionEndReason
+import co.byite.focus.core.model.SessionHeader
 import co.byite.focus.core.model.V0bRawRecord
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -47,6 +51,12 @@ class V0bReportTest {
         raw(4, null, face = 40.0, battery = 87, current = null, voltage = null),
     )
     private val log = SessionLog(Synth.header, records, sessionEnd = SessionEnd(Synth.mono(6), Synth.utc(6), SessionEndReason.USER), timebase = listOf(Synth.timebase(0)), v0bRaw = raws)
+
+    /** A 0.2.4 header with a fixed [24,24] request: the only kind that is judged (E2 1장). */
+    private val fixed24: SessionHeader = Synth.header.copy(cameraFpsRequestLower = 24, cameraFpsRequestUpper = 24, cameraFpsRangesSupported = "[24,24],[30,30]")
+
+    /** A normal stop with nothing wrong beyond what the log says. */
+    private val cleanStop = StopSummary(checked = true, captureResultDrainComplete = true, aggregationQueueDrained = true)
 
     @Test
     fun overallCountsFramesMissingSecondsAndInferenceTime() {
@@ -108,10 +118,11 @@ class V0bReportTest {
 
     @Test
     fun aShortSessionIsAllWarmupAndCannotBeJudged() {
-        val s = V0bReport.build(log)
+        val s = V0bReport.build(log.copy(header = fixed24))
         assertEquals(4, s.warmupRow.seconds)
         assertEquals(0, s.offRow.seconds)
         assertEquals(0, s.onRow.seconds)
+        assertTrue(s.pass.judged)
         assertNull(s.pass.pass)
         assertTrue("판정 불가" in s.render(), s.render())
     }
@@ -120,7 +131,14 @@ class V0bReportTest {
     fun renderIsDeterministicMentionsEverySegmentAndSaysWhenTheCounterCheckWasSkipped() {
         val text = V0bReport.build(log, notes = listOf("테스트 노트")).render()
         assertEquals(text, V0bReport.build(log, notes = listOf("테스트 노트")).render())
-        assertTrue(text.startsWith(V0bReport.COUNTER_CHECK_SKIPPED + "\n프리셋 (없음) (Face ?, blendshape ?, 매 프레임, 갭 임계 80ms)  focus-engine V0-A/B 요약  세션 S-synth"), text)
+        // a log that predates the fps request fields: not judged (E2 1장), so the thresholds read n/a and the first line says why
+        assertTrue(
+            text.startsWith(
+                "${V0bReport.NOT_COMPARABLE_PREFIX}${V0bReport.COUNTER_CHECK_SKIPPED}; ${V0bReport.REASON_FPS_NOT_RECORDED}\n${V0bReport.COUNTER_CHECK_SKIPPED}\n" +
+                    "프리셋 (없음) (Face ?, blendshape ?, 매 프레임, 갭 임계 n/a)  focus-engine V0-A/B 요약  세션 S-synth",
+            ),
+            text,
+        )
         assertTrue("[정면] 2s" in text && "[자리비움] 1s" in text && "[${V0bReport.NO_LABEL}] 1s" in text, text)
         assertTrue("누락된 초: 3 (레코드 없는 초 2 + 프레임 0인 초 1)" in text, text)
         assertTrue("카메라 640x480 (4:3) @ 24fps(CameraX 실제 선택)" in text, text)
@@ -128,12 +146,65 @@ class V0bReportTest {
     }
 
     @Test
-    fun counterCheckResultLeadsTheSummary() {
-        val ok = V0bReport.build(log, stop = StopSummary(checked = true, totals = CounterTotals())).render()
-        assertTrue(ok.startsWith(V0bReport.COUNTER_OK + "\n"), ok)
-        val bad = V0bReport.build(log, stop = StopSummary(checked = true, mismatches = listOf("pose_requested 3 ≠ …", "frames_analyzer_received 1 ≠ …"), poseCancelledAtStop = 1)).render()
-        assertTrue(bad.startsWith("계수 불일치: pose_requested 3 ≠ …\n계수 불일치: frames_analyzer_received 1 ≠ …\n프리셋 "), bad)
+    fun theCounterCheckResultFollowsTheStateLine() {
+        val ok = V0bReport.build(log.copy(header = fixed24), stop = StopSummary(checked = true, totals = CounterTotals(), captureResultDrainComplete = true, aggregationQueueDrained = true)).render()
+        assertTrue(ok.startsWith(V0bReport.COMPARABLE_LINE + "\n" + V0bReport.COUNTER_OK + "\n프리셋 "), ok)
+        val bad = V0bReport.build(log.copy(header = fixed24), stop = cleanStop.copy(mismatches = listOf("pose_requested 3 ≠ …", "frames_analyzer_received 1 ≠ …"), poseCancelledAtStop = 1)).render()
+        assertTrue(bad.startsWith("${V0bReport.NOT_COMPARABLE_PREFIX}${V0bReport.REASON_COUNTER_MISMATCH} 2건\n계수 불일치: pose_requested 3 ≠ …\n계수 불일치: frames_analyzer_received 1 ≠ …\n프리셋 "), bad)
         assertTrue("종료 시 취소 1" in bad, bad)
+    }
+
+    /** E2 3장: the first line is one of three states; every failing condition is named, and Hvar is the third state, never "비교 불가". */
+    @Test
+    fun theFirstLineIsOneOfThreeStatesAndNamesEveryFailingCondition() {
+        fun first(log: SessionLog, stop: StopSummary = cleanStop): String = V0bReport.build(log, stop = stop).render().lines()[0]
+        fun end(afterClose: Long? = 0, drain: Boolean? = true, queue: Boolean? = true, outOfOrder: Long? = 0, failed: Boolean? = (afterClose ?: 0) > 0 || drain == false || queue == false) =
+            SessionEnd(Synth.mono(130), Synth.utc(130), SessionEndReason.USER, 0, 0, afterClose, outOfOrder, drain, queue, failed)
+        val base = longLog.copy(sessionEnd = end())
+        assertEquals(V0bReport.COMPARABLE_LINE, first(base))
+        assertTrue(V0bReport.build(base, stop = cleanStop).comparability.comparable)
+        // counter consistency
+        assertEquals("${V0bReport.NOT_COMPARABLE_PREFIX}${V0bReport.REASON_COUNTER_MISMATCH} 1건", first(base, cleanStop.copy(mismatches = listOf("pose_requested 3 ≠ …"))))
+        assertEquals("${V0bReport.NOT_COMPARABLE_PREFIX}${V0bReport.COUNTER_CHECK_SKIPPED}", first(base, StopSummary.RECOVERED), "a recovered summary never checked the relations")
+        // each stop-integrity cause on its own, read from the session_end line
+        assertEquals("${V0bReport.NOT_COMPARABLE_PREFIX}${StopIntegrity.REASON_AFTER_CLOSE} 2건(stop_integrity_failed)", first(base.copy(sessionEnd = end(afterClose = 2))))
+        assertEquals("${V0bReport.NOT_COMPARABLE_PREFIX}${StopIntegrity.REASON_DRAIN}(stop_integrity_failed)", first(base.copy(sessionEnd = end(drain = false))))
+        assertEquals("${V0bReport.NOT_COMPARABLE_PREFIX}${StopIntegrity.REASON_QUEUE}(stop_integrity_failed)", first(base.copy(sessionEnd = end(queue = false))))
+        // a verdict without recorded causes (nothing in this repo writes one, but a hand-edited or future log might)
+        assertEquals("${V0bReport.NOT_COMPARABLE_PREFIX}${V0bReport.STOP_INTEGRITY_CAUSE_UNKNOWN}(stop_integrity_failed)", first(base.copy(sessionEnd = end(afterClose = null, drain = null, queue = null, failed = true))))
+        // the live flags fill in what the end line lacks
+        assertEquals("${V0bReport.NOT_COMPARABLE_PREFIX}${StopIntegrity.REASON_DRAIN}(stop_integrity_failed)", first(base.copy(sessionEnd = end(drain = null, failed = null)), cleanStop.copy(captureResultDrainComplete = false)))
+        // cadence: a fixed [24,24] request measured at 23 fps
+        val slow = base.copy(records = longRecords.map { it.copy(framesRequested = 23, framesAnalyzerReceived = 23, framesProcessed = 23, framesSampleApplied = 23, framesDropped = 0) })
+        assertEquals("${V0bReport.NOT_COMPARABLE_PREFIX}${V0bReport.REASON_CADENCE}(요청 [24,24], 실측 23.00fps)", first(slow))
+        // slot mode + out of order; every-frame mode with the same count stays comparable
+        val slotHeader = base.header.copy(capturePreset = "E15", faceSchedule = FaceSchedule.SLOT, faceProcessPeriodNs = 66_666_667L, frameGapThresholdNs = 100_000_000L, frameLongGapThresholdNs = 300_000_000L)
+        assertEquals("${V0bReport.NOT_COMPARABLE_PREFIX}${V0bReport.REASON_OUT_OF_ORDER} 3건", first(base.copy(header = slotHeader, sessionEnd = end(outOfOrder = 3))))
+        assertEquals(V0bReport.COMPARABLE_LINE, first(base.copy(header = base.header.copy(faceSchedule = FaceSchedule.EVERY_FRAME), sessionEnd = end(outOfOrder = 3))))
+        // fps unset (0.2.4, no request) vs an older log that recorded nothing
+        assertEquals("${V0bReport.NOT_COMPARABLE_PREFIX}${V0bReport.REASON_FPS_UNSET}", first(base.copy(header = base.header.copy(cameraFpsRequestLower = null, cameraFpsRequestUpper = null, cameraFpsRangesSupported = "[15,30]"))))
+        assertEquals("${V0bReport.NOT_COMPARABLE_PREFIX}${V0bReport.REASON_FPS_NOT_RECORDED}", first(base.copy(header = Synth.header.copy(capturePreset = "A"))))
+        // every failing condition at once, in a fixed order
+        val everything = V0bReport.build(
+            slow.copy(header = slotHeader, sessionEnd = end(afterClose = 1, drain = false, queue = false, outOfOrder = 2)),
+            stop = cleanStop.copy(mismatches = listOf("x", "y")),
+        ).comparability
+        assertEquals(ComparisonState.NOT_COMPARABLE, everything.state)
+        assertEquals(
+            listOf(
+                "${V0bReport.REASON_COUNTER_MISMATCH} 2건",
+                "${StopIntegrity.REASON_AFTER_CLOSE} 1건(stop_integrity_failed)", "${StopIntegrity.REASON_DRAIN}(stop_integrity_failed)", "${StopIntegrity.REASON_QUEUE}(stop_integrity_failed)",
+                "${V0bReport.REASON_CADENCE}(요청 [24,24], 실측 23.00fps)",
+                "${V0bReport.REASON_OUT_OF_ORDER} 2건",
+            ),
+            everything.reasons,
+        )
+        // Hvar: the third state, not an error — and a broken Hvar session still shows what is wrong
+        val hvar = base.copy(header = base.header.copy(capturePreset = "Hvar", cameraFpsRequestLower = 7, cameraFpsRequestUpper = 15, nominalFps = 15))
+        assertEquals(V0bReport.NOT_APPLICABLE_LINE, first(hvar))
+        assertEquals(ComparisonState.NOT_APPLICABLE, V0bReport.build(hvar, stop = cleanStop).comparability.state)
+        assertFalse(V0bReport.build(hvar, stop = cleanStop).comparability.comparable)
+        assertEquals("${V0bReport.NOT_APPLICABLE_LINE} · 이상: ${V0bReport.REASON_COUNTER_MISMATCH} 1건", first(hvar, cleanStop.copy(mismatches = listOf("x"))))
     }
 
     @Test
@@ -166,7 +237,7 @@ class V0bReportTest {
         )
     }
     private val longLog = SessionLog(
-        Synth.header.copy(capturePreset = "A", cameraResolution = "1280x720", cameraId = "1", lensFacing = "FRONT", hingeSensor = true),
+        fixed24.copy(capturePreset = "A", cameraResolution = "1280x720", cameraId = "1", lensFacing = "FRONT", hingeSensor = true),
         longRecords, sessionEnd = SessionEnd(Synth.mono(130), Synth.utc(130), SessionEndReason.USER), v0bRaw = longRaws,
     )
 
@@ -248,6 +319,12 @@ class V0bReportTest {
         assertEquals(false, f.pass.dropOk)
         assertEquals(false, f.pass.pass)
         assertTrue("불합격" in f.render())
+        // the same log without a recorded fixed request is not judged at all (E2 1장: only camera_fps_request_fixed == true is)
+        val unknown = V0bReport.build(longLog.copy(header = Synth.header.copy(capturePreset = "A")))
+        assertFalse(unknown.pass.judged)
+        assertNull(unknown.pass.pass)
+        assertEquals(V0bReport.REASON_FPS_NOT_RECORDED, unknown.pass.notJudgedReason)
+        assertTrue("합격 판정 안 함(프리셋 A, ${V0bReport.REASON_FPS_NOT_RECORDED})" in unknown.render(), unknown.render())
     }
 
     @Test

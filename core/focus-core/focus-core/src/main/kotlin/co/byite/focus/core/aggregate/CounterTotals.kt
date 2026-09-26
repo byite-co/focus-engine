@@ -16,9 +16,10 @@ package co.byite.focus.core.aggregate
  *   (schema 0.2.4); a bug that loses a slot breaks this relation because `missed` is never derived from the other two.
  *
  * Diagnostics outside every relation: capture results stamped before the session start, at or after the raw stop
- * fence, and after the scheduler's CLOSE. The last one must be 0 at a normal stop: such a capture result is a real
- * pre-fence frame that is absent from `expected`, so the relations can pass while the stop was not clean
- * (`stop_integrity_failed`, directive E 2·5장).
+ * fence, after the scheduler's CLOSE, and out of order. The after-CLOSE count must be 0 at a normal stop: such a
+ * capture result is a real pre-fence frame that is absent from `expected`, so the relations can pass while the stop
+ * was not clean. The stop-integrity verdict itself is [StopIntegrity] (after-CLOSE count, capture-result drain,
+ * aggregation-queue drain), not a property of the totals alone (directive E 2·5장, E2 2.2).
  */
 data class CounterTotals(
     val framesRequested: Long = 0,
@@ -49,6 +50,8 @@ data class CounterTotals(
     val captureResultsBeforeStart: Long = 0,
     val captureResultsAfterFence: Long = 0,
     val captureResultsAfterClose: Long = 0,
+    /** In-window capture results that trailed a newer evaluated timestamp (E2 2.3; a slot-mode session with any is not comparable). */
+    val captureResultsOutOfOrder: Long = 0,
 ) {
     val backpressureDrops: Long get() = framesRequested - framesAnalyzerReceived
     val framesSampleEnqueued: Long get() = framesSampleApplied + framesSampleLateDropped
@@ -57,9 +60,6 @@ data class CounterTotals(
 
     /** `missed ÷ expected` (the counted `missed`, never `expected − filled`); null without expected slots. */
     val slotMissRatio: Double? get() = if (processingSlotsExpected > 0) processingSlotsMissed.toDouble() / processingSlotsExpected else null
-
-    /** A capture result reached the scheduler after CLOSE: the stop was not clean (directive E 2장). */
-    val stopIntegrityFailed: Boolean get() = captureResultsAfterClose > 0
 }
 
 /**

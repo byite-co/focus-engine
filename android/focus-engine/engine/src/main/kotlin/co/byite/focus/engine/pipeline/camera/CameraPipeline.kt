@@ -66,25 +66,27 @@ data class CameraFacts(
     val presetId: String,
     /** "FRONT", "BACK" or "EXTERNAL" (`LENS_FACING`). */
     val lensFacing: String,
-    /** Cadence the thresholds were computed for: the requested range's upper bound (Hvar: 15), 30 when nothing was requested. */
+    /** Cadence the thresholds were computed for: the requested range's upper bound (Hvar: 15); [CadencePlan.NOMINAL_FPS_UNSET] (0) for fps unset. */
     val nominalFps: Int,
     val fpsSelected: String,
     val fpsAvailable: String,
     val timestampSource: String,
     val stabilization: String,
-    /** Rounded ms of the ns thresholds (legacy header fields). */
-    val gapThresholdMs: Int,
-    val longGapThresholdMs: Int,
+    /** Rounded ms of the ns thresholds (legacy header fields); null for fps unset (no expected interval at the start). */
+    val gapThresholdMs: Int?,
+    val longGapThresholdMs: Int?,
     val perfHint: String,
     /** Requested AE range, null when nothing was requested (HAL default). */
     val fpsRequest: FpsRange? = null,
     /** Every AE range the camera offers. */
     val fpsRanges: List<FpsRange> = emptyList(),
     val faceSchedule: FaceSchedule = FaceSchedule.EVERY_FRAME,
-    /** Expected interval between Face-processed frames (ns) and the formula thresholds (directive E 2장). */
-    val faceProcessPeriodNs: Long = 0L,
-    val gapThresholdNs: Long = 0L,
-    val longGapThresholdNs: Long = 0L,
+    /** Expected interval between Face-processed frames (ns) and the formula thresholds (directive E 2장); all null for an every-frame preset with fps unset (E2 1장). */
+    val faceProcessPeriodNs: Long? = null,
+    val gapThresholdNs: Long? = null,
+    val longGapThresholdNs: Long? = null,
+    /** No AE range could be requested (neither [24,24] nor [30,30]): no cadence is assumed, the session is not comparable. */
+    val fpsUnset: Boolean = false,
 )
 
 /**
@@ -255,16 +257,14 @@ class CameraPipeline(
             return false
         }
         val selected: Range<Int>? = request?.let { Range(it.lower, it.upper) }
-        // the cadence the thresholds are computed for: the requested upper bound (Hvar: 15), 30 for the HAL default
-        val nominalFps = request?.upper ?: 30
-        val processPeriodNs = preset.faceProcessPeriodNs(nominalFps)
-        val frameIntervalNs = GapThresholds.frameIntervalNs(nominalFps)
-        frameIntervalMs = (frameIntervalNs / 1_000_000L).coerceAtLeast(1L)
-        scheduler = FrameScheduler(listener, preset.slotPeriodNs(), frameIntervalNs)
+        // the cadence the thresholds are computed for: the requested upper bound (Hvar: 15); nothing is assumed for fps unset (E2 1장)
+        val plan = preset.cadencePlan(request, supportedRanges)
+        frameIntervalMs = (plan.slotToleranceIntervalNs / 1_000_000L).coerceAtLeast(1L)
+        scheduler = FrameScheduler(listener, preset.slotPeriodNs(), plan.slotToleranceIntervalNs)
         listener.onEvent(
-            "fps_request preset=${preset.id} wanted=${preset.cameraFps.label} selected=${request?.toString() ?: "unset"} nominal=$nominalFps " +
-                "face_schedule=${preset.faceSchedule.name.lowercase()} face_period_ns=$processPeriodNs frame_interval_ns=$frameIntervalNs " +
-                "gap_threshold_ns=${GapThresholds.gapThresholdNs(processPeriodNs)} long_gap_threshold_ns=${GapThresholds.longGapThresholdNs(processPeriodNs)} supported=${supportedRanges.joinToString(",")}",
+            "fps_request preset=${preset.id} wanted=${preset.cameraFps.label} selected=${request?.toString() ?: "unset"} nominal=${plan.nominalFps ?: "unset"} " +
+                "face_schedule=${preset.faceSchedule.name.lowercase()} face_period_ns=${plan.faceProcessPeriodNs} slot_tolerance_interval_ns=${plan.slotToleranceIntervalNs} " +
+                "gap_threshold_ns=${plan.gapThresholdNs} long_gap_threshold_ns=${plan.longGapThresholdNs} supported=${supportedRanges.joinToString(",")}",
         )
 
         val supported: List<FrameSize> = c2.getCameraCharacteristic(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
@@ -339,20 +339,21 @@ class CameraPipeline(
             requestedHeight = choice.size.height,
             presetId = choice.presetId,
             lensFacing = lensFacing,
-            nominalFps = nominalFps,
+            nominalFps = plan.nominalFpsForHeader,
             fpsSelected = request?.toString() ?: "unset(no [24,24] or [30,30])",
             fpsAvailable = supportedRanges.joinToString(prefix = "[", postfix = "]"),
             timestampSource = tb.cameraSourceName,
             stabilization = "video=OFF ois=${if (oisOff) "OFF" else "n/a"}",
-            gapThresholdMs = preset.gapThresholdMs(nominalFps),
-            longGapThresholdMs = preset.longGapThresholdMs(nominalFps),
+            gapThresholdMs = plan.gapThresholdMs,
+            longGapThresholdMs = plan.longGapThresholdMs,
             perfHint = if (hintSession != null) "target ${preset.perfHintTargetMs}ms" else "none",
             fpsRequest = request,
             fpsRanges = supportedRanges,
             faceSchedule = preset.faceSchedule,
-            faceProcessPeriodNs = processPeriodNs,
-            gapThresholdNs = GapThresholds.gapThresholdNs(processPeriodNs),
-            longGapThresholdNs = GapThresholds.longGapThresholdNs(processPeriodNs),
+            faceProcessPeriodNs = plan.faceProcessPeriodNs,
+            gapThresholdNs = plan.gapThresholdNs,
+            longGapThresholdNs = plan.longGapThresholdNs,
+            fpsUnset = plan.fpsUnset,
         )
         return true
     }

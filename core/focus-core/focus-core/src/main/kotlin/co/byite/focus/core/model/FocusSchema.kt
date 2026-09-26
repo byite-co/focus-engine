@@ -23,6 +23,12 @@ object FocusSchema {
      */
     const val RECORD_PERIOD_MS: Long = 1_000L
 
+    /**
+     * Warm-up: the first 60 s of a session. The summary's comparison rows exclude them (CHANGELOG v0.2.3 (b)), and a
+     * session without a fixed AE request learns its diagnostic expected interval from their capture-result intervals (E2 1장).
+     */
+    const val WARMUP_MS: Long = 60_000L
+
     /** Number of whole buckets a duration covers, rounding up (3000 ms → 3 buckets). */
     fun buckets(durationMs: Long): Int = ((durationMs + RECORD_PERIOD_MS - 1) / RECORD_PERIOD_MS).toInt()
 }

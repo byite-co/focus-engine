@@ -95,10 +95,58 @@ class StopSequenceTest {
         assertEquals(1, r.records[0].raw.poseApplied)
         assertEquals(t0 + 1500, r.end.tMonoMs, "session_end is the fence")
         assertEquals(Synth.UTC0 + 1500, r.end.tUtcMs)
-        assertEquals(false, r.end.stopIntegrityFailed, "a clean stop: no capture result after CLOSE")
+        assertEquals(false, r.end.stopIntegrityFailed, "a clean stop: no capture result after CLOSE, both drains complete")
         assertEquals(0L, r.end.captureResultsAfterClose)
+        assertEquals(0L, r.end.captureResultsOutOfOrder)
+        assertEquals(true, r.end.captureResultDrainComplete)
+        assertEquals(true, r.end.aggregationQueueDrained)
         assertFalse(r.stopIntegrityFailed)
+        assertEquals(emptyList(), r.stopIntegrity.reasons)
         assertEquals(r, h.written)
+    }
+
+    /** E2 2.2: an incomplete capture-result drain or aggregation-queue drain is a stop-integrity failure with its own recorded cause. */
+    private fun drainFailure(captureResultsDrained: Boolean, queueDrained: Boolean): StopResult {
+        val h = harness()
+        return StopSequence(
+            stopInputs = { t0 + 1500 },
+            raiseFence = { fence -> h.queue.post { h.agg.stopInputs(fence) } },
+            drainCaptureResults = { captureResultsDrained },
+            awaitAnalysisIdle = { 0L },
+            closePoseSlot = { },
+            awaitPoseIdle = { 0L },
+            drainAggregationQueue = { _ -> h.queue.drain(); queueDrained },
+            finish = { fence -> StopFinalizer.finish(h.agg, fence, t0, Synth.UTC0, device, SessionEndReason.USER) },
+            writeEnd = { },
+        ).run()
+    }
+
+    @Test
+    fun anIncompleteCaptureResultDrainIsAStopIntegrityFailureRecordedAsItsOwnCause() {
+        val r = drainFailure(captureResultsDrained = false, queueDrained = true)
+        assertFalse(r.captureResultDrainComplete)
+        assertTrue(r.queueDrained)
+        assertTrue(r.stopIntegrityFailed)
+        assertEquals(listOf(StopIntegrity.REASON_DRAIN), r.stopIntegrity.reasons)
+        assertEquals(false, r.end.captureResultDrainComplete)
+        assertEquals(true, r.end.aggregationQueueDrained)
+        assertEquals(0L, r.end.captureResultsAfterClose, "after_close stays 0: the cause is the drain, and the end line says so")
+        assertEquals(true, r.end.stopIntegrityFailed)
+        assertEquals(emptyList(), r.mismatches, "the conservation relations are a separate check")
+    }
+
+    @Test
+    fun anIncompleteAggregationQueueDrainIsAStopIntegrityFailureRecordedAsItsOwnCause() {
+        val r = drainFailure(captureResultsDrained = true, queueDrained = false)
+        assertTrue(r.captureResultDrainComplete)
+        assertFalse(r.queueDrained)
+        assertTrue(r.stopIntegrityFailed)
+        assertEquals(listOf(StopIntegrity.REASON_QUEUE), r.stopIntegrity.reasons)
+        assertEquals(true, r.end.captureResultDrainComplete)
+        assertEquals(false, r.end.aggregationQueueDrained)
+        assertEquals(true, r.end.stopIntegrityFailed)
+        val both = drainFailure(captureResultsDrained = false, queueDrained = false)
+        assertEquals(listOf(StopIntegrity.REASON_DRAIN, StopIntegrity.REASON_QUEUE), both.stopIntegrity.reasons, "each failed cause is listed, never one bool for all")
     }
 
     /**

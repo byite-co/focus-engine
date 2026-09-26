@@ -7,6 +7,7 @@ import co.byite.focus.core.model.SecondRecord
 import co.byite.focus.core.model.V0bRawRecord
 import co.byite.focus.core.model.ZoneStatus
 import co.byite.focus.core.util.Stats
+import kotlin.math.roundToLong
 import kotlin.math.sqrt
 
 /** One closed bucket: the schema-0.2.3 [SecondRecord] plus the paired [V0bRawRecord]. */
@@ -64,7 +65,10 @@ data class ProcessedFrame(
  * Processing slots (directive E 2장, schema 0.2.4): the [FrameScheduler] emits `expected` / `filled` / `missed` as
  * three independent terminal counters through [CameraCounterSink]; this class only counts them per bucket and in
  * the totals. Gap thresholds are the formula of [GapThresholds] applied to the preset's expected processing
- * interval, passed in as ns.
+ * interval, passed in as ns. A session without a fixed AE request and without a slot period ("fps unset", E2 1장)
+ * has no expected interval at the start: with [learnThresholdsFromWarmup] the diagnostic interval is the median of
+ * the per-second capture-interval medians of the warm-up (the first [FocusSchema.WARMUP_MS], learned when the last
+ * warm-up bucket closes); before that no gap is over any threshold, and the summary shows the thresholds as n/a.
  *
  * V0-B has no calibration and no gates, so the fields that depend on them are left empty:
  * `raw_state`, `final_state`, `invalid_reason`, `candidate_*`, `events`, `torso_*_ratio`,
@@ -90,6 +94,11 @@ class FeatureAggregator(
      * the default is the legacy `threshold ÷ 2` (40 ms at the 80 ms default) for callers that pass no threshold.
      */
     private val expectedIntervalNs: Long = gapThresholdNs / 2,
+    /**
+     * fps unset (E2 1장): ignore the three values above and learn the diagnostic expected interval from the warm-up
+     * ([learnedExpectedIntervalNs]); thresholds are the formula of that interval from the moment it is known.
+     */
+    val learnThresholdsFromWarmup: Boolean = false,
 ) : CameraCounterSink {
     init {
         require(closeDelayMs >= 0) { "closeDelayMs must not be negative" }
@@ -97,6 +106,25 @@ class FeatureAggregator(
         require(longGapThresholdNs >= gapThresholdNs) { "longGapThresholdNs must not be below gapThresholdNs" }
         require(expectedIntervalNs > 0) { "expectedIntervalNs must be positive" }
     }
+
+    // thresholds in force: the constructor values, or null until the warm-up median is learned (fps unset)
+    private var gapNs: Long? = if (learnThresholdsFromWarmup) null else gapThresholdNs
+    private var longGapNs: Long? = if (learnThresholdsFromWarmup) null else longGapThresholdNs
+    private var expectedNs: Long? = if (learnThresholdsFromWarmup) null else expectedIntervalNs
+    private val warmupIntervalMedians = ArrayList<Double>()
+
+    /** fps unset: the diagnostic expected interval learned at the close of the last warm-up bucket; null before that or without capture results. */
+    var learnedExpectedIntervalNs: Long? = null
+        private set
+
+    /** Gap threshold in force (ns), null while unknown (fps unset before the warm-up ends). */
+    val currentGapThresholdNs: Long? get() = gapNs
+
+    /** Long-gap threshold in force (ns), null while unknown. */
+    val currentLongGapThresholdNs: Long? get() = longGapNs
+
+    /** Expected processing interval in force (ns), null while unknown. */
+    val currentExpectedIntervalNs: Long? get() = expectedNs
 
     /** Stage times of the last processed frame, kept to name the cause of the next over-threshold gap. */
     private class PrevCycle(val faceInferMs: Double, val sample: FrameSample?)
@@ -195,6 +223,7 @@ class FeatureAggregator(
     private var tCaptureBeforeStart = 0L
     private var tCaptureAfterFence = 0L
     private var tCaptureAfterClose = 0L
+    private var tCaptureOutOfOrder = 0L
 
     /** Session-wide counters for the conservation check at a normal stop. */
     val totals: CounterTotals
@@ -207,6 +236,7 @@ class FeatureAggregator(
             otherLateInputs = tOtherLate, inputsBeforeStart = tBeforeStart, inputsAfterFence = tAfterFence,
             processingSlotsExpected = tSlotsExpected, processingSlotsFilled = tSlotsFilled, processingSlotsMissed = tSlotsMissed,
             captureResultsBeforeStart = tCaptureBeforeStart, captureResultsAfterFence = tCaptureAfterFence, captureResultsAfterClose = tCaptureAfterClose,
+            captureResultsOutOfOrder = tCaptureOutOfOrder,
         )
 
     /** Scene / IMU inputs that arrived after their bucket had been closed (dropped). */
@@ -315,6 +345,11 @@ class FeatureAggregator(
         tCaptureAfterClose++
     }
 
+    /** An in-window capture result that trailed a newer evaluated timestamp (diagnostic; E2 2.3). */
+    override fun onCaptureResultOutOfOrder(stamp: CameraStamp) {
+        tCaptureOutOfOrder++
+    }
+
     /**
      * Face inference succeeded on a frame. Counts `frames_processed` and the Face time, measures the gap to the
      * previous processed frame, and applies the scalars of [ProcessedFrame.sample] when its bucket is still open
@@ -335,11 +370,13 @@ class FeatureAggregator(
                 b.gapCount++
                 if (gap > b.maxGapNs) b.maxGapNs = gap
                 if (gap > GAP_80MS_NS) b.gapsOver80++
-                if (gap > gapThresholdNs) {
+                val gapT = gapNs
+                val longT = longGapNs
+                if (gapT != null && gap > gapT) {
                     b.gapsOverThreshold++
                     b.gapCauses[gapCause(prevCycle)]++
                 }
-                if (gap > longGapThresholdNs) b.gapsOverLong++
+                if (longT != null && gap > longT) b.gapsOverLong++
             }
         }
         if (frame.captureMonoNs > lastProcessedNs) {
@@ -380,7 +417,8 @@ class FeatureAggregator(
      */
     private fun gapCause(prev: PrevCycle?): Int {
         val sample = prev?.sample ?: return GAP_CAUSE_OTHER
-        val expectedIntervalMs = expectedIntervalNs.toDouble() / NS_PER_MS
+        val expected = expectedNs ?: return GAP_CAUSE_OTHER
+        val expectedIntervalMs = expected.toDouble() / NS_PER_MS
         if (sample.totalMs < expectedIntervalMs) return GAP_CAUSE_OTHER
         val stages = doubleArrayOf(sample.wrapMs, prev.faceInferMs + sample.facePostMs, sample.sceneMs ?: 0.0, sample.poseCopyMs ?: 0.0, sample.enqueueMs)
         var best = 0
@@ -516,6 +554,12 @@ class FeatureAggregator(
 
     private fun emit(k: Long, b: Bucket, device: DeviceSample): AggregatedSecond {
         val start = bucketStart(k)
+        val captureIntervals = b.captureIntervalsNs.map { it.toDouble() / NS_PER_MS }
+        val captureIntervalMedian = Stats.medianOf(captureIntervals)
+        if (learnThresholdsFromWarmup && learnedExpectedIntervalNs == null && k < WARMUP_BUCKETS) {
+            captureIntervalMedian?.let { warmupIntervalMedians.add(it) }
+            if (k == WARMUP_BUCKETS - 1) learnFromWarmup()
+        }
         val lastPose = b.poses.lastOrNull { it.hasShoulders }
         val headPresent = lastPose?.headLandmarkPresent ?: false
         val luma = if (b.scenes.isNotEmpty()) b.scenes.sumOf { it.lumaMean } / b.scenes.size else lastSceneLuma
@@ -565,7 +609,6 @@ class FeatureAggregator(
         )
         val poseInfer = b.poses.map { it.poseInferMs }
         val sceneMs = b.scenes.map { it.computeMs }
-        val captureIntervals = b.captureIntervalsNs.map { it.toDouble() / NS_PER_MS }
         val raw = V0bRawRecord(
             tMonoMs = start,
             segmentLabel = labelAt(start),
@@ -619,7 +662,7 @@ class FeatureAggregator(
             processingSlotsExpected = b.slotsExpected,
             processingSlotsFilled = b.slotsFilled,
             processingSlotsMissed = b.slotsMissed,
-            captureIntervalMsMedian = Stats.medianOf(captureIntervals),
+            captureIntervalMsMedian = captureIntervalMedian,
             captureIntervalMsP95 = Stats.percentileNearestRankOf(captureIntervals, 0.95),
             captureIntervalMsMax = captureIntervals.maxOrNull(),
             imuSamples = b.imuN,
@@ -651,6 +694,20 @@ class FeatureAggregator(
         return sqrt(dx * dx + dy * dy) / cur.shoulderWidthPx!!
     }
 
+    /**
+     * fps unset: the diagnostic expected interval = median of the per-second capture-interval medians of the warm-up
+     * buckets (the same statistic the summary's warm-up row shows), in force from the close of the last warm-up bucket.
+     * Nothing is learned when the warm-up had no capture results.
+     */
+    private fun learnFromWarmup() {
+        val medianMs = Stats.medianOf(warmupIntervalMedians) ?: return
+        val learned = (medianMs * NS_PER_MS).roundToLong().coerceAtLeast(1L)
+        learnedExpectedIntervalNs = learned
+        expectedNs = learned
+        gapNs = GapThresholds.gapThresholdNs(learned)
+        longGapNs = GapThresholds.longGapThresholdNs(learned)
+    }
+
     private fun variance(sum: Double, sumSq: Double, n: Int): Double {
         val mean = sum / n
         return (sumSq / n - mean * mean).coerceAtLeast(0.0)
@@ -679,12 +736,12 @@ class FeatureAggregator(
         return clampedBucketIndex(stamp.captureMonoNs)
     }
 
-    /** Mono position → bucket index, clamped to the first bucket and (once the fence is up) to the last partial bucket. */
+    /** Mono position → bucket index, clamped to the first bucket and (once the fence is up) to the last bucket the session holds ([lastPartialBucketIndex]). */
     private fun clampedBucketIndex(monoNs: Long): Long {
         var k = if (monoNs < startNs) 0L else (monoNs - startNs) / periodNs
         val fence = fenceNs
         if (fence != null) {
-            val lastPartial = (fence - startNs) / periodNs
+            val lastPartial = lastPartialBucketIndex(fence - startNs, periodNs)
             if (k > lastPartial) k = lastPartial
         }
         return k
@@ -742,6 +799,20 @@ class FeatureAggregator(
     companion object {
         const val DEFAULT_CLOSE_DELAY_MS: Long = 300L
         const val NS_PER_MS: Long = 1_000_000L
+
+        /** Warm-up buckets whose capture-interval medians teach the fps-unset diagnostic interval (the summary's warm-up row). */
+        const val WARMUP_BUCKETS: Long = FocusSchema.WARMUP_MS / FocusSchema.RECORD_PERIOD_MS
+
+        /**
+         * Index of the last bucket a fenced session can hold: the bucket of the last ns before the fence,
+         * `(fence − start − 1) ÷ period` (E2 2.1). A fence exactly on a bucket boundary therefore points at the bucket
+         * *before* it — the bucket that begins at the fence is never emitted, and an admitted pre-fence frame clamped
+         * there would vanish from the records while still counted as applied. `spanNs ≤ 0` (fence at the start) gives 0.
+         */
+        fun lastPartialBucketIndex(spanNs: Long, periodNs: Long = FocusSchema.RECORD_PERIOD_MS * NS_PER_MS): Long {
+            require(periodNs > 0) { "periodNs must be positive" }
+            return if (spanNs <= 0L) 0L else (spanNs - 1) / periodNs
+        }
 
         /** Threshold of `gaps_over_80ms` (v0-plan V0-A). */
         const val GAP_80MS_NS: Long = 80_000_000L

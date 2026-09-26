@@ -20,6 +20,10 @@ import kotlin.math.roundToLong
  * over the threshold.
  */
 object GapThresholds {
+    /** The two factors, for callers that display or scale in floating point; the ns arithmetic below is exact. */
+    const val GAP_FACTOR: Double = 1.5
+    const val LONG_GAP_FACTOR: Double = 4.5
+
     /** gap_threshold = expected interval × 3 / 2. */
     fun gapThresholdNs(processPeriodNs: Long): Long {
         require(processPeriodNs > 0) { "processPeriodNs must be positive" }

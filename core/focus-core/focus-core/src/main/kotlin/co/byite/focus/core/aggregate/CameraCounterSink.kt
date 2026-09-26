@@ -38,4 +38,11 @@ interface CameraCounterSink {
 
     /** A pre-fence capture result that reached the scheduler after its CLOSE (the CLOSE step of the stop order): `capture_results_after_close` +1; normal stops have none. */
     fun onCaptureResultAfterClose(stamp: CameraStamp)
+
+    /**
+     * An in-window capture result older than the newest timestamp already evaluated (it trailed a later frame or capture
+     * result): `capture_results_out_of_order` +1 (diagnostic, E2 2.3). In slot mode the rule has already passed it, so a
+     * session with any of these is not comparable.
+     */
+    fun onCaptureResultOutOfOrder(stamp: CameraStamp)
 }

@@ -2,6 +2,8 @@ package co.byite.focus.core.report
 
 import co.byite.focus.core.aggregate.CounterTotals
 import co.byite.focus.core.aggregate.FeatureAggregator
+import co.byite.focus.core.aggregate.GapThresholds
+import co.byite.focus.core.aggregate.StopIntegrity
 import co.byite.focus.core.log.SessionLog
 import co.byite.focus.core.model.FaceSchedule
 import co.byite.focus.core.model.FocusSchema
@@ -24,10 +26,10 @@ data class V0bOverall(
     /** Hinge-sensor line: "힌지 센서 감지: 펼침 100% …", "힌지 센서 없음(접힘 상태 미상)" or "-" for older logs. */
     val foldLine: String,
     val preset: String,
-    /** Rounded ms thresholds of the header (kept for older logs); [thresholds] carries the exact values. */
-    val gapThresholdMs: Int,
-    val longGapThresholdMs: Int,
-    /** Exact gap thresholds and whether they apply (not for a variable-cadence request). */
+    /** Rounded ms thresholds of the header (kept for older logs; null for fps unset); [thresholds] carries the exact values. */
+    val gapThresholdMs: Int?,
+    val longGapThresholdMs: Int?,
+    /** Exact gap thresholds and whether they apply (only for a fixed-cadence request). */
     val thresholds: GapThresholdLine,
     /** Requested / supported camera fps ranges and the measured cadence (directive E 1장). */
     val cadence: CadenceStats,
@@ -165,10 +167,14 @@ data class SlotCounts(val expected: Long, val filled: Long, val missed: Long) {
  * per-second max (per-second records carry no arrays, so this is the same convention as the stage timings).
  */
 data class CadenceStats(
-    /** "[24,24]", "[7,15]" or "unset". */
+    /** "[24,24]", "[7,15]", "fps unset(가변)" or "unset" (older log). */
     val requestLabel: String,
-    /** True fixed, false variable, null when nothing was requested / older log. */
+    /** True fixed, false variable, null when nothing was requested / older log. Only `true` is judged. */
     val requestFixed: Boolean?,
+    /** True for a 0.2.4 session that requested no AE range (neither [24,24] nor [30,30] offered): not comparable (E2 1장). */
+    val requestUnset: Boolean = false,
+    /** True for the 3장 slot schedule (E, E15): an out-of-order capture result then makes the session not comparable (E2 2.3). */
+    val slotMode: Boolean = false,
     /** Requested cadence (the range's upper bound) when fixed. */
     val requestedFps: Int?,
     val rangesSupported: String?,
@@ -191,36 +197,99 @@ data class CadenceStats(
     val mismatch: Boolean? get() = deviation?.let { abs(it) > V0bReport.CADENCE_TOLERANCE }
 }
 
-/** Exact gap thresholds (ms) as the aggregator counted them, and whether the pass mark may use them. */
+/**
+ * Gap thresholds (ms) as the aggregator counted them, and whether the pass mark may use them. [applicable] is true only
+ * for a fixed AE request (`camera_fps_request_fixed == true`, E2 1장): a variable range (Hvar) and an unset request are
+ * shown as n/a and never judged. For fps unset the values are the warm-up diagnostic (median capture-result interval of
+ * the first 60 s × 1.5 / 4.5, [learnedFromWarmup]); null when that warm-up did not complete.
+ */
 data class GapThresholdLine(
-    val gapMs: Double,
-    val longGapMs: Double,
-    /** Expected processing interval (ms) the formula was applied to; null in older logs. */
+    val gapMs: Double?,
+    val longGapMs: Double?,
+    /** Expected processing interval (ms) the formula was applied to; null in older logs or before the warm-up taught it. */
     val expectedIntervalMs: Double?,
-    /** False for a variable-cadence request (Hvar): shown as n/a, never judged. */
+    /** True only for a fixed-cadence request: the pass mark uses the thresholds. */
     val applicable: Boolean,
     /** True when the header carries the exact ns values (0.2.4); false when only the rounded ms fields exist. */
     val exact: Boolean,
+    /** fps unset: the values come from the warm-up capture intervals, not from the header. */
+    val learnedFromWarmup: Boolean = false,
 ) {
-    val gapLabel: String get() = if (!applicable) "n/a" else if (exact) "${Stats.fmt(gapMs, 1)}ms" else "${gapMs.toLong()}ms"
-    val longGapLabel: String get() = if (!applicable) "n/a" else if (exact) "${Stats.fmt(longGapMs, 1)}ms" else "${longGapMs.toLong()}ms"
-    /** Label of the threshold the counters were computed against, whether or not it is judged (diagnostic value for Hvar). */
-    val gapCountedLabel: String get() = if (exact) "${Stats.fmt(gapMs, 1)}ms" else "${gapMs.toLong()}ms"
-    val longGapCountedLabel: String get() = if (exact) "${Stats.fmt(longGapMs, 1)}ms" else "${longGapMs.toLong()}ms"
+    private fun ms(x: Double?): String = if (x == null) "-" else if (exact || learnedFromWarmup) "${Stats.fmt(x, 1)}ms" else "${x.toLong()}ms"
+    val gapLabel: String get() = if (!applicable) "n/a" else ms(gapMs)
+    val longGapLabel: String get() = if (!applicable) "n/a" else ms(longGapMs)
+    /** Label of the threshold the counters were computed against, whether or not it is judged (diagnostic value for Hvar / fps unset; "-" while unknown). */
+    val gapCountedLabel: String get() = ms(gapMs)
+    val longGapCountedLabel: String get() = ms(longGapMs)
 }
 
-/** Capture-result diagnostics of the stop (directive E 2장); nulls when the log predates them or the stop was not normal. */
+/**
+ * Capture-result diagnostics of the stop (directive E 2장, E2 2.2·2.3): the `session_end` line first, the live stop
+ * information where the line has none; nulls when the log predates them or the stop was not normal. The integrity
+ * verdict keeps its three causes apart ([integrity]); [integrityReasons] names the ones that failed.
+ */
 data class StopDiagnostics(
     val captureResultsBeforeStart: Long?,
     val captureResultsAfterFence: Long?,
     val captureResultsAfterClose: Long?,
+    val captureResultsOutOfOrder: Long?,
+    val captureResultDrainComplete: Boolean?,
+    val aggregationQueueDrained: Boolean?,
     val stopIntegrityFailed: Boolean?,
 ) {
+    val integrity: StopIntegrity get() = StopIntegrity(captureResultsAfterClose, captureResultDrainComplete, aggregationQueueDrained)
+
+    /** Each failed cause; a recorded verdict without recorded causes gives one generic reason. */
+    val integrityReasons: List<String>
+        get() = integrity.reasons.ifEmpty { if (stopIntegrityFailed == true) listOf(V0bReport.STOP_INTEGRITY_CAUSE_UNKNOWN) else emptyList() }
+
     companion object {
-        val UNKNOWN = StopDiagnostics(null, null, null, null)
-        fun of(t: CounterTotals) = StopDiagnostics(t.captureResultsBeforeStart, t.captureResultsAfterFence, t.captureResultsAfterClose, t.stopIntegrityFailed)
-        fun of(end: SessionEnd?) = if (end == null) UNKNOWN else StopDiagnostics(end.captureResultsBeforeStart, end.captureResultsAfterFence, end.captureResultsAfterClose, end.stopIntegrityFailed)
+        val UNKNOWN = StopDiagnostics(null, null, null, null, null, null, null)
+
+        fun of(end: SessionEnd?, stop: StopSummary = StopSummary.RECOVERED): StopDiagnostics {
+            val t = stop.totals
+            val afterClose = end?.captureResultsAfterClose ?: t?.captureResultsAfterClose
+            val drain = end?.captureResultDrainComplete ?: stop.captureResultDrainComplete
+            val queue = end?.aggregationQueueDrained ?: stop.aggregationQueueDrained
+            return StopDiagnostics(
+                captureResultsBeforeStart = end?.captureResultsBeforeStart ?: t?.captureResultsBeforeStart,
+                captureResultsAfterFence = end?.captureResultsAfterFence ?: t?.captureResultsAfterFence,
+                captureResultsAfterClose = afterClose,
+                captureResultsOutOfOrder = end?.captureResultsOutOfOrder ?: t?.captureResultsOutOfOrder,
+                captureResultDrainComplete = drain,
+                aggregationQueueDrained = queue,
+                stopIntegrityFailed = end?.stopIntegrityFailed ?: StopIntegrity(afterClose, drain, queue).failed,
+            )
+        }
     }
+}
+
+/** The three states of the summary's first line (E2 3장). */
+enum class ComparisonState {
+    /** Every condition holds: the session may enter a pair comparison (H12 ↔ E, H15 ↔ E15, A ↔ A …). */
+    COMPARABLE,
+    /** At least one condition fails; [Comparability.reasons] lists every failing one. */
+    NOT_COMPARABLE,
+    /** Hvar: a variable-cadence diagnostic session by design — not an error, no pair verdict. */
+    NOT_APPLICABLE,
+}
+
+/**
+ * Whether a session may enter a pair comparison (E2 3장):
+ * `comparable = counter_consistency_ok AND !stop_integrity_failed AND (cadence_ok OR cadence n/a) AND !(slot mode AND
+ * out_of_order > 0) AND fixed_ae_request_available`. Hvar is [ComparisonState.NOT_APPLICABLE] whatever else holds; any
+ * failing condition is still listed in [reasons] so a broken Hvar session is not silently clean.
+ */
+data class Comparability(val state: ComparisonState, val reasons: List<String>) {
+    val comparable: Boolean get() = state == ComparisonState.COMPARABLE
+
+    /** The summary's first line. */
+    val line: String
+        get() = when (state) {
+            ComparisonState.COMPARABLE -> V0bReport.COMPARABLE_LINE
+            ComparisonState.NOT_COMPARABLE -> V0bReport.NOT_COMPARABLE_PREFIX + reasons.joinToString("; ")
+            ComparisonState.NOT_APPLICABLE -> V0bReport.NOT_APPLICABLE_LINE + if (reasons.isEmpty()) "" else " · 이상: " + reasons.joinToString("; ")
+        }
 }
 
 /** Weighted mean, nearest-rank p95 of the per-second means, and max of the per-second max of one timed stage. */
@@ -295,8 +364,10 @@ data class V0bRow(
 data class V0bPass(
     val preset: String,
     val offSeconds: Int,
-    /** False for a variable-cadence request: no verdict. */
+    /** False unless the request was a fixed AE range: a variable range (Hvar) or no request (fps unset / older log) gets no verdict. */
     val judged: Boolean,
+    /** Why nothing is judged ("가변 cadence [7,15]", "fps unset(가변)", …); empty when [judged]. */
+    val notJudgedReason: String = "",
     /** Expected Face rate × 23.5 / 24 (A 23.5, E·H12 11.75, E15·H15 14.69); `23.5 ÷ divisor` for older logs. */
     val fpsMin: Double,
     val processedFps: Double?,
@@ -401,6 +472,9 @@ data class StopSummary(
     val framesCancelledAtStop: Long = 0,
     val poseCancelledAtStop: Long = 0,
     val totals: CounterTotals? = null,
+    /** The two drain flags of [StopIntegrity] from the live stop; the `session_end` line carries them too. */
+    val captureResultDrainComplete: Boolean? = null,
+    val aggregationQueueDrained: Boolean? = null,
 ) {
     companion object {
         val RECOVERED = StopSummary(checked = false)
@@ -418,6 +492,8 @@ data class V0bSummary(
     val segments: List<V0bSegment>,
     val notes: List<String>,
     val stop: StopSummary,
+    /** The first line of the summary (E2 3장). */
+    val comparability: Comparability,
 ) {
     fun render(): String = V0bReport.render(this)
     val offRow: V0bRow get() = rows.first { it.name == V0bReport.ROW_OFF }
@@ -439,8 +515,8 @@ object V0bReport {
     const val ROW_ON = "화면 on"
     const val ROW_WARMUP = "워밍업"
     const val ROW_TRANSITION = "전환"
-    /** 정정 2: comparison statistics exclude the first 60 s of the session. */
-    const val WARMUP_MS: Long = 60_000L
+    /** 정정 2: comparison statistics exclude the first 60 s of the session ([FocusSchema.WARMUP_MS]). */
+    const val WARMUP_MS: Long = FocusSchema.WARMUP_MS
     /** 정정 3: the first 5 s after a screen-state change are a transition, excluded from the on/off rows. */
     const val TRANSITION_MS: Long = 5_000L
     const val TREND_WINDOW_MS: Long = 10_000L
@@ -456,7 +532,18 @@ object V0bReport {
     const val CADENCE_TOLERANCE: Double = 0.03
     const val CADENCE_MISMATCH_PREFIX = "cadence 불일치: "
     const val STOP_INTEGRITY_FAILED_PREFIX = "정상 종료 무결성 실패(stop_integrity_failed): "
-    const val NOT_COMPARABLE = "이 세션은 짝 비교에 쓰지 않는다."
+    const val STOP_INTEGRITY_CAUSE_UNKNOWN = "원인 미기록"
+    const val OUT_OF_ORDER_PREFIX = "슬롯 모드 순서 역전 CaptureResult: "
+    const val FPS_UNSET_PREFIX = "fps unset(가변): "
+    // E2 3장: the three states of the first line
+    const val COMPARABLE_LINE = "비교 가능"
+    const val NOT_COMPARABLE_PREFIX = "비교 불가: "
+    const val NOT_APPLICABLE_LINE = "짝 비교 판정 비적용: Hvar 가변 cadence"
+    const val REASON_COUNTER_MISMATCH = "계수 불일치"
+    const val REASON_CADENCE = "cadence 불일치"
+    const val REASON_OUT_OF_ORDER = "슬롯 모드 순서 역전 CaptureResult"
+    const val REASON_FPS_UNSET = "fps unset(가변): 고정 AE range 요청 없음"
+    const val REASON_FPS_NOT_RECORDED = "카메라 fps 요청 기록 없음(schema < 0.2.4)"
     const val BATTERY_WARN_PCT: Int = 20
     const val BATTERY_WARNING_PREFIX = "경고: 배터리 20% 미만"
 
@@ -483,10 +570,17 @@ object V0bReport {
         var batteryEnd: Int? = null
         var batteryMin: Int? = null
         for (r in raws) r.batteryPct?.let { if (batteryStart == null) batteryStart = it; batteryEnd = it; batteryMin = minOf(batteryMin ?: it, it) }
-        val thresholds = thresholdLine(h)
+        val off = rowStats(ROW_OFF, rows.filter { !it.warmup && !it.transition && it.screenOn == false })
+        val on = rowStats(ROW_ON, rows.filter { !it.warmup && !it.transition && it.screenOn == true })
+        val warmup = rowStats(ROW_WARMUP, rows.filter { it.warmup })
+        val transition = rowStats(ROW_TRANSITION, rows.filter { !it.warmup && it.transition })
+        // fps unset: the diagnostic interval is the warm-up's capture-interval median, known only once the warm-up completed (the aggregator learns it at the same point)
+        val thresholds = thresholdLine(h, warmupIntervalMedianMs = if (lengthMs >= WARMUP_MS) warmup.captureIntervalMedianMs else null)
         val cadence = CadenceStats(
             requestLabel = h.cameraFpsRequestLabel,
             requestFixed = h.cameraFpsRequestFixed,
+            requestUnset = h.cameraFpsUnset,
+            slotMode = h.faceSchedule == FaceSchedule.SLOT,
             requestedFps = if (h.cameraFpsRequestFixed == true) h.cameraFpsRequestUpper else null,
             rangesSupported = h.cameraFpsRangesSupported,
             measuredFps = all.requestedFps,
@@ -497,7 +591,22 @@ object V0bReport {
             processedFps = all.processedFps,
             expectedFaceRateHz = h.expectedFaceRateHz,
         )
-        val diagnostics = stop.totals?.let { StopDiagnostics.of(it) } ?: StopDiagnostics.of(end)
+        val diagnostics = StopDiagnostics.of(end, stop)
+        val outOfOrder = diagnostics.captureResultsOutOfOrder ?: 0L
+        val reasons = ArrayList<String>()
+        if (!stop.checked) reasons.add(COUNTER_CHECK_SKIPPED) else if (stop.mismatches.isNotEmpty()) reasons.add("$REASON_COUNTER_MISMATCH ${stop.mismatches.size}건")
+        if (diagnostics.stopIntegrityFailed == true) for (r in diagnostics.integrityReasons) reasons.add("$r(stop_integrity_failed)")
+        if (cadence.mismatch == true) reasons.add("$REASON_CADENCE(요청 ${cadence.requestLabel}, 실측 ${Stats.fmt(cadence.measuredFps, 2)}fps)")
+        if (cadence.slotMode && outOfOrder > 0) reasons.add("$REASON_OUT_OF_ORDER ${outOfOrder}건")
+        if (h.cameraFpsRequestFixed == null) reasons.add(if (h.cameraFpsUnset) REASON_FPS_UNSET else REASON_FPS_NOT_RECORDED)
+        val comparability = Comparability(
+            state = when {
+                h.cameraFpsRequestFixed == false -> ComparisonState.NOT_APPLICABLE
+                reasons.isEmpty() -> ComparisonState.COMPARABLE
+                else -> ComparisonState.NOT_COMPARABLE
+            },
+            reasons = reasons,
+        )
 
         val overall = V0bOverall(
             sessionId = h.sessionId,
@@ -541,14 +650,16 @@ object V0bReport {
             batteryMinPct = batteryMin,
         )
 
-        val off = rowStats(ROW_OFF, rows.filter { !it.warmup && !it.transition && it.screenOn == false })
-        val on = rowStats(ROW_ON, rows.filter { !it.warmup && !it.transition && it.screenOn == true })
-        val warmup = rowStats(ROW_WARMUP, rows.filter { it.warmup })
-        val transition = rowStats(ROW_TRANSITION, rows.filter { !it.warmup && it.transition })
         val pass = V0bPass(
             preset = h.capturePreset ?: "(없음)",
             offSeconds = off.seconds,
             judged = thresholds.applicable,
+            notJudgedReason = when {
+                thresholds.applicable -> ""
+                h.cameraFpsRequestFixed == false -> "가변 cadence ${h.cameraFpsRequestLabel}"
+                h.cameraFpsUnset -> SessionHeader.FPS_UNSET_LABEL
+                else -> REASON_FPS_NOT_RECORDED
+            },
             fpsMin = h.expectedFaceRateHz?.let { it * V0bPass.FPS_MIN_FRACTION } ?: (V0bPass.FPS_MIN_EVERY_FRAME / h.frameProcessDivisor),
             processedFps = off.processedFps,
             gapRatio = off.gapRatio,
@@ -584,6 +695,7 @@ object V0bReport {
             segments = segments,
             notes = notes,
             stop = stop,
+            comparability = comparability,
         )
     }
 
@@ -692,16 +804,30 @@ object V0bReport {
         )
     }
 
-    /** Exact thresholds from the ns header fields (0.2.4), else the rounded ms fields; not applicable for a variable cadence (Hvar). */
-    fun thresholdLine(h: SessionHeader): GapThresholdLine {
+    /**
+     * Exact thresholds from the ns header fields (0.2.4), else the rounded ms fields; applicable only to a fixed AE request
+     * (E2 1장: null is not judged). A header without an expected interval (fps unset, every-frame preset) gets the warm-up
+     * diagnostic from [warmupIntervalMedianMs] (the warm-up row's capture-interval median once the warm-up completed).
+     */
+    fun thresholdLine(h: SessionHeader, warmupIntervalMedianMs: Double? = null): GapThresholdLine {
         val gapNs = h.frameGapThresholdNs
         val longNs = h.frameLongGapThresholdNs
         val exact = gapNs != null && longNs != null
+        if (h.cameraFpsUnset && h.faceProcessPeriodNs == null) {
+            return GapThresholdLine(
+                gapMs = warmupIntervalMedianMs?.let { it * GapThresholds.GAP_FACTOR },
+                longGapMs = warmupIntervalMedianMs?.let { it * GapThresholds.LONG_GAP_FACTOR },
+                expectedIntervalMs = warmupIntervalMedianMs,
+                applicable = false,
+                exact = false,
+                learnedFromWarmup = true,
+            )
+        }
         return GapThresholdLine(
-            gapMs = if (gapNs != null) gapNs.toDouble() / FeatureAggregator.NS_PER_MS else h.frameGapThresholdMs.toDouble(),
-            longGapMs = if (longNs != null) longNs.toDouble() / FeatureAggregator.NS_PER_MS else h.frameLongGapThresholdMs.toDouble(),
+            gapMs = if (gapNs != null) gapNs.toDouble() / FeatureAggregator.NS_PER_MS else h.frameGapThresholdMs?.toDouble(),
+            longGapMs = if (longNs != null) longNs.toDouble() / FeatureAggregator.NS_PER_MS else h.frameLongGapThresholdMs?.toDouble(),
             expectedIntervalMs = h.faceProcessPeriodNs?.let { it.toDouble() / FeatureAggregator.NS_PER_MS },
-            applicable = h.cameraFpsRequestFixed != false,
+            applicable = h.cameraFpsRequestFixed == true,
             exact = exact,
         )
     }
@@ -823,7 +949,7 @@ object V0bReport {
 
     fun cameraLine(h: SessionHeader): String {
         val ar = h.cameraAspectRatio?.let { " ($it)" } ?: ""
-        return "${h.cameraResolution}$ar @ ${h.nominalFps}fps"
+        return "${h.cameraResolution}$ar @ ${if (h.cameraFpsUnset) SessionHeader.FPS_UNSET_LABEL else "${h.nominalFps}fps"}"
     }
 
     fun presetLine(h: SessionHeader): String {
@@ -840,6 +966,7 @@ object V0bReport {
             },
         )
         if (h.cameraFpsRequestLower != null) parts.add("카메라 ${h.cameraFpsRequestLabel}${if (h.cameraFpsRequestFixed == false) " 가변" else ""}")
+        else if (h.cameraFpsUnset) parts.add("카메라 ${SessionHeader.FPS_UNSET_LABEL}")
         val th = thresholdLine(h)
         parts.add(if (th.applicable) "갭 임계 ${th.gapLabel}" else "갭 임계 n/a")
         h.perfHintTargetMs?.let { parts.add("perf hint ${it}ms") }
@@ -856,7 +983,10 @@ object V0bReport {
         val th = o.thresholds
         val dg = o.diagnostics
         fun n(x: Long?): String = x?.toString() ?: "-"
+        fun yn(b: Boolean?): String = when (b) { true -> "예"; false -> "아니오"; null -> "-" }
         return buildString {
+            // E2 3장: the first line is one of three states; the detail lines below name each condition
+            appendLine(s.comparability.line)
             if (!s.stop.checked) {
                 appendLine(COUNTER_CHECK_SKIPPED)
             } else if (s.stop.mismatches.isEmpty()) {
@@ -865,10 +995,24 @@ object V0bReport {
                 for (m in s.stop.mismatches) appendLine(COUNTER_MISMATCH_PREFIX + m)
             }
             if (cad.mismatch == true) {
-                appendLine("${CADENCE_MISMATCH_PREFIX}요청 ${cad.requestLabel} 고정, CaptureResult 실측 ${f(cad.measuredFps, 2)}fps (${Stats.pct(cad.deviation, 1)} 차이, 허용 ±${Stats.pct(CADENCE_TOLERANCE, 0)}). $NOT_COMPARABLE")
+                appendLine("${CADENCE_MISMATCH_PREFIX}요청 ${cad.requestLabel} 고정, CaptureResult 실측 ${f(cad.measuredFps, 2)}fps (${Stats.pct(cad.deviation, 1)} 차이, 허용 ±${Stats.pct(CADENCE_TOLERANCE, 0)})")
             }
             if (dg.stopIntegrityFailed == true) {
-                appendLine("${STOP_INTEGRITY_FAILED_PREFIX}scheduler CLOSE 뒤 도착한 CaptureResult ${n(dg.captureResultsAfterClose)}건 (fence 전 프레임인데 expected 에 없다). $NOT_COMPARABLE")
+                appendLine(STOP_INTEGRITY_FAILED_PREFIX + dg.integrityReasons.joinToString("; "))
+            }
+            if (cad.slotMode && (dg.captureResultsOutOfOrder ?: 0L) > 0L) {
+                appendLine("${OUT_OF_ORDER_PREFIX}${n(dg.captureResultsOutOfOrder)}건 — 슬롯 규칙이 이미 지나간 CaptureResult(손실은 갭으로만 드러난다)")
+            }
+            if (cad.requestUnset) {
+                appendLine(
+                    FPS_UNSET_PREFIX + "고정 AE range([24,24]/[30,30]) 없음, 기대 간격을 가정하지 않음; 슬롯·갭 합격 판정 없음. " +
+                        if (th.learnedFromWarmup) {
+                            th.expectedIntervalMs?.let { "진단용 기대 간격 = 워밍업 60초 CaptureResult 간격 중앙값 ${f(it, 1)}ms (갭 임계 진단값 ${th.gapCountedLabel} / ${th.longGapCountedLabel})" }
+                                ?: "워밍업 60초 미완료: 진단용 기대 간격 없음(gaps_over_threshold 는 세지 않았다)"
+                        } else {
+                            "기대 간격 = 슬롯 주기 ${f(th.expectedIntervalMs, 1)}ms (진단값)"
+                        },
+                )
             }
             if (o.batteryLow) appendLine("${BATTERY_WARNING_PREFIX} (최저 ${o.batteryMinPct}%; 실측 절차는 50% 이상 충전에서 시작한다)")
             appendLine("프리셋 ${o.preset}  focus-engine V0-A/B 요약  세션 ${o.sessionId}")
@@ -893,13 +1037,19 @@ object V0bReport {
             appendLine(
                 "처리 슬롯(전체): expected ${sl.expected}, filled ${sl.filled}, missed ${sl.missed}, slot_miss_ratio ${Stats.pct(sl.missRatio, 2)}" +
                     (s.stop.totals?.let { t -> " (세션 총계 fence 까지: ${t.processingSlotsExpected}/${t.processingSlotsFilled}/${t.processingSlotsMissed})" } ?: "") +
-                    "; 진단 계수: capture_results_before_start ${n(dg.captureResultsBeforeStart)}, after_fence ${n(dg.captureResultsAfterFence)}, after_close ${n(dg.captureResultsAfterClose)}; " +
-                    "stop_integrity_failed: ${when (dg.stopIntegrityFailed) { true -> "예"; false -> "아니오"; null -> "-" }}",
+                    "; 진단 계수: capture_results_before_start ${n(dg.captureResultsBeforeStart)}, after_fence ${n(dg.captureResultsAfterFence)}, after_close ${n(dg.captureResultsAfterClose)}, out_of_order ${n(dg.captureResultsOutOfOrder)}; " +
+                    "capture_result_drain_complete ${yn(dg.captureResultDrainComplete)}, aggregation_queue_drained ${yn(dg.aggregationQueueDrained)}; " +
+                    "stop_integrity_failed: ${yn(dg.stopIntegrityFailed)}",
             )
             appendLine(
                 "갭 임계: ${th.gapLabel} / 긴 갭 ${th.longGapLabel}" +
-                    (th.expectedIntervalMs?.let { " (기대 처리 간격 ${f(it, 1)}ms × 1.5 / 4.5)" } ?: "") +
-                    (if (!th.applicable) " — 가변 cadence: 합격 판정에 쓰지 않음; 기록된 gaps_over_threshold 는 상한 기준 ${th.gapCountedLabel}/${th.longGapCountedLabel} 진단값" else ""),
+                    (th.expectedIntervalMs?.let { " (기대 처리 간격 ${f(it, 1)}ms × 1.5 / 4.5${if (th.learnedFromWarmup) ", 워밍업 실측" else ""})" } ?: "") +
+                    when {
+                        th.applicable -> ""
+                        cad.requestFixed == false -> " — 가변 cadence: 합격 판정에 쓰지 않음; 기록된 gaps_over_threshold 는 상한 기준 ${th.gapCountedLabel}/${th.longGapCountedLabel} 진단값"
+                        cad.requestUnset -> " — ${SessionHeader.FPS_UNSET_LABEL}: 합격 판정에 쓰지 않음; 기록된 gaps_over_threshold 는 ${th.gapCountedLabel}/${th.longGapCountedLabel} 진단값"
+                        else -> " — 고정 AE range 요청이 기록되지 않은 로그: 합격 판정에 쓰지 않음"
+                    },
             )
             appendLine("갭 > ${th.gapCountedLabel}: ${o.gapsOverThreshold} (80ms 초과 ${o.gapsOver80Ms}), 갭 > ${th.longGapCountedLabel}: ${o.gapsOverLongThreshold}, 최대 갭 ${o.maxFrameGapMs?.let { "$it ms" } ?: "-"}")
             appendLine("누락된 초: ${o.missingSeconds} (레코드 없는 초 ${o.missingRecords} + 프레임 0인 초 ${o.zeroFrameRecords})")
@@ -935,7 +1085,7 @@ object V0bReport {
             if (!ps.judged) {
                 val off = s.offRow
                 appendLine(
-                    "합격 판정 안 함(프리셋 ${ps.preset}, 가변 cadence ${cad.requestLabel}): 화면 off 행 처리 fps ${f(ps.processedFps, 2)}, slot_miss_ratio ${Stats.pct(ps.slotMissRatio, 2)} (${off.slots.missed}/${off.slots.expected}, 진단값), " +
+                    "합격 판정 안 함(프리셋 ${ps.preset}, ${ps.notJudgedReason}): 화면 off 행 처리 fps ${f(ps.processedFps, 2)}, slot_miss_ratio ${Stats.pct(ps.slotMissRatio, 2)} (${off.slots.missed}/${off.slots.expected}, 진단값), " +
                         "raw 드롭 ${Stats.pct(ps.rawDropRatio, 2)}, CaptureResult ${f(off.requestedFps, 2)}fps 간격 중앙값/p95/최대 ${f(off.captureIntervalMedianMs, 1)}/${f(off.captureIntervalP95Ms, 1)}/${f(off.captureIntervalMaxMs, 1)}ms, " +
                         "처리 프레임 최대 갭 ${off.maxFrameGapMs?.let { "$it ms" } ?: "-"}, 80ms 초과 ${off.gapsOver80Ms}, ${th.gapCountedLabel} 초과 ${off.gapsOverThreshold}, ${th.longGapCountedLabel} 초과 ${off.gapsOverLongThreshold} (진단값) · $offPower",
                 )

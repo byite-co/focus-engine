@@ -24,6 +24,7 @@ import co.byite.focus.core.aggregate.CameraStamp
 import co.byite.focus.core.aggregate.CounterTotals
 import co.byite.focus.core.aggregate.DeviceSample
 import co.byite.focus.core.aggregate.FeatureAggregator
+import co.byite.focus.core.aggregate.GapThresholds
 import co.byite.focus.core.aggregate.FinishOutcome
 import co.byite.focus.core.aggregate.PoseSample
 import co.byite.focus.core.aggregate.ProcessedFrame
@@ -33,6 +34,7 @@ import co.byite.focus.core.aggregate.StopResult
 import co.byite.focus.core.aggregate.StopSequence
 import co.byite.focus.core.log.SessionLog
 import co.byite.focus.core.model.AppState
+import co.byite.focus.core.model.FaceSchedule
 import co.byite.focus.core.model.FocusSchema
 import co.byite.focus.core.model.ParameterSet
 import co.byite.focus.core.model.ScreenState
@@ -109,6 +111,8 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
     private var sessionStartRawNs = 0L
     /** Camera-counter messages that reached the queue before the first frame started the aggregator (never expected: FIFO order). */
     private var countersBeforeAggregator = 0L
+    /** fps unset: the learned diagnostic interval is logged once (aggregation thread). */
+    private var warmupIntervalLogged = false
     /** Stop fence in both domains, chosen exactly once by stop step 1 (main thread, or the stop thread on a timeout). */
     private val fenceLock = Any()
     @Volatile private var stopFenceMonoMs: Long? = null
@@ -295,6 +299,7 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
     override fun onSlotFilled(stamp: CameraStamp) = toCounters { onSlotFilled(stamp) }
     override fun onSlotMissed(stamp: CameraStamp) = toCounters { onSlotMissed(stamp) }
     override fun onCaptureResultAfterClose(stamp: CameraStamp) = toCounters { onCaptureResultAfterClose(stamp) }
+    override fun onCaptureResultOutOfOrder(stamp: CameraStamp) = toCounters { onCaptureResultOutOfOrder(stamp) }
     override fun onFrameProcessed(frame: ProcessedFrame) = toAggregator { onFrameProcessed(frame) }
     override fun onScene(sample: SceneSample) = toAggregator { onScene(sample) }
     override fun onPoseRequested(stamp: CameraStamp, copyMs: Double) = toAggregator { onPoseRequested(stamp, copyMs) }
@@ -313,13 +318,15 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
         startMonoMs = captureMonoMs
         sessionStartRawNs = rawSensorTs
         startUtcMs = System.currentTimeMillis() - (SystemClock.elapsedRealtime() - captureMonoMs)
-        val agg = FeatureAggregator(
-            startMonoMs, startUtcMs,
-            gapThresholdNs = facts.gapThresholdNs,
-            longGapThresholdNs = facts.longGapThresholdNs,
-            sessionStartRawNs = rawSensorTs,
-            expectedIntervalNs = facts.faceProcessPeriodNs,
-        )
+        val gapNs = facts.gapThresholdNs
+        val longGapNs = facts.longGapThresholdNs
+        val periodNs = facts.faceProcessPeriodNs
+        val agg = if (gapNs != null && longGapNs != null && periodNs != null) {
+            FeatureAggregator(startMonoMs, startUtcMs, gapThresholdNs = gapNs, longGapThresholdNs = longGapNs, sessionStartRawNs = rawSensorTs, expectedIntervalNs = periodNs)
+        } else {
+            // fps unset, every-frame preset (E2 1장): no expected interval is assumed; the diagnostic one is learned from the warm-up
+            FeatureAggregator(startMonoMs, startUtcMs, sessionStartRawNs = rawSensorTs, learnThresholdsFromWarmup = true)
+        }
         aggregator = agg
         val h = SessionHeader(
             sessionId = files!!.sessionId,
@@ -430,6 +437,12 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
             records.add(c)
             lg.append(c)
         }
+        if (agg.learnThresholdsFromWarmup && !warmupIntervalLogged) {
+            agg.learnedExpectedIntervalNs?.let { learned ->
+                warmupIntervalLogged = true
+                event("expected_interval_learned source=warmup_capture_interval_median ns=$learned gap_threshold_ns=${agg.currentGapThresholdNs} long_gap_threshold_ns=${agg.currentLongGapThresholdNs} (fps unset)")
+            }
+        }
         closed.lastOrNull()?.let { EngineStatus.line = statusLine(it, records.size) }
         if (!finishing && now - lastTimebaseMs >= TIMEBASE_PERIOD_MS) {
             lastTimebaseMs = now
@@ -525,15 +538,18 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
                 analysisHandler?.post { camera?.applyPendingFence() }
                 aggHandler?.post { aggregator?.stopInputs(fence, fenceRaw) }
             },
-            // Step 1 drain: the Camera2 capture results still in flight after unbind (camera CLOSED + quiet), then the analysis
-            // thread's queued work. On a timeout the in-flight frame is invalidated by its generation: its outcome is never posted nor counted.
-            awaitAnalysisIdle = { timeout ->
+            // Step 1 drain, part 1: the Camera2 capture results still in flight after unbind (camera CLOSED + quiet). Incomplete
+            // (a bound ran out) = `capture_result_drain_complete = false` = stop_integrity_failed (E2 2.2).
+            drainCaptureResults = {
                 camera?.let { cam ->
                     val (closed, quiet, elapsed) = cam.awaitCaptureResultsDrained(CAPTURE_DRAIN_CLOSED_TIMEOUT_MS, CAPTURE_DRAIN_QUIET_FRAMES, CAPTURE_DRAIN_QUIET_TIMEOUT_MS)
                     drainNote = "capture_result_drain closed=$closed quiet=$quiet elapsed_ms=$elapsed"
-                }
-                if (awaitIdle(analysisHandler, timeout)) 0L else (camera?.cancelAnalysis() ?: 0L)
+                    closed && quiet
+                } ?: true
             },
+            // Step 1 drain, part 2: the analysis thread's queued work. On a timeout the in-flight frame is invalidated by its
+            // generation: its outcome is never posted nor counted.
+            awaitAnalysisIdle = { timeout -> if (awaitIdle(analysisHandler, timeout)) 0L else (camera?.cancelAnalysis() ?: 0L) },
             closeSlotScheduler = {
                 var closed = 0L
                 runOn(analysisHandler, 2_000L) { closed = camera?.closeScheduler() ?: 0L }
@@ -562,8 +578,10 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
         if (result != null) {
             event(
                 "stop_sequence steps=${result.steps.joinToString(">")} fence=${result.fenceMonoMs} fence_raw_ns=${stopFenceRawNs} offset_snapshot_ns=${stopOffsetSnapshotNs} $drainNote " +
-                    "frames_cancelled=${result.framesCancelledAtStop} slots_closed_as_missed=${result.slotsClosedAsMissed} pose_cancelled=${result.poseCancelledAtStop} drained=${result.queueDrained} " +
-                    "mismatches=${result.mismatches.size} capture_after_close=${result.totals.captureResultsAfterClose} stop_integrity_failed=${result.stopIntegrityFailed}",
+                    "frames_cancelled=${result.framesCancelledAtStop} slots_closed_as_missed=${result.slotsClosedAsMissed} pose_cancelled=${result.poseCancelledAtStop} " +
+                    "capture_result_drain_complete=${result.captureResultDrainComplete} aggregation_queue_drained=${result.queueDrained} " +
+                    "mismatches=${result.mismatches.size} capture_after_close=${result.totals.captureResultsAfterClose} capture_out_of_order=${result.totals.captureResultsOutOfOrder} " +
+                    "stop_integrity_failed=${result.stopIntegrityFailed} integrity_reasons=${result.stopIntegrity.reasons.size}",
             )
         }
         runOn(analysisHandler, 10_000L) {
@@ -616,10 +634,26 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
         if (agg.inputsBeforeStart > 0) notes.add("세션 시작 전 raw timestamp 의 입력 ${agg.inputsBeforeStart}건은 계수에서 뺐다 (CaptureResult ${r.totals.captureResultsBeforeStart}건).")
         if (agg.inputsAfterFence > 0) notes.add("정지 fence(mono ${r.fenceMonoMs}, raw ${stopFenceRawNs}) 이후 raw timestamp 의 입력 ${agg.inputsAfterFence}건은 계수에서 뺐다 (CaptureResult ${r.totals.captureResultsAfterFence}건).")
         if (r.slotsClosedAsMissed > 0) notes.add("scheduler CLOSE 때 미해결 슬롯 ${r.slotsClosedAsMissed}개를 missed 로 종결했다.")
-        if (r.stopIntegrityFailed) notes.add("CLOSE 뒤 CaptureResult ${r.totals.captureResultsAfterClose}건이 도착했다(stop_integrity_failed).")
+        // E2 2.2: each stop-integrity cause on its own line (the session_end line carries the same three fields)
+        for (reason in r.stopIntegrity.reasons) notes.add("정상 종료 무결성 실패(stop_integrity_failed): $reason.")
+        if (!r.captureResultDrainComplete) notes.add("CaptureResult 콜백 drain 이 제한 시간 안에 끝나지 않았다(CameraX CLOSED ${CAPTURE_DRAIN_CLOSED_TIMEOUT_MS}ms / 무입력 ${CAPTURE_DRAIN_QUIET_FRAMES}프레임 ${CAPTURE_DRAIN_QUIET_TIMEOUT_MS}ms). CLOSE 뒤에 fence 전 CaptureResult 가 올 수 있었다.")
         if (!r.queueDrained) notes.add("aggregation 큐 barrier 가 제한 시간 안에 돌아오지 않았다. 마지막 레코드가 불완전할 수 있다.")
+        if (r.totals.captureResultsOutOfOrder > 0) notes.add("뒤 프레임보다 늦게 도착한 창 안 CaptureResult(순서 역전) ${r.totals.captureResultsOutOfOrder}건${if (h.faceSchedule == FaceSchedule.SLOT) " — 슬롯 구성에서는 짝 비교 제외" else ""}.")
         if (r.framesCancelledAtStop > 0) notes.add("정지 시 분석 스레드의 Face 작업 ${r.framesCancelledAtStop}건이 제한 시간 안에 끝나지 않아 취소로 셌다.")
-        val stop = StopSummary(checked = true, mismatches = r.mismatches, framesCancelledAtStop = r.framesCancelledAtStop, poseCancelledAtStop = r.poseCancelledAtStop, totals = r.totals)
+        if (agg.learnThresholdsFromWarmup) {
+            val learned = agg.learnedExpectedIntervalNs
+            notes.add(
+                if (learned != null) {
+                    "fps 요청 없음(fps unset): 진단용 기대 간격 = 워밍업 60초 CaptureResult 간격 중앙값 ${learned / 1e6}ms, 갭 임계 진단값 ${GapThresholds.gapThresholdNs(learned) / 1e6}/${GapThresholds.longGapThresholdNs(learned) / 1e6}ms (워밍업 뒤 초부터 적용)."
+                } else {
+                    "fps 요청 없음(fps unset): 워밍업 60초가 끝나기 전에 세션이 끝나 진단용 기대 간격이 없다(gaps_over_threshold 는 세지 않았다)."
+                },
+            )
+        }
+        val stop = StopSummary(
+            checked = true, mismatches = r.mismatches, framesCancelledAtStop = r.framesCancelledAtStop, poseCancelledAtStop = r.poseCancelledAtStop, totals = r.totals,
+            captureResultDrainComplete = r.captureResultDrainComplete, aggregationQueueDrained = r.queueDrained,
+        )
         val log = SessionLog(h, records.map { it.second }, sessionEnd = end, timebase = timebaseLines.toList(), v0bRaw = records.map { it.raw })
         val summary = selfCheck + "\n" + V0bReport.build(log, notes, stop).render()
         val t = r.totals
@@ -629,7 +663,8 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
                 "pose requested=${t.poseRequested} superseded=${t.poseSuperseded} completed=${t.poseCompleted} applied=${t.poseApplied} late=${t.poseLateDropped} errors=${t.poseErrors} " +
                 "cancelled=${r.poseCancelledAtStop} before_start=${t.inputsBeforeStart} after_fence=${t.inputsAfterFence} " +
                 "slots expected=${t.processingSlotsExpected} filled=${t.processingSlotsFilled} missed=${t.processingSlotsMissed} " +
-                "capture_before_start=${t.captureResultsBeforeStart} capture_after_fence=${t.captureResultsAfterFence} capture_after_close=${t.captureResultsAfterClose}",
+                "capture_before_start=${t.captureResultsBeforeStart} capture_after_fence=${t.captureResultsAfterFence} capture_after_close=${t.captureResultsAfterClose} capture_out_of_order=${t.captureResultsOutOfOrder} " +
+                "capture_result_drain_complete=${r.captureResultDrainComplete} aggregation_queue_drained=${r.queueDrained} stop_integrity_failed=${r.stopIntegrityFailed}",
         )
         for (m in r.mismatches) event("counter_mismatch $m")
         files?.let { f ->

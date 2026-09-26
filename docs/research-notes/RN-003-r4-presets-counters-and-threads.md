@@ -70,7 +70,7 @@ CHANGELOG v0.2.3 (a)(b). `spec_version` "0.2.0" 유지, `feature_schema_version`
 - G 는 전력이 늘어 R4 예산에서 불리해 보인다.
 - 남은 질문: Face 처리 빈도를 같게 두고 카메라 cadence 만 낮추면 전류가 줄어드는가. 이를 위해 지시문 E 가 H12(카메라 [12,12]) ↔ E, H15([15,15]) ↔ E15(24fps, Face 15Hz 슬롯) 짝을 정의했다. 짝 비교는 Face 빈도가 같은 짝만 카메라 효과로 해석한다.
 
-지시문 E 구현(PR #8): 처리 슬롯 계수 3종(독립 terminal counter)과 `expected = filled + missed` 종료 검사, 카메라 timestamp 영역 계약(raw = identity·소속·슬롯, mono = 위치, fence 시 offset freeze, 양끝 버킷 clamp), 갭 임계 공식(1.5배·4.5배), H12/H15/Hvar/E15, 정지 순서(위 결정 3 의 7단계 → 8단계: fence 를 producer 정지 전에 전달하고 CaptureResult 콜백 drain 뒤 슬롯 scheduler CLOSE gate 추가), 힌지 초기값. 실기기 H 세션 결과는 이 표 아래에 붙인다.
+지시문 E 구현(PR #8): 처리 슬롯 계수 3종(독립 terminal counter)과 `expected = filled + missed` 종료 검사, 카메라 timestamp 영역 계약(raw = identity·소속·슬롯, mono = 위치, fence 시 offset freeze, 양끝 버킷 clamp), 갭 임계 공식(1.5배·4.5배), H12/H15/Hvar/E15, 정지 순서(위 결정 3 의 7단계 → 8단계: fence 를 producer 정지 전에 전달하고 CaptureResult 콜백 drain 뒤 슬롯 scheduler CLOSE gate 추가), 힌지 초기값. 리뷰 반영(지시문 E2, 같은 PR): Hvar 는 상한 15 가변 range 중 가장 좁은 것; `[24,24]`·`[30,30]` 이 없는 카메라(fps unset)는 30fps 를 가정하지 않고 워밍업 60초 CaptureResult 간격 중앙값을 진단용 기대 간격으로 쓰며 판정하지 않는다; 종료 clamp 의 마지막 버킷은 `(fence − start − 1) ÷ period`; `stop_integrity_failed` 는 after_close > 0 OR CaptureResult drain 미완료 OR aggregation 큐 drain 미완료(원인별 보존); 슬롯 모드의 순서 역전 CaptureResult > 0 은 비교 불가; 요약 첫 줄은 `비교 가능` / `비교 불가: <사유들>` / `짝 비교 판정 비적용: Hvar 가변 cadence`. 실기기 H 세션 결과는 이 표 아래에 붙인다.
 
 ## 결정한 사람
 

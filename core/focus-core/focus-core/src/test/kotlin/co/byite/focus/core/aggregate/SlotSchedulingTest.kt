@@ -5,8 +5,13 @@ import co.byite.focus.core.log.SessionLog
 import co.byite.focus.core.model.AppState
 import co.byite.focus.core.model.FaceSchedule
 import co.byite.focus.core.model.ScreenState
+import co.byite.focus.core.model.SessionEnd
 import co.byite.focus.core.model.SessionEndReason
+import co.byite.focus.core.model.SessionHeader
+import co.byite.focus.core.report.ComparisonState
+import co.byite.focus.core.report.StopSummary
 import co.byite.focus.core.report.V0bReport
+import co.byite.focus.core.util.Stats
 import kotlin.math.abs
 import kotlin.math.roundToLong
 import kotlin.test.Test
@@ -47,9 +52,14 @@ class SlotSchedulingTest {
         sink: (FeatureAggregator) -> CameraCounterSink = { it },
         gapNs: Long = GapThresholds.gapThresholdNs(processPeriodNs ?: frameIntervalNs),
         longGapNs: Long = GapThresholds.longGapThresholdNs(processPeriodNs ?: frameIntervalNs),
+        /** fps unset (E2 1장): no expected interval at the start; the aggregator learns the diagnostic one from the warm-up. */
+        learnFromWarmup: Boolean = false,
     ) {
         val startMonoMs: Long = (startRaw + frameOffsetNs) / 1_000_000L
-        val agg = FeatureAggregator(startMonoMs, Synth.UTC0, gapThresholdNs = gapNs, longGapThresholdNs = longGapNs, sessionStartRawNs = startRaw, expectedIntervalNs = processPeriodNs ?: frameIntervalNs)
+        val agg = FeatureAggregator(
+            startMonoMs, Synth.UTC0, gapThresholdNs = gapNs, longGapThresholdNs = longGapNs, sessionStartRawNs = startRaw,
+            expectedIntervalNs = processPeriodNs ?: frameIntervalNs, learnThresholdsFromWarmup = learnFromWarmup,
+        )
         val scheduler = FrameScheduler(sink(agg), processPeriodNs, frameIntervalNs)
         val filledRaw = ArrayList<Long>()
         var started = false
@@ -92,7 +102,29 @@ class SlotSchedulingTest {
         }
 
         fun closeAll(nowMonoMs: Long) = agg.closeBuckets(nowMonoMs, device)
+
+        /** The normal stop order with a clean drain, as [StopSequence] runs it. */
+        fun stop(fenceRaw: Long, captureResultsDrained: Boolean = true, queueDrained: Boolean = true): StopResult = StopSequence(
+            stopInputs = { fenceRaw / 1_000_000L },
+            raiseFence = { f -> scheduler.fence(fenceRaw); agg.stopInputs(f, fenceRaw) },
+            drainCaptureResults = { captureResultsDrained },
+            awaitAnalysisIdle = { 0L },
+            closeSlotScheduler = { scheduler.close() },
+            closePoseSlot = { },
+            awaitPoseIdle = { 0L },
+            drainAggregationQueue = { queueDrained },
+            finish = { f -> StopFinalizer.finish(agg, f, startMonoMs, Synth.UTC0, device, SessionEndReason.USER) },
+            writeEnd = { },
+        ).run()
     }
+
+    /** A 0.2.4 header with a fixed [24,24] request, so the summary's first line is about the condition under test only. */
+    private fun fixedHeader(preset: String, schedule: FaceSchedule, periodNs: Long, startMonoMs: Long): SessionHeader = Synth.header.copy(
+        tStartMonoMs = startMonoMs, capturePreset = preset, cameraFpsRequestLower = 24, cameraFpsRequestUpper = 24, cameraFpsRangesSupported = "[24,24],[30,30]", nominalFps = 24,
+        faceSchedule = schedule, faceProcessPeriodNs = periodNs, frameGapThresholdNs = GapThresholds.gapThresholdNs(periodNs), frameLongGapThresholdNs = GapThresholds.longGapThresholdNs(periodNs),
+    )
+
+    private val checkedStop = StopSummary(checked = true, captureResultDrainComplete = true, aggregationQueueDrained = true)
 
     private fun stream(fps: Double, seconds: Double, startRaw: Long = 5_000_000_000L): List<Long> {
         val n = (fps * seconds).toInt()
@@ -452,28 +484,35 @@ class SlotSchedulingTest {
         // 23.2 fps measured against [24,24]: 100 seconds with 23 or 24 capture results
         val records = (0L until 100L).map { sec -> val n = if (sec % 5 == 0L) 24 else 23; Synth.record(sec).copy(framesRequested = n, framesAnalyzerReceived = n, framesProcessed = n, framesSampleApplied = n) }
         val fixed = cadenceLog(24, 24, 24).let { it.copy(records = records) }
-        val s = V0bReport.build(fixed)
+        val s = V0bReport.build(fixed, stop = checkedStop)
         assertEquals(23.2, s.overall.cadence.measuredFps!!, 1e-9)
         assertEquals(true, s.overall.cadence.mismatch)
+        assertEquals(ComparisonState.NOT_COMPARABLE, s.comparability.state)
+        assertEquals(listOf("${V0bReport.REASON_CADENCE}(요청 [24,24], 실측 23.20fps)"), s.comparability.reasons)
         val text = s.render()
-        assertTrue(text.lines()[1].startsWith(V0bReport.CADENCE_MISMATCH_PREFIX), text)
-        assertTrue(V0bReport.NOT_COMPARABLE in text.lines()[1], text)
-        // Hvar: the same records under a variable range [7,15] are never a mismatch, and nothing is judged
-        val hvar = V0bReport.build(cadenceLog(15, 7, 15, preset = "Hvar").let { it.copy(records = records.map { r -> r.copy(framesRequested = 14, framesAnalyzerReceived = 14, framesProcessed = 14, framesSampleApplied = 14) }) })
+        assertEquals(V0bReport.NOT_COMPARABLE_PREFIX + "${V0bReport.REASON_CADENCE}(요청 [24,24], 실측 23.20fps)", text.lines()[0], text)
+        assertEquals(V0bReport.COUNTER_OK, text.lines()[1], text)
+        assertTrue(text.lines()[2].startsWith(V0bReport.CADENCE_MISMATCH_PREFIX), text)
+        // Hvar: the same records under a variable range [7,15] are never a mismatch, nothing is judged, and the first line is the third state (not "비교 불가")
+        val hvar = V0bReport.build(cadenceLog(15, 7, 15, preset = "Hvar").let { it.copy(records = records.map { r -> r.copy(framesRequested = 14, framesAnalyzerReceived = 14, framesProcessed = 14, framesSampleApplied = 14) }) }, stop = checkedStop)
         assertNull(hvar.overall.cadence.mismatch)
         assertEquals(false, hvar.overall.cadence.requestFixed)
         assertFalse(hvar.overall.thresholds.applicable)
         assertEquals("n/a", hvar.overall.thresholds.gapLabel)
         assertFalse(hvar.pass.judged)
         assertNull(hvar.pass.pass)
+        assertEquals(ComparisonState.NOT_APPLICABLE, hvar.comparability.state)
         val ht = hvar.render()
-        assertFalse(ht.lines()[1].startsWith(V0bReport.CADENCE_MISMATCH_PREFIX), ht)
+        assertEquals(V0bReport.NOT_APPLICABLE_LINE, ht.lines()[0], ht)
+        assertFalse(ht.lines().any { it.startsWith(V0bReport.CADENCE_MISMATCH_PREFIX) }, ht)
         assertTrue("합격 판정 안 함(프리셋 Hvar, 가변 cadence [7,15])" in ht, ht)
         assertTrue("갭 임계: n/a / 긴 갭 n/a" in ht, ht)
-        // a fixed request within 3 % is not flagged
-        val ok = V0bReport.build(cadenceLog(24, 24, 24))
+        // a fixed request within 3 % is not flagged: the session is comparable
+        val ok = V0bReport.build(cadenceLog(24, 24, 24), stop = checkedStop)
         assertEquals(false, ok.overall.cadence.mismatch)
-        assertFalse(ok.render().lines()[1].startsWith(V0bReport.CADENCE_MISMATCH_PREFIX))
+        assertEquals(ComparisonState.COMPARABLE, ok.comparability.state)
+        assertEquals(V0bReport.COMPARABLE_LINE, ok.render().lines()[0])
+        assertFalse(ok.render().lines().any { it.startsWith(V0bReport.CADENCE_MISMATCH_PREFIX) })
     }
 
     // ---- (m) a slot lost between the scheduler and the counters breaks expected = filled + missed at the stop check
@@ -577,22 +616,28 @@ class SlotSchedulingTest {
         ).run()
         assertEquals(1L, r.totals.captureResultsAfterClose)
         assertTrue(r.stopIntegrityFailed)
+        assertEquals(listOf("${StopIntegrity.REASON_AFTER_CLOSE} 1건"), r.stopIntegrity.reasons)
         assertEquals(true, r.end.stopIntegrityFailed)
         assertEquals(1L, r.end.captureResultsAfterClose)
+        assertEquals(true, r.end.captureResultDrainComplete)
+        assertEquals(true, r.end.aggregationQueueDrained)
         assertEquals(emptyList(), r.mismatches, "the relations pass: the straggler is requested and a backpressure drop, just not expected")
         assertEquals(fenceMs, r.end.tMonoMs, "session_end = fence, not the write time $writeClock")
         assertEquals(Synth.UTC0 + (fenceMs - s.startMonoMs), r.end.tUtcMs)
-        val log = SessionLog(Synth.header, r.records.map { it.second }, sessionEnd = r.end, v0bRaw = r.records.map { it.raw })
-        val summary = V0bReport.build(log, stop = co.byite.focus.core.report.StopSummary(checked = true, mismatches = r.mismatches, totals = r.totals))
+        val log = SessionLog(fixedHeader("E15", FaceSchedule.SLOT, period15, s.startMonoMs), r.records.map { it.second }, sessionEnd = r.end, v0bRaw = r.records.map { it.raw })
+        val summary = V0bReport.build(log, stop = StopSummary(checked = true, mismatches = r.mismatches, totals = r.totals, captureResultDrainComplete = r.captureResultDrainComplete, aggregationQueueDrained = r.queueDrained))
         assertEquals(true, summary.overall.diagnostics.stopIntegrityFailed)
+        assertEquals(ComparisonState.NOT_COMPARABLE, summary.comparability.state)
         val text = summary.render()
-        assertTrue(text.lines()[1].startsWith(V0bReport.STOP_INTEGRITY_FAILED_PREFIX), text)
-        assertTrue(V0bReport.NOT_COMPARABLE in text.lines()[1], text)
+        assertEquals(V0bReport.NOT_COMPARABLE_PREFIX + "${StopIntegrity.REASON_AFTER_CLOSE} 1건(stop_integrity_failed)", text.lines()[0], text)
+        assertEquals(V0bReport.COUNTER_OK, text.lines()[1], text)
+        assertTrue(text.lines()[2].startsWith(V0bReport.STOP_INTEGRITY_FAILED_PREFIX + StopIntegrity.REASON_AFTER_CLOSE), text)
         assertTrue("after_close 1" in text, text)
-        // rebuilt from the JSONL alone (recovery / re-analysis) the flag still comes from the session_end line
+        // rebuilt from the JSONL alone (recovery / re-analysis) the flag and its cause still come from the session_end line
         val recovered = V0bReport.build(log)
         assertEquals(true, recovered.overall.diagnostics.stopIntegrityFailed)
         assertNotNull(recovered.overall.diagnostics.captureResultsAfterClose)
+        assertEquals(listOf("${StopIntegrity.REASON_AFTER_CLOSE} 1건"), recovered.overall.diagnostics.integrityReasons)
         // a *post-fence* capture result after CLOSE was never a candidate for expected: after-fence, not an integrity failure
         val s2 = Session(raws[0], period15, frame24)
         for (r in raws) s2.both(r)
@@ -604,7 +649,159 @@ class SlotSchedulingTest {
         assertEquals(0L, s2.agg.totals.captureResultsAfterClose)
         assertEquals(1L, s2.agg.totals.captureResultsAfterFence)
         assertEquals(1L, s2.scheduler.captureResultsAfterCloseAfterFence)
-        assertFalse(s2.agg.totals.stopIntegrityFailed)
+        assertEquals(false, StopIntegrity.of(s2.agg.totals, captureResultDrainComplete = true, aggregationQueueDrained = true).failed)
+    }
+
+    // ---- (p) E2 2.1: a fence exactly on a bucket boundary — the end clamp must point at the last bucket that exists
+
+    @Test
+    fun p_aFenceExactlyOnABucketBoundaryClampsAPreFenceStragglerIntoTheLastEmittedBucket() {
+        val raws = stream(24.0, 2.0) // 48 frames, the last at +1958.3 ms
+        val s = Session(raws[0], null, frame24) // REALTIME: raw == mono
+        for (r in raws) s.both(r)
+        val fenceMonoMs = s.startMonoMs + 2_000 // fenceMono − sessionStartMono = 2000 ms exactly: buckets 0 and 1 are complete, bucket 2 begins at the fence
+        val fenceRaw = fenceMonoMs * 1_000_000L
+        s.scheduler.fence(fenceRaw)
+        s.agg.stopInputs(fenceMonoMs, fenceRaw)
+        val stragglerRaw = fenceRaw - 1_000_000L // 1 ms before the raw fence: inside the window by identity
+        val staleMono = fenceMonoMs * 1_000_000L + 400_000_000L // converted with an older offset: 400 ms past the mono fence, bucket 2 by position
+        val st = CameraStamp(stragglerRaw, staleMono)
+        val before = s.agg.totals
+        assertEquals(FrameScheduler.CaptureDecision.SELECTED, s.scheduler.onCaptureResult(st))
+        assertEquals(FrameScheduler.FrameOutcome.SLOT, s.scheduler.onFrameReceived(st))
+        assertTrue(s.scheduler.onFaceSucceeded(st))
+        s.agg.onFrameProcessed(ProcessedFrame(staleMono, 15.0, FrameSample(staleMono, 1_000_000L, false, rawSensorTs = stragglerRaw), rawSensorTs = stragglerRaw))
+        val t = s.agg.totals
+        assertEquals(before.framesSampleApplied + 1, t.framesSampleApplied, "admitted by raw, applied")
+        assertEquals(0L, t.framesSampleLateDropped)
+        val out = StopFinalizer.finish(s.agg, fenceMonoMs, s.startMonoMs, Synth.UTC0, device, SessionEndReason.USER)
+        assertEquals(2, out.records.size, "buckets 0 and 1 are complete at a fence of exactly +2000 ms")
+        val last = out.records[1]
+        assertEquals(s.startMonoMs + 1_000, last.second.tMonoMs)
+        assertEquals(25, last.second.framesRequested, "24 stream frames of second 1 plus the straggler")
+        assertEquals(25, last.second.framesProcessed)
+        assertEquals(25, last.second.framesSampleApplied)
+        assertEquals(t.framesSampleApplied, out.records.sumOf { it.second.framesSampleApplied.toLong() }, "an applied frame never vanishes from the records: (fence − start) ÷ period would have put it into bucket 2, which is never emitted")
+        assertEquals(t.framesRequested, out.records.sumOf { it.second.framesRequested.toLong() })
+        assertEquals(emptyList(), CounterConsistency.check(out.totals))
+    }
+
+    // ---- (q) E2 2.3: an out-of-order capture result is a diagnostic counter; in slot mode it makes the session not comparable
+
+    @Test
+    fun q_anOutOfOrderCaptureResultInSlotModeIsCountedInTheEndLineAndMakesTheSessionNotComparable() {
+        val raws = stream(24.0, 2.0)
+        fun run(periodNs: Long?): Pair<Session, StopResult> {
+            val s = Session(raws[0], periodNs, frame24)
+            for (r in raws.take(10)) s.both(r)
+            s.frame(raws[11]) // frame 11 arrives before any capture result of frames 10 / 11
+            assertEquals(FrameScheduler.CaptureDecision.OUT_OF_ORDER, s.captureResult(raws[10]), "the capture result of the frame before it trails")
+            assertEquals(FrameScheduler.CaptureDecision.DUPLICATE, s.captureResult(raws[11]))
+            for (r in raws.drop(12)) s.both(r)
+            return s to s.stop(raws.last() + frame24 / 2)
+        }
+        val (slot, rs) = run(period15)
+        assertEquals(1L, slot.scheduler.captureResultsOutOfOrder)
+        assertEquals(1L, rs.totals.captureResultsOutOfOrder, "the scheduler hands each out-of-order capture result to the sink")
+        assertEquals(1L, rs.end.captureResultsOutOfOrder, "recorded on the session_end line")
+        assertEquals(emptyList(), rs.mismatches)
+        assertFalse(rs.stopIntegrityFailed, "out of order is not a stop-integrity cause")
+        val slotLog = SessionLog(fixedHeader("E15", FaceSchedule.SLOT, period15, slot.startMonoMs), rs.records.map { it.second }, sessionEnd = rs.end, v0bRaw = rs.records.map { it.raw })
+        val slotSummary = V0bReport.build(slotLog, stop = StopSummary(checked = true, totals = rs.totals, captureResultDrainComplete = true, aggregationQueueDrained = true))
+        assertEquals(1L, slotSummary.overall.diagnostics.captureResultsOutOfOrder)
+        assertEquals(ComparisonState.NOT_COMPARABLE, slotSummary.comparability.state)
+        assertEquals(listOf("${V0bReport.REASON_OUT_OF_ORDER} 1건"), slotSummary.comparability.reasons)
+        val text = slotSummary.render()
+        assertEquals(V0bReport.NOT_COMPARABLE_PREFIX + "${V0bReport.REASON_OUT_OF_ORDER} 1건", text.lines()[0], text)
+        assertTrue(text.lines().any { it.startsWith(V0bReport.OUT_OF_ORDER_PREFIX + "1건") }, text)
+        assertTrue("out_of_order 1" in text, text)
+        assertEquals(1L, V0bReport.build(slotLog).overall.diagnostics.captureResultsOutOfOrder, "the recovered summary reads it from the end line")
+        // every-frame mode: the same event is a processing opportunity (expected + missed by backpressure), shown as a count, and the session stays comparable
+        val (every, re) = run(null)
+        assertEquals(1L, every.scheduler.captureResultsOutOfOrder)
+        assertEquals(1L, re.end.captureResultsOutOfOrder)
+        assertEquals(1L, re.totals.processingSlotsMissed)
+        val everyLog = SessionLog(fixedHeader("A", FaceSchedule.EVERY_FRAME, frame24, every.startMonoMs), re.records.map { it.second }, sessionEnd = re.end, v0bRaw = re.records.map { it.raw })
+        val everySummary = V0bReport.build(everyLog, stop = StopSummary(checked = true, totals = re.totals, captureResultDrainComplete = true, aggregationQueueDrained = true))
+        assertEquals(ComparisonState.COMPARABLE, everySummary.comparability.state, everySummary.comparability.toString())
+        assertTrue("out_of_order 1" in everySummary.render())
+    }
+
+    // ---- (r) E2 1장: fps unset (neither [24,24] nor [30,30]) — no 30 fps assumption; the diagnostic interval is the warm-up's capture-interval median
+
+    @Test
+    fun r_anUnsetFpsSessionLearnsItsDiagnosticIntervalFromTheWarmupAndIsNeverJudged() {
+        val fps = 27.5 // whatever the HAL default happens to be
+        val all = stream(fps, 75.0)
+        val interval = (1e9 / fps).roundToLong()
+        fun gapAt(sec: Int) = all.indexOfFirst { it - all[0] >= sec * 1_000_000_000L }
+        val g1 = gapAt(30) // a 3-frame gap inside the warm-up
+        val g2 = gapAt(70) // and one after it
+        val raws = all.filterIndexed { i, _ -> i != g1 && i != g1 + 1 && i != g2 && i != g2 + 1 }
+        val s = Session(raws[0], null, GapThresholds.frameIntervalNs(30), learnFromWarmup = true)
+        assertNull(s.agg.currentGapThresholdNs, "no expected interval is assumed at the start")
+        for (r in raws.filter { it - raws[0] < 59_000_000_000L }) s.both(r)
+        val early = s.closeAll(s.startMonoMs + 59_500)
+        assertNull(s.agg.learnedExpectedIntervalNs, "nothing is known before the warm-up ends")
+        assertEquals(59, early.size)
+        val warmGap = early[30].second
+        assertEquals(0, warmGap.gapsOverThreshold, "no threshold in force during the warm-up")
+        assertEquals(1, warmGap.gapsOver80Ms, "the fixed 80 ms diagnostic still counts the 109 ms gap")
+        assertEquals(109L, warmGap.maxFrameGapMs)
+        // the aggregation tick closes bucket 59 at ~60.3 s, before the frames of the 70th second arrive
+        for (r in raws.filter { it - raws[0] >= 59_000_000_000L && it - raws[0] < 61_000_000_000L }) s.both(r)
+        val atSixtyOne = s.closeAll(s.startMonoMs + 61_400)
+        assertEquals(listOf(59L, 60L), atSixtyOne.map { (it.second.tMonoMs - s.startMonoMs) / 1000 })
+        val learned = assertNotNull(s.agg.learnedExpectedIntervalNs, "learned when the last warm-up bucket closed")
+        for (r in raws.filter { it - raws[0] >= 61_000_000_000L }) s.both(r)
+        val rest = atSixtyOne + s.closeAll(s.startMonoMs + 76_000)
+        assertTrue(abs(learned - interval) <= 2L, "learned $learned ns vs the real interval $interval ns")
+        assertEquals(GapThresholds.gapThresholdNs(learned), s.agg.currentGapThresholdNs)
+        assertEquals(GapThresholds.longGapThresholdNs(learned), s.agg.currentLongGapThresholdNs)
+        val records = early + rest
+        val lateGap = records[70].second
+        assertEquals(1, lateGap.gapsOverThreshold, "after the warm-up a 3-frame gap (109 ms) is over 1.5 × 36.4 ms")
+        assertEquals(0, lateGap.gapsOverLongThreshold)
+        // the summary: thresholds n/a, the learned diagnostic shown, nothing judged, "비교 불가: fps unset(가변)"
+        val fenceRaw = raws.last() + interval
+        val r = s.stop(fenceRaw)
+        val header = Synth.header.copy(
+            tStartMonoMs = s.startMonoMs, capturePreset = "A", nominalFps = 0, cameraFpsRangesSupported = "[15,30]", faceSchedule = FaceSchedule.EVERY_FRAME,
+            faceProcessPeriodNs = null, frameGapThresholdNs = null, frameLongGapThresholdNs = null, frameGapThresholdMs = null, frameLongGapThresholdMs = null,
+        )
+        assertTrue(header.cameraFpsUnset)
+        assertEquals(SessionHeader.FPS_UNSET_LABEL, header.cameraFpsRequestLabel)
+        val log = SessionLog(header, (records + r.records).map { it.second }, sessionEnd = r.end, v0bRaw = (records + r.records).map { it.raw })
+        val summary = V0bReport.build(log, stop = StopSummary(checked = true, totals = r.totals, captureResultDrainComplete = true, aggregationQueueDrained = true))
+        val th = summary.overall.thresholds
+        assertFalse(th.applicable)
+        assertTrue(th.learnedFromWarmup)
+        assertEquals(learned / 1e6, assertNotNull(th.expectedIntervalMs), 1e-6)
+        assertEquals("n/a", th.gapLabel)
+        assertEquals("n/a", th.longGapLabel)
+        assertEquals("${Stats.fmt(learned / 1e6 * 1.5, 1)}ms", th.gapCountedLabel)
+        assertFalse(summary.pass.judged)
+        assertEquals(SessionHeader.FPS_UNSET_LABEL, summary.pass.notJudgedReason)
+        assertNull(summary.overall.cadence.mismatch, "no request: no cadence verdict")
+        assertEquals(ComparisonState.NOT_COMPARABLE, summary.comparability.state)
+        assertEquals(listOf(V0bReport.REASON_FPS_UNSET), summary.comparability.reasons)
+        val text = summary.render()
+        assertEquals(V0bReport.NOT_COMPARABLE_PREFIX + V0bReport.REASON_FPS_UNSET, text.lines()[0], text)
+        assertTrue(text.lines().any { it.startsWith(V0bReport.FPS_UNSET_PREFIX) && "진단용 기대 간격 = 워밍업 60초 CaptureResult 간격 중앙값 ${Stats.fmt(learned / 1e6, 1)}ms" in it }, text)
+        assertTrue("@ ${SessionHeader.FPS_UNSET_LABEL}(CameraX 실제 선택)" in text, text)
+        assertTrue("카메라 ${SessionHeader.FPS_UNSET_LABEL}, 갭 임계 n/a" in text, text)
+        assertTrue("합격 판정 안 함(프리셋 A, ${SessionHeader.FPS_UNSET_LABEL})" in text, text)
+        assertEquals(summary, V0bReport.build(co.byite.focus.core.log.JsonlCodec.decode(co.byite.focus.core.log.JsonlCodec.encode(log)), stop = summary.stop), "null ms thresholds round-trip")
+        // a session that ends inside the warm-up learns nothing and says so
+        val short = V0bReport.build(SessionLog(header, records.take(40).map { it.second }, sessionEnd = SessionEnd(s.startMonoMs + 40_000, Synth.UTC0 + 40_000, SessionEndReason.USER), v0bRaw = records.take(40).map { it.raw }), stop = checkedStop)
+        assertNull(short.overall.thresholds.expectedIntervalMs)
+        assertEquals("-", short.overall.thresholds.gapCountedLabel)
+        assertTrue("워밍업 60초 미완료" in short.render(), short.render())
+        // a slot preset on an unset camera keeps the slot period as its (diagnostic) expected interval and is still not judged
+        val e15 = V0bReport.thresholdLine(header.copy(capturePreset = "E15", faceSchedule = FaceSchedule.SLOT, faceProcessPeriodNs = period15, frameGapThresholdNs = GapThresholds.gapThresholdNs(period15), frameLongGapThresholdNs = GapThresholds.longGapThresholdNs(period15), frameGapThresholdMs = 100, frameLongGapThresholdMs = 300))
+        assertFalse(e15.applicable)
+        assertFalse(e15.learnedFromWarmup)
+        assertEquals(100.0, assertNotNull(e15.gapMs), 1e-6)
     }
 
     // ---- review: an in-window capture result that trails a later frame (every-frame mode) is still a slot — and a lost one

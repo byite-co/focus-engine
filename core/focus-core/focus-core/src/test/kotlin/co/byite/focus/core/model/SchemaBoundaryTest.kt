@@ -154,7 +154,10 @@ class SchemaBoundaryTest {
     fun intervalSessionEndAndTimebaseFields() {
         assertEquals(listOf("t_start_mono_ms", "t_end_mono_ms", "t_start_utc_ms", "t_end_utc_ms", "state", "reason"), names(IntervalRecord.serializer().descriptor))
         assertEquals(
-            listOf("t_mono_ms", "t_utc_ms", "reason", "capture_results_before_start", "capture_results_after_fence", "capture_results_after_close", "stop_integrity_failed"),
+            listOf(
+                "t_mono_ms", "t_utc_ms", "reason", "capture_results_before_start", "capture_results_after_fence", "capture_results_after_close",
+                "capture_results_out_of_order", "capture_result_drain_complete", "aggregation_queue_drained", "stop_integrity_failed",
+            ),
             names(SessionEnd.serializer().descriptor),
         )
         assertEquals(listOf("t_mono_ms", "camera_ts_source", "camera_to_mono_offset_ns", "imu_to_mono_offset_ns"), names(TimebaseRecord.serializer().descriptor))

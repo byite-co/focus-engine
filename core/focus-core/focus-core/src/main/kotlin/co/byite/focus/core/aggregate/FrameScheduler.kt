@@ -28,7 +28,8 @@ package co.byite.focus.core.aggregate
  * later frame. In every-frame mode such an in-window capture result is still a processing opportunity (every capture
  * result in the window is one): it opens a slot, and when a later frame was already received that slot is missed at
  * once (its frame was lost to backpressure). In slot mode the rule has already advanced past it, so it is not selected;
- * a lost frame there shows as a gap. [captureResultsOutOfOrder] counts both.
+ * a lost frame there shows as a gap. [captureResultsOutOfOrder] counts both, and the sink gets each one
+ * (`capture_results_out_of_order`); a slot-mode session with any is not comparable (E2 2.3).
  *
  * **Window.** Capture results before [onSessionStart] are kept (raw + mono) and replayed once the first analyzer frame
  * fixes `sessionStartRawTs`: the aggregator counts the ones before the start, the ones inside the window enter the
@@ -298,6 +299,7 @@ class FrameScheduler(
         if (recent.any { it.first == raw }) return CaptureDecision.DUPLICATE
         if (raw <= lastEvaluatedRaw) {
             captureResultsOutOfOrder++
+            sink.onCaptureResultOutOfOrder(stamp)
             if (processPeriodNs == null) {
                 // every capture result in the window is an opportunity, whatever order it arrived in
                 remember(raw, true)

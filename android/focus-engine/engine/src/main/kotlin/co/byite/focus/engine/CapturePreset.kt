@@ -36,8 +36,8 @@ sealed class CameraFpsRequest {
     fun select(supported: List<FpsRange>): FpsRange? = when (this) {
         Default -> supported.firstOrNull { it.lower == 24 && it.upper == 24 } ?: supported.firstOrNull { it.lower == 30 && it.upper == 30 }
         is Fixed -> supported.firstOrNull { it.lower == fps && it.upper == fps }
-        // the widest variable range under the bound: the one that lets AE move the most (documented choice, README "프리셋")
-        is VariableUpper -> supported.filter { it.upper == upperFps && it.lower < upperFps }.minByOrNull { it.lower }
+        // the narrowest variable range under the bound (highest lower bound): closest to fixed 15, least cadence swing (E2 1장)
+        is VariableUpper -> supported.filter { it.upper == upperFps && it.lower < upperFps }.maxByOrNull { it.lower }
     }
 
     /** Default is always available (it falls back to the HAL default); the others need their range. */
@@ -122,6 +122,20 @@ enum class CapturePreset(
     /** The preset can run on a camera offering [supported] AE ranges (H12 / H15 / Hvar need theirs; E15 is always offered). */
     fun isAvailable(supported: List<FpsRange>): Boolean = cameraFps.isAvailable(supported)
 
+    /** Expected interval, thresholds and slot tolerance for the [request] the camera accepted (null = fps unset) among [supported]. */
+    fun cadencePlan(request: FpsRange?, supported: List<FpsRange>): CadencePlan {
+        val nominal = request?.upper
+        val period: Long? = if (nominal != null) faceProcessPeriodNs(nominal) else slotPeriodNs()
+        val fastest = supported.maxOfOrNull { it.upper } ?: CadencePlan.FALLBACK_TOLERANCE_FPS
+        return CadencePlan(
+            nominalFps = nominal,
+            faceProcessPeriodNs = period,
+            gapThresholdNs = period?.let { GapThresholds.gapThresholdNs(it) },
+            longGapThresholdNs = period?.let { GapThresholds.longGapThresholdNs(it) },
+            slotToleranceIntervalNs = GapThresholds.frameIntervalNs(nominal ?: fastest),
+        )
+    }
+
     companion object {
         const val PERF_HINT_TARGET_MS: Int = PERF_HINT_TARGET_MS_G
 
@@ -131,6 +145,38 @@ enum class CapturePreset(
 
         /** Presets the dev app lists for a camera offering [supported]: every preset except the H variants the camera cannot run. */
         fun availableOn(supported: List<FpsRange>): List<CapturePreset> = entries.filter { it.isAvailable(supported) }
+    }
+}
+
+/**
+ * What the pipeline derives from the AE range it selected (E2 1장), pure so it is JVM-tested. [nominalFps] is the requested
+ * range's upper bound, null for **fps unset** (a preset with the default request on a camera offering neither [24,24] nor
+ * [30,30]): then nothing is assumed about the cadence — an every-frame preset has no expected interval and no thresholds
+ * (the aggregator learns a diagnostic interval from the warm-up), a slot preset keeps its slot period, and the session is
+ * not comparable. [slotToleranceIntervalNs] is the camera frame interval the slot rule's half-frame tolerance is taken from:
+ * at the nominal cadence, or for fps unset at the fastest cadence the camera offers — a bound (the rule never selects a
+ * frame earlier than it would at any real cadence), not an assumed cadence.
+ */
+data class CadencePlan(
+    val nominalFps: Int?,
+    val faceProcessPeriodNs: Long?,
+    val gapThresholdNs: Long?,
+    val longGapThresholdNs: Long?,
+    val slotToleranceIntervalNs: Long,
+) {
+    val fpsUnset: Boolean get() = nominalFps == null
+
+    /** Rounded ms of the thresholds for the legacy header fields; null for fps unset. */
+    val gapThresholdMs: Int? get() = gapThresholdNs?.let { (it / 1e6).roundToInt() }
+    val longGapThresholdMs: Int? get() = longGapThresholdNs?.let { (it / 1e6).roundToInt() }
+
+    /** Header `nominal_fps`: the requested upper bound, 0 for fps unset (the header field is not nullable). */
+    val nominalFpsForHeader: Int get() = nominalFps ?: NOMINAL_FPS_UNSET
+
+    companion object {
+        const val NOMINAL_FPS_UNSET: Int = 0
+        /** Slot tolerance basis when the camera reports no AE range at all: the fastest cadence a phone camera runs at. */
+        const val FALLBACK_TOLERANCE_FPS: Int = 30
     }
 }
 
