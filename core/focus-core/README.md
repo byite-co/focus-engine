@@ -16,7 +16,7 @@
 
 | 패키지 | 내용 |
 |---|---|
-| `model` | `State`(우선순위 포함), `InvalidReason`, `Event`, `SessionHeader`, `SecondRecord`(스키마 0.2.1), `IntervalRecord`, `SessionEnd`, `CalibrationSnapshot`, `TimebaseRecord`, `V0bRawRecord`(V0-B 원시 스칼라 줄), `ParameterSet`, `BackdateRules`, `FocusSchema` |
+| `model` | `State`(우선순위 포함), `InvalidReason`, `Event`, `SessionHeader`(0.2.4 카메라 cadence·Face 스케줄 필드), `SecondRecord`(필드는 0.2.3 과 같다), `IntervalRecord`, `SessionEnd`(0.2.4 정지 진단), `CalibrationSnapshot`, `TimebaseRecord`, `V0bRawRecord`(V0-B 원시 스칼라 줄, 0.2.4 슬롯 계수), `ParameterSet`, `BackdateRules`, `FocusSchema` |
 | `engine` | `GateEngine`·`GateDecision`, `FaceBand`(얼굴 검출 2단 임계값), `NaiveBaselineEngine`, `PhoneGateTracker`(집어 듦·재거치·재캘리브레이션 상태 기계) |
 | `finalizer` | `StateFinalizer`: raw/final 분리, 30초 확정 버퍼, 소급 덮어쓰기 표, flushNow, lifecycle gap, 프로세스 종료 복구 |
 | `log` | `JsonlCodec`, `SessionLog`, `FocusJson` |
@@ -92,6 +92,7 @@ JDK 17 이상. Kotlin 2.2, kotlinx-serialization 1.9, kotlin.test.
 ## 세션 JSONL 형식 (feature_schema_version 0.2.4)
 
 첫 줄은 세션 header, 이후 한 줄에 객체 하나. `type` 키로 구분한다(없으면 키로 추론). 빈 줄과 모르는 키는 무시한다.
+아래 예시는 0.2.1 로그(호환 판독 예시)다. 0.2.3·0.2.4 가 header·`v0b_raw`·`session_end` 에 더한 필드는 예시 뒤의 목록에 있고, 없으면 문서화된 기본값으로 읽는다.
 시간이 있는 줄(calibration, timebase, interval, second, v0b_raw)은 시간 순으로 쓴다. 같은 시각이면 second 뒤에 v0b_raw 가 온다.
 `JsonlCodec.encodeHeader/encodeSecond/encodeV0bRaw/...` 는 줄 하나씩 만드는 인코더로, 기기 층의 스트리밍 기록이 쓴다.
 

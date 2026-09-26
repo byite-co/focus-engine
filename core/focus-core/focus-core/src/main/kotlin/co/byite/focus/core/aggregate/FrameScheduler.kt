@@ -21,15 +21,22 @@ package co.byite.focus.core.aggregate
  *
  * **Slot life.** `expected` when selected; `filled` when Face succeeded on that raw timestamp ([onFaceSucceeded]);
  * `missed` when a later analyzer frame arrives while the slot is still open (backpressure: the frame never reached the
- * analyzer), on a pre-Face or Face error of its frame, or at [close] (stop step 4) for every slot still open. The three
- * are emitted as independent events; nothing is derived.
+ * analyzer), on a pre-Face or Face error of its frame, or at [close] (the CLOSE step of the stop order) for every slot
+ * still open. The three are emitted as independent events; nothing is derived.
+ *
+ * **Out of order.** Capture results and analyzer frames travel on different paths, so a capture result can trail a
+ * later frame. In every-frame mode such an in-window capture result is still a processing opportunity (every capture
+ * result in the window is one): it opens a slot, and when a later frame was already received that slot is missed at
+ * once (its frame was lost to backpressure). In slot mode the rule has already advanced past it, so it is not selected;
+ * a lost frame there shows as a gap. [captureResultsOutOfOrder] counts both.
  *
  * **Window.** Capture results before [onSessionStart] are kept (raw + mono) and replayed once the first analyzer frame
  * fixes `sessionStartRawTs`: the aggregator counts the ones before the start, the ones inside the window enter the
  * stream in raw order together with the first frame itself, so the capture result of the first frame is the first
  * processing opportunity. After [fence] (`stopFenceRawTs`) capture results and analyzer frames with `raw ≥ fence` are
- * neither slots nor accepted by the analyzer. After [close] a capture result is `capture_results_after_close`
- * (normal stops have none: `stop_integrity_failed`).
+ * neither slots nor accepted by the analyzer. After [close] a capture result of a pre-fence frame is
+ * `capture_results_after_close` (normal stops have none: `stop_integrity_failed`); one of a post-fence frame is only
+ * after-fence, as before CLOSE — it was never a candidate for `expected`, so it says nothing about the stop's integrity.
  */
 class FrameScheduler(
     private val sink: CameraCounterSink,
@@ -54,14 +61,14 @@ class FrameScheduler(
         BEFORE_START,
         /** Raw timestamp at or after the raw fence: counted after-fence, never a slot. */
         AFTER_FENCE,
-        /** Arrived after CLOSE: `capture_results_after_close`. */
+        /** A pre-fence capture result that arrived after CLOSE: `capture_results_after_close`. */
         AFTER_CLOSE,
         /** A new processing opportunity (`expected` +1). */
         SELECTED,
         NOT_SELECTED,
         /** Timestamp already evaluated (the analyzer frame came first, or a repeated result). */
         DUPLICATE,
-        /** Older than the newest evaluated timestamp and not seen before: cannot be selected. */
+        /** Older than the newest evaluated timestamp and not seen before. Every-frame mode: still a slot (missed when its frame can no longer come); slot mode: not selected. */
         OUT_OF_ORDER,
     }
 
@@ -98,7 +105,11 @@ class FrameScheduler(
     var slotsMissedByBackpressure: Long = 0L; private set
     var slotsMissedAtClose: Long = 0L; private set
     var captureResultsAfterClose: Long = 0L; private set
+    /** Post-fence capture results that arrived after CLOSE: after-fence, not an integrity failure. */
+    var captureResultsAfterCloseAfterFence: Long = 0L; private set
     var captureResultsOutOfOrder: Long = 0L; private set
+    /** Out-of-order in-window capture results that opened a slot in every-frame mode (their frame was lost). */
+    var slotsFromOutOfOrder: Long = 0L; private set
     var framesRejectedAfterFence: Long = 0L; private set
     var pendingDropped: Long = 0L; private set
     var replayedBeforeStart: Long = 0L; private set
@@ -126,6 +137,11 @@ class FrameScheduler(
     fun onCaptureResult(stamp: CameraStamp): CaptureDecision {
         if (closed) {
             sink.onFrameRequested(stamp)
+            val f = fenceRaw
+            if (f != null && stamp.rawSensorTs >= f) {
+                captureResultsAfterCloseAfterFence++
+                return CaptureDecision.AFTER_FENCE
+            }
             sink.onCaptureResultAfterClose(stamp)
             captureResultsAfterClose++
             return CaptureDecision.AFTER_CLOSE
@@ -238,6 +254,7 @@ class FrameScheduler(
     fun close(): Long {
         if (closed) return 0L
         closed = true
+        checkNotNull(fenceRaw) { "fence() must precede close()" }
         var n = 0L
         for (s in open) {
             slotsMissed++
@@ -252,7 +269,7 @@ class FrameScheduler(
     /** One-line diagnostics for the event log. */
     fun stats(): String =
         "slots expected=$slotsExpected filled=$slotsFilled missed=$slotsMissed (backpressure=$slotsMissedByBackpressure at_close=$slotsMissedAtClose) open=${open.size} " +
-            "capture_after_close=$captureResultsAfterClose capture_out_of_order=$captureResultsOutOfOrder frames_rejected_after_fence=$framesRejectedAfterFence " +
+            "capture_after_close=$captureResultsAfterClose capture_after_close_post_fence=$captureResultsAfterCloseAfterFence capture_out_of_order=$captureResultsOutOfOrder slots_from_out_of_order=$slotsFromOutOfOrder frames_rejected_after_fence=$framesRejectedAfterFence " +
             "pending_dropped=$pendingDropped replayed_before_start=$replayedBeforeStart anchor=${anchor ?: "-"} next_due=$nextDue"
 
     // ---- internals
@@ -281,7 +298,23 @@ class FrameScheduler(
         if (recent.any { it.first == raw }) return CaptureDecision.DUPLICATE
         if (raw <= lastEvaluatedRaw) {
             captureResultsOutOfOrder++
-            remember(raw, false)
+            if (processPeriodNs == null) {
+                // every capture result in the window is an opportunity, whatever order it arrived in
+                remember(raw, true)
+                slotsExpected++
+                slotsFromOutOfOrder++
+                sink.onSlotExpected(stamp)
+                if (raw < lastReceivedRaw) {
+                    // a later frame was already received: frames arrive in order, so this one was lost to backpressure
+                    slotsMissed++
+                    slotsMissedByBackpressure++
+                    sink.onSlotMissed(stamp)
+                } else {
+                    open.add(Slot(stamp))
+                }
+            } else {
+                remember(raw, false)
+            }
             return CaptureDecision.OUT_OF_ORDER
         }
         lastEvaluatedRaw = raw

@@ -49,7 +49,7 @@ class SlotSchedulingTest {
         longGapNs: Long = GapThresholds.longGapThresholdNs(processPeriodNs ?: frameIntervalNs),
     ) {
         val startMonoMs: Long = (startRaw + frameOffsetNs) / 1_000_000L
-        val agg = FeatureAggregator(startMonoMs, Synth.UTC0, gapThresholdNs = gapNs, longGapThresholdNs = longGapNs, sessionStartRawNs = startRaw)
+        val agg = FeatureAggregator(startMonoMs, Synth.UTC0, gapThresholdNs = gapNs, longGapThresholdNs = longGapNs, sessionStartRawNs = startRaw, expectedIntervalNs = processPeriodNs ?: frameIntervalNs)
         val scheduler = FrameScheduler(sink(agg), processPeriodNs, frameIntervalNs)
         val filledRaw = ArrayList<Long>()
         var started = false
@@ -372,19 +372,35 @@ class SlotSchedulingTest {
         assertEquals(0, b0.backpressureDrops)
         assertEquals(24, b0.framesRequested)
         assertEquals(0L, s.agg.totals.captureResultsBeforeStart)
-        // end side: a capture result inside the raw window whose mono value is at or after the mono fence
+        // end side (symmetric): a frame captured inside the raw window whose mono value — converted with a stale, larger
+        // offset — lies more than a bucket past the mono fence. It goes through the scheduler like a real frame.
         val fenceRaw = raws.last() + 3 * frame24 // ≈ 2083 ms raw, 2113 ms mono: bucket 1 (ends at 2030 ms mono) is complete
         val fenceMonoMs = (fenceRaw + 30_000_000L) / 1_000_000L
+        s.scheduler.fence(fenceRaw)
         s.agg.stopInputs(fenceMonoMs, fenceRaw)
-        val lastRaw = raws.last()
-        val afterMonoFence = CameraStamp(lastRaw, fenceMonoMs * 1_000_000L + 5_000_000L)
-        val before = s.agg.totals.framesRequested
-        s.agg.onFrameRequested(afterMonoFence)
-        assertEquals(before + 1, s.agg.totals.framesRequested, "raw < fenceRaw: admitted and attributed to the last partial bucket")
-        assertEquals(0L, s.agg.totals.inputsAfterFence)
+        val straggler = raws.last() + frame24 // raw < fenceRaw
+        val staleMono = fenceMonoMs * 1_000_000L + 1_500_000_000L // 1.5 s past the mono fence: two buckets beyond the last partial one
+        val before = s.agg.totals
+        val st = CameraStamp(straggler, staleMono)
+        assertEquals(FrameScheduler.CaptureDecision.SELECTED, s.scheduler.onCaptureResult(st))
+        assertEquals(FrameScheduler.FrameOutcome.SLOT, s.scheduler.onFrameReceived(st))
+        assertTrue(s.scheduler.onFaceSucceeded(st))
+        s.agg.onFrameProcessed(ProcessedFrame(staleMono, 15.0, FrameSample(staleMono, 1_000_000L, false, rawSensorTs = straggler), rawSensorTs = straggler))
+        val t = s.agg.totals
+        assertEquals(before.framesRequested + 1, t.framesRequested, "raw < fenceRaw: admitted whatever the mono value")
+        assertEquals(before.framesAnalyzerReceived + 1, t.framesAnalyzerReceived)
+        assertEquals(before.framesProcessed + 1, t.framesProcessed)
+        assertEquals(before.framesSampleApplied + 1, t.framesSampleApplied, "clamped to the last partial bucket and applied, not late")
+        assertEquals(0L, t.framesSampleLateDropped)
+        assertEquals(before.processingSlotsFilled + 1, t.processingSlotsFilled)
+        assertEquals(0L, t.inputsAfterFence)
+        assertEquals(0L, t.captureResultsAfterFence)
         val out = StopFinalizer.finish(s.agg, fenceMonoMs, s.startMonoMs, Synth.UTC0, device, SessionEndReason.USER, closed)
         assertEquals(2, out.records.size, "buckets 0 and 1 are complete; the partial one is dropped but its counts stay in the totals")
-        assertEquals(before + 1, out.totals.framesRequested)
+        assertEquals(before.framesRequested + 1, out.totals.framesRequested)
+        assertEquals(emptyList(), CounterConsistency.check(out.totals))
+        // the same stamp without the clamp would have opened bucket 3, two past the fence: finish must still emit nothing after the fence
+        assertTrue(out.records.all { it.second.tMonoMs + 1000 <= fenceMonoMs })
     }
 
     // ---- (k) a normal stop: expected = filled + missed is part of the stop check, after_close = 0
@@ -577,5 +593,79 @@ class SlotSchedulingTest {
         val recovered = V0bReport.build(log)
         assertEquals(true, recovered.overall.diagnostics.stopIntegrityFailed)
         assertNotNull(recovered.overall.diagnostics.captureResultsAfterClose)
+        // a *post-fence* capture result after CLOSE was never a candidate for expected: after-fence, not an integrity failure
+        val s2 = Session(raws[0], period15, frame24)
+        for (r in raws) s2.both(r)
+        val f2 = raws.last() + frame24 / 2
+        s2.scheduler.fence(f2)
+        s2.agg.stopInputs(f2 / 1_000_000L, f2)
+        s2.scheduler.close()
+        assertEquals(FrameScheduler.CaptureDecision.AFTER_FENCE, s2.captureResult(raws.last() + 2 * frame24))
+        assertEquals(0L, s2.agg.totals.captureResultsAfterClose)
+        assertEquals(1L, s2.agg.totals.captureResultsAfterFence)
+        assertEquals(1L, s2.scheduler.captureResultsAfterCloseAfterFence)
+        assertFalse(s2.agg.totals.stopIntegrityFailed)
+    }
+
+    // ---- review: an in-window capture result that trails a later frame (every-frame mode) is still a slot — and a lost one
+
+    @Test
+    fun anOutOfOrderCaptureResultInEveryFrameModeIsAnExpectedSlotThatIsMissedWhenItsFrameCanNoLongerCome() {
+        val start = 5_000_000_000L
+        val s = Session(start, null, frame24)
+        s.both(start)
+        // frame 1 was dropped by KEEP_ONLY_LATEST and its capture result trails frame 2
+        s.frame(start + 2 * frame24)
+        assertEquals(FrameScheduler.CaptureDecision.OUT_OF_ORDER, s.captureResult(start + frame24))
+        assertEquals(FrameScheduler.CaptureDecision.DUPLICATE, s.captureResult(start + 2 * frame24))
+        val t = s.agg.totals
+        assertEquals(3L, t.framesRequested)
+        assertEquals(2L, t.framesAnalyzerReceived)
+        assertEquals(3L, t.processingSlotsExpected, "every capture result in the window is an opportunity, whatever its arrival order")
+        assertEquals(2L, t.processingSlotsFilled)
+        assertEquals(1L, t.processingSlotsMissed, "its frame was lost to backpressure")
+        assertEquals(1L, s.scheduler.slotsFromOutOfOrder)
+        assertEquals(1L, s.scheduler.slotsMissedByBackpressure)
+        assertEquals(emptyList(), CounterConsistency.check(t))
+        // trailing only a later *capture result* (its own frame may still come): the slot stays open and the frame fills it
+        val s2 = Session(start, null, frame24)
+        s2.both(start)
+        assertEquals(FrameScheduler.CaptureDecision.SELECTED, s2.captureResult(start + 2 * frame24))
+        assertEquals(FrameScheduler.CaptureDecision.OUT_OF_ORDER, s2.captureResult(start + frame24))
+        assertEquals(2, s2.scheduler.openSlots)
+        assertEquals(FrameScheduler.FrameOutcome.SLOT, s2.frame(start + frame24))
+        assertEquals(FrameScheduler.FrameOutcome.SLOT, s2.frame(start + 2 * frame24))
+        assertEquals(3L, s2.agg.totals.processingSlotsFilled)
+        assertEquals(0L, s2.agg.totals.processingSlotsMissed)
+        // slot mode: the rule has already advanced; an out-of-order result is not selected and a lost frame shows as a gap
+        val s3 = Session(start, period15, frame24)
+        s3.both(start)
+        s3.frame(start + 2 * frame24)
+        assertEquals(FrameScheduler.CaptureDecision.OUT_OF_ORDER, s3.captureResult(start + frame24))
+        assertEquals(0L, s3.scheduler.slotsFromOutOfOrder)
+        assertEquals(emptyList(), CounterConsistency.check(s3.agg.totals))
+    }
+
+    // ---- review: gap causes compare the cycle with the expected processing interval, not with threshold ÷ 2
+
+    @Test
+    fun gapCauseUsesTheExpectedProcessingIntervalAsTheCycleCriterion() {
+        val start = 5_000_000_000L
+        val a = FeatureAggregator(
+            start / 1_000_000L, Synth.UTC0,
+            gapThresholdNs = GapThresholds.gapThresholdNs(frame24), longGapThresholdNs = GapThresholds.longGapThresholdNs(frame24),
+            sessionStartRawNs = start, expectedIntervalNs = frame24,
+        )
+        a.onScene(SceneSample(start, 118.0, 4.0, 9.0))
+        // a 35 ms cycle is shorter than one frame interval (41.7 ms): the analyzer was not the bottleneck → "other"
+        a.onFrameProcessed(ProcessedFrame(start, 30.0, FrameSample(start, 1_000_000L, false, wrapMs = 1.0, facePostMs = 0.5, totalMs = 35.0)))
+        a.onFrameProcessed(ProcessedFrame(start + 2 * frame24, 15.0, FrameSample(start + 2 * frame24, 1_000_000L, false, totalMs = 20.0)))
+        // a 45 ms cycle dominated by Face → Face
+        a.onFrameProcessed(ProcessedFrame(start + 3 * frame24, 40.0, FrameSample(start + 3 * frame24, 1_000_000L, false, wrapMs = 1.0, facePostMs = 0.5, totalMs = 45.0)))
+        a.onFrameProcessed(ProcessedFrame(start + 5 * frame24, 15.0, FrameSample(start + 5 * frame24, 1_000_000L, false, totalMs = 20.0)))
+        val raw = a.closeBuckets(start / 1_000_000L + 1_300, device)[0].raw
+        assertEquals(2, raw.gapCauses.values.sum())
+        assertEquals(1, raw.gapCauseOther)
+        assertEquals(1, raw.gapCauseFace)
     }
 }

@@ -27,11 +27,11 @@ data class SessionHeader(
     @SerialName("task_mode") val taskMode: TaskMode,
 
     // ---- capture preset (schema 0.2.3, CHANGELOG v0.2.3). Null / default in older logs.
-    /** Dev-app capture preset id (A, B, C, C2, D, E, G, F); null when the log predates presets. */
+    /** Dev-app capture preset id (A, B, C, C2, D, E, E15, G, H12, H15, Hvar); null when the log predates presets. */
     @SerialName("capture_preset") val capturePreset: String? = null,
-    /** Face runs on every n-th received frame: 1 = every frame, 2 = every other frame (preset E). */
+    /** Legacy (0.2.3): 2 for preset E (every other frame), 1 otherwise. From 0.2.4 the Face schedule is [faceSchedule] + [faceProcessPeriodNs]; readers prefer those. */
     @SerialName("frame_process_divisor") val frameProcessDivisor: Int = 1,
-    /** Threshold of `gaps_over_threshold`: 80 ms for every-frame presets, 2 × expected interval otherwise (167 ms for E). */
+    /** Threshold of `gaps_over_threshold` in rounded ms. 0.2.4: the rounding of [frameGapThresholdNs] (expected interval × 1.5: A 63, E 125, E15 100); 0.2.3 logs: 80, or 2 × expected interval (E 167). */
     @SerialName("frame_gap_threshold_ms") val frameGapThresholdMs: Int = 80,
     /** Face Landmarker delegate ("CPU", "GPU"); null when unknown. */
     @SerialName("face_delegate") val faceDelegate: String? = null,
@@ -39,7 +39,7 @@ data class SessionHeader(
     @SerialName("face_blendshapes") val faceBlendshapes: Boolean? = null,
     /** PerformanceHintManager target for the Face analysis thread (preset G); null when no hint session. */
     @SerialName("perf_hint_target_ms") val perfHintTargetMs: Int? = null,
-    /** Threshold of `gaps_over_long_threshold`: 200 ms for every-frame presets, 5 × expected interval otherwise (417 ms for E at 24 fps). */
+    /** Threshold of `gaps_over_long_threshold` in rounded ms. 0.2.4: the rounding of [frameLongGapThresholdNs] (expected interval × 4.5: A 188, E 375, E15 300); 0.2.3 logs: 200, or 5 × expected interval (E 417). */
     @SerialName("frame_long_gap_threshold_ms") val frameLongGapThresholdMs: Int = 200,
     /** Camera2 id of the camera in use; null in older logs. */
     @SerialName("camera_id") val cameraId: String? = null,

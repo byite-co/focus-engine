@@ -109,7 +109,9 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
     private var sessionStartRawNs = 0L
     /** Camera-counter messages that reached the queue before the first frame started the aggregator (never expected: FIFO order). */
     private var countersBeforeAggregator = 0L
-    /** Stop fence in both domains, set by stop step 1 on the main thread and read by the stop thread. */
+    /** Stop fence in both domains, chosen exactly once by stop step 1 (main thread, or the stop thread on a timeout). */
+    private val fenceLock = Any()
+    @Volatile private var stopFenceMonoMs: Long? = null
     @Volatile private var stopFenceRawNs: Long? = null
     @Volatile private var stopOffsetSnapshotNs: Long? = null
 
@@ -154,6 +156,7 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
         records.clear()
         timebaseLines.clear()
         countersBeforeAggregator = 0L
+        stopFenceMonoMs = null
         stopFenceRawNs = null
         stopOffsetSnapshotNs = null
         aggregator = null
@@ -298,6 +301,7 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
     override fun onPoseSuperseded(stamp: CameraStamp) = toAggregator { onPoseSuperseded(stamp) }
     override fun onPose(sample: PoseSample) = toAggregator { onPose(sample) }
     override fun onPoseError(stamp: CameraStamp) = toAggregator { onPoseError(stamp) }
+    override fun onStopFence(fenceMonoMs: Long, fenceRawNs: Long) = toAggregator { stopInputs(fenceMonoMs, fenceRawNs) }
     override fun onEvent(message: String) = event(message)
 
     // ---- aggregation thread
@@ -314,6 +318,7 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
             gapThresholdNs = facts.gapThresholdNs,
             longGapThresholdNs = facts.longGapThresholdNs,
             sessionStartRawNs = rawSensorTs,
+            expectedIntervalNs = facts.faceProcessPeriodNs,
         )
         aggregator = agg
         val h = SessionHeader(
@@ -482,37 +487,53 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
         Thread({ runStopSequence(reason) }, "focus-stop").start()
     }
 
+    /**
+     * Stop step 1, exactly once: freeze the camera offset, take the mono fence, derive the raw fence
+     * (`fenceMono − offsetSnapshot`) and hand it to the camera pipeline (scheduler + aggregator, before any producer stops).
+     * Returns the mono fence. A second call (the stop thread after a main-thread timeout, or vice versa) returns the first choice.
+     */
+    private fun chooseFence(): Long = synchronized(fenceLock) {
+        stopFenceMonoMs?.let { return it }
+        val snapshot = camera?.timebase?.freezeCameraOffset() ?: 0L
+        val fence = SystemClock.elapsedRealtime()
+        val fenceRaw = fence * FeatureAggregator.NS_PER_MS - snapshot
+        stopOffsetSnapshotNs = snapshot
+        stopFenceRawNs = fenceRaw
+        stopFenceMonoMs = fence
+        camera?.requestFence(fence, fenceRaw)
+        fence
+    }
+
     /** `focus-stop` thread: the [StopSequence] contract, then thread teardown on the main thread. */
     private fun runStopSequence(reason: SessionEndReason) {
         var summary = ""
+        var drainNote = "capture_result_drain=skipped"
         val seq = StopSequence(
             stopInputs = {
-                var fence = 0L
+                // directive E 5장: fence first (offset freeze, raw fence, handed to the scheduler and the aggregator), then the producers stop
                 runOn(mainHandler, 5_000L) {
-                    // directive E 5장: fence first (offset freeze, raw fence), then the producers stop
-                    val snapshot = camera?.timebase?.freezeCameraOffset() ?: 0L
-                    fence = SystemClock.elapsedRealtime()
-                    stopOffsetSnapshotNs = snapshot
-                    stopFenceRawNs = fence * FeatureAggregator.NS_PER_MS - snapshot
+                    chooseFence()
                     motion?.stop()
                     device.stopHingeMonitor()
                     camera?.unbind()
                 }
-                if (fence == 0L) {
-                    fence = SystemClock.elapsedRealtime()
-                    val snapshot = camera?.timebase?.freezeCameraOffset() ?: 0L
-                    stopOffsetSnapshotNs = snapshot
-                    stopFenceRawNs = fence * FeatureAggregator.NS_PER_MS - snapshot
-                }
-                fence
+                chooseFence() // no-op when the main-thread block ran; the stop thread's own fence when it timed out
             },
             raiseFence = { fence ->
+                // The fence already reached both consumers from stopInputs; this re-post covers a camera that delivers nothing more.
                 val fenceRaw = stopFenceRawNs ?: (fence * FeatureAggregator.NS_PER_MS)
-                analysisHandler?.post { camera?.applyFence(fenceRaw) }
+                analysisHandler?.post { camera?.applyPendingFence() }
                 aggHandler?.post { aggregator?.stopInputs(fence, fenceRaw) }
             },
-            // On a timeout the in-flight frame is invalidated by its generation: its outcome is never posted nor counted.
-            awaitAnalysisIdle = { timeout -> if (awaitIdle(analysisHandler, timeout)) 0L else (camera?.cancelAnalysis() ?: 0L) },
+            // Step 1 drain: the Camera2 capture results still in flight after unbind (camera CLOSED + quiet), then the analysis
+            // thread's queued work. On a timeout the in-flight frame is invalidated by its generation: its outcome is never posted nor counted.
+            awaitAnalysisIdle = { timeout ->
+                camera?.let { cam ->
+                    val (closed, quiet, elapsed) = cam.awaitCaptureResultsDrained(CAPTURE_DRAIN_CLOSED_TIMEOUT_MS, CAPTURE_DRAIN_QUIET_FRAMES, CAPTURE_DRAIN_QUIET_TIMEOUT_MS)
+                    drainNote = "capture_result_drain closed=$closed quiet=$quiet elapsed_ms=$elapsed"
+                }
+                if (awaitIdle(analysisHandler, timeout)) 0L else (camera?.cancelAnalysis() ?: 0L)
+            },
             closeSlotScheduler = {
                 var closed = 0L
                 runOn(analysisHandler, 2_000L) { closed = camera?.closeScheduler() ?: 0L }
@@ -540,7 +561,7 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
         }
         if (result != null) {
             event(
-                "stop_sequence steps=${result.steps.joinToString(">")} fence=${result.fenceMonoMs} fence_raw_ns=${stopFenceRawNs} offset_snapshot_ns=${stopOffsetSnapshotNs} " +
+                "stop_sequence steps=${result.steps.joinToString(">")} fence=${result.fenceMonoMs} fence_raw_ns=${stopFenceRawNs} offset_snapshot_ns=${stopOffsetSnapshotNs} $drainNote " +
                     "frames_cancelled=${result.framesCancelledAtStop} slots_closed_as_missed=${result.slotsClosedAsMissed} pose_cancelled=${result.poseCancelledAtStop} drained=${result.queueDrained} " +
                     "mismatches=${result.mismatches.size} capture_after_close=${result.totals.captureResultsAfterClose} stop_integrity_failed=${result.stopIntegrityFailed}",
             )
@@ -694,9 +715,8 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
             // session at the last record with session_end(PROCESS_DEATH_RECOVERED) (v0.2.1 판정 10) and the
             // recovered summary skips the counter check.
             stopping = true
-            val snapshot = camera?.timebase?.freezeCameraOffset() ?: 0L
-            val fence = SystemClock.elapsedRealtime()
-            val fenceRaw = fence * FeatureAggregator.NS_PER_MS - snapshot
+            val fence = chooseFence()
+            val fenceRaw = stopFenceRawNs ?: (fence * FeatureAggregator.NS_PER_MS)
             motion?.stop()
             device.stopHingeMonitor()
             camera?.unbind()
@@ -780,6 +800,10 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
         private const val WAKE_LOCK_TIMEOUT_MS = 6L * 60 * 60 * 1000
         private const val TIMEBASE_PERIOD_MS = 60_000L
         private const val STATUS_PERIOD_MS = 1_000L
+        /** Stop step 1 capture-result drain: wait for CameraX to report CLOSED, then for a quiet span of capture-result callbacks. */
+        private const val CAPTURE_DRAIN_CLOSED_TIMEOUT_MS = 1_500L
+        private const val CAPTURE_DRAIN_QUIET_FRAMES = 3
+        private const val CAPTURE_DRAIN_QUIET_TIMEOUT_MS = 500L
 
         /** Binder-free placeholder for a bucket that closes before the status thread delivered a sample (logged when used). */
         private val NO_DEVICE_SAMPLE = DeviceSample(thermalStatus = 0, isInteractive = false, isDeviceIdle = false, screenState = ScreenState.OFF, appState = AppState.BACKGROUND)

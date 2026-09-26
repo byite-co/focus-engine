@@ -50,7 +50,9 @@ import co.byite.focus.engine.pipeline.pose.PoseWorker
 import co.byite.focus.engine.pipeline.scene.SceneQuality
 import co.byite.focus.engine.timebase.Timebase
 import java.nio.ByteBuffer
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
+import java.util.concurrent.TimeUnit
 
 /** Camera facts for the header and the event log. Strings and scalars. */
 data class CameraFacts(
@@ -128,6 +130,12 @@ class CameraPipeline(
         /** Pose worker thread. */
         fun onPoseError(stamp: CameraStamp)
 
+        /**
+         * Analysis thread, the moment the scheduler takes the stop fence: the aggregator's `stopInputs(fenceMono, fenceRaw)`
+         * must be queued here so it precedes every counter the scheduler emits from now on (same FIFO queue).
+         */
+        fun onStopFence(fenceMonoMs: Long, fenceRawNs: Long)
+
         /** Any thread. */
         fun onEvent(message: String)
     }
@@ -140,6 +148,14 @@ class CameraPipeline(
     private var scratch: ByteBuffer? = null
     /** Slot scheduler + counter glue (core), created at [bind]; analysis thread only. */
     @Volatile private var scheduler: FrameScheduler? = null
+    /** Stop fence requested by the main thread ([requestFence]); the analysis thread applies it at its next entry, before any producer stops. */
+    @Volatile private var pendingFenceMonoMs: Long? = null
+    @Volatile private var pendingFenceRawNs: Long? = null
+    private var fenceApplied = false
+    /** Camera2 capture-result drain (stop): the last capture result's arrival and the camera's CLOSED state. */
+    @Volatile private var lastCaptureResultAtMs = 0L
+    private val cameraClosed = CountDownLatch(1)
+    @Volatile private var frameIntervalMs = 42L
     /** Generation gate of the per-frame work (code review item 2). */
     private val gate = AnalysisGate()
     private var hintSession: PerformanceHintManager.Session? = null
@@ -243,6 +259,7 @@ class CameraPipeline(
         val nominalFps = request?.upper ?: 30
         val processPeriodNs = preset.faceProcessPeriodNs(nominalFps)
         val frameIntervalNs = GapThresholds.frameIntervalNs(nominalFps)
+        frameIntervalMs = (frameIntervalNs / 1_000_000L).coerceAtLeast(1L)
         scheduler = FrameScheduler(listener, preset.slotPeriodNs(), frameIntervalNs)
         listener.onEvent(
             "fps_request preset=${preset.id} wanted=${preset.cameraFps.label} selected=${request?.toString() ?: "unset"} nominal=$nominalFps " +
@@ -276,6 +293,7 @@ class CameraPipeline(
             override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
                 val ts = result.get(CaptureResult.SENSOR_TIMESTAMP)
                 val fps = result.get(CaptureResult.CONTROL_AE_TARGET_FPS_RANGE)?.let { "[${it.lower},${it.upper}]" }
+                lastCaptureResultAtMs = SystemClock.elapsedRealtime()
                 analysisHandler.post {
                     if (ts != null) onCaptureResult(ts, tb)
                     if (fps != null && fps != fpsEffective) {
@@ -304,6 +322,7 @@ class CameraPipeline(
         camera.cameraInfo.cameraState.observe(owner) { st ->
             val err = st.error
             listener.onEvent("camera_state ${st.type}${if (err != null) " error=${err.code} ${err.cause?.message ?: ""}" else ""}")
+            if (st.type == androidx.camera.core.CameraState.Type.CLOSED) cameraClosed.countDown()
         }
         val res = analysis.resolutionInfo?.resolution
         val lensFacing = when (c2.getCameraCharacteristic(CameraCharacteristics.LENS_FACING)) {
@@ -341,17 +360,74 @@ class CameraPipeline(
     /** Analysis thread: one capture result (raw `SENSOR_TIMESTAMP`) into the scheduler; it emits `frames_requested` and the slot decision. */
     private fun onCaptureResult(rawTs: Long, tb: Timebase) {
         val sch = scheduler ?: return
+        applyPendingFence(sch)
         val d = sch.onCaptureResult(CameraStamp(rawTs, tb.cameraToMonoNoSample(rawTs)))
         if (d == FrameScheduler.CaptureDecision.AFTER_CLOSE && ++captureAfterCloseLogged <= 20) listener.onEvent("capture_result_after_close raw_ts=$rawTs")
     }
 
-    /** Stop step 1 (analysis thread): `stopFenceRawTs` — capture results and frames at or after it are rejected. */
-    fun applyFence(fenceRawNs: Long) {
-        scheduler?.fence(fenceRawNs)
+    /**
+     * Stop step 1, main thread, **before** the producers stop (directive E 5장): the fence in both domains. The analysis
+     * thread applies it at its next capture result or frame ([applyPendingFence]) and queues the aggregator's fence
+     * through [Listener.onStopFence] ahead of every later counter, so no capture result stamped at or after the raw fence
+     * can become an expected slot while the camera is still winding down.
+     */
+    fun requestFence(fenceMonoMs: Long, fenceRawNs: Long) {
+        if (pendingFenceRawNs == null) {
+            pendingFenceMonoMs = fenceMonoMs
+            pendingFenceRawNs = fenceRawNs
+        }
     }
 
-    /** Stop step 2 (analysis thread): CLOSE the scheduler; returns the open slots terminated as missed. */
-    fun closeScheduler(): Long = scheduler?.close() ?: 0L
+    /** Analysis thread: apply a requested fence once (idempotent); also the target of the stop sequence's `raise_fence` post. */
+    fun applyPendingFence(sch: FrameScheduler? = scheduler) {
+        if (fenceApplied) return
+        val raw = pendingFenceRawNs ?: return
+        val mono = pendingFenceMonoMs ?: return
+        fenceApplied = true
+        sch?.fence(raw)
+        listener.onStopFence(mono, raw)
+    }
+
+    /**
+     * Stop step 1, stop thread: wait for the Camera2 capture results still in flight after [unbind] — until the camera
+     * reports CLOSED (bounded by [closedTimeoutMs]) and no capture result arrived for [quietFrames] frame intervals
+     * (bounded by [quietTimeoutMs]). Returns (closed seen, quiet reached, elapsed ms) for the event log.
+     */
+    fun awaitCaptureResultsDrained(closedTimeoutMs: Long, quietFrames: Int, quietTimeoutMs: Long): Triple<Boolean, Boolean, Long> {
+        val t0 = SystemClock.elapsedRealtime()
+        val closed = try {
+            cameraClosed.await(closedTimeoutMs, TimeUnit.MILLISECONDS)
+        } catch (e: InterruptedException) {
+            false
+        }
+        val quietMs = frameIntervalMs * quietFrames
+        var quiet = false
+        val deadline = SystemClock.elapsedRealtime() + quietTimeoutMs
+        while (SystemClock.elapsedRealtime() < deadline) {
+            val since = SystemClock.elapsedRealtime() - lastCaptureResultAtMs
+            if (since >= quietMs) {
+                quiet = true
+                break
+            }
+            try {
+                Thread.sleep((quietMs - since).coerceIn(1L, 20L))
+            } catch (e: InterruptedException) {
+                break
+            }
+        }
+        return Triple(closed, quiet, SystemClock.elapsedRealtime() - t0)
+    }
+
+    /** The CLOSE step of the stop order (analysis thread): CLOSE the scheduler; returns the open slots terminated as missed. */
+    fun closeScheduler(): Long {
+        val sch = scheduler ?: return 0L
+        applyPendingFence(sch)
+        if (sch.fenceRawTs == null) {
+            listener.onEvent("close_scheduler_without_fence") // stop order violated; leave the scheduler open rather than close it unfenced
+            return 0L
+        }
+        return sch.close()
+    }
 
     /** Main thread. Stop step 1: no frame reaches [analyze] after this returns (a call already running finishes). */
     fun unbind() {
@@ -414,6 +490,7 @@ class CameraPipeline(
             }
             val sch = scheduler
             if (sch == null) return // bind() has not run: nothing is counted
+            applyPendingFence(sch)
             if (sessionStartMs < 0) {
                 sessionStartMs = tsMs
                 sessionStartRaw = rawTs

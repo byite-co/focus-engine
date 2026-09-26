@@ -36,6 +36,6 @@ interface CameraCounterSink {
     /** A selected slot terminated without a Face success: `processing_slots_missed` +1. */
     fun onSlotMissed(stamp: CameraStamp)
 
-    /** A capture result that reached the scheduler after its CLOSE (stop step 4): `capture_results_after_close` +1; normal stops have none. */
+    /** A pre-fence capture result that reached the scheduler after its CLOSE (the CLOSE step of the stop order): `capture_results_after_close` +1; normal stops have none. */
     fun onCaptureResultAfterClose(stamp: CameraStamp)
 }

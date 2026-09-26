@@ -84,11 +84,18 @@ class FeatureAggregator(
     private val longGapThresholdNs: Long = DEFAULT_LONG_GAP_THRESHOLD_NS,
     /** Raw camera timestamp (ns) of the first analyzer frame = start of the raw session window (directive E 4장). Defaults to the mono start (REALTIME camera). */
     private val sessionStartRawNs: Long = tStartMonoMs * NS_PER_MS,
+    /**
+     * Expected interval between processed frames (ns), the cycle-length criterion of the gap-cause attribution: a cycle
+     * shorter than it means the analyzer was not the bottleneck. Presets pass their expected processing interval;
+     * the default is the legacy `threshold ÷ 2` (40 ms at the 80 ms default) for callers that pass no threshold.
+     */
+    private val expectedIntervalNs: Long = gapThresholdNs / 2,
 ) : CameraCounterSink {
     init {
         require(closeDelayMs >= 0) { "closeDelayMs must not be negative" }
         require(gapThresholdNs > 0) { "gapThresholdNs must be positive" }
         require(longGapThresholdNs >= gapThresholdNs) { "longGapThresholdNs must not be below gapThresholdNs" }
+        require(expectedIntervalNs > 0) { "expectedIntervalNs must be positive" }
     }
 
     /** Stage times of the last processed frame, kept to name the cause of the next over-threshold gap. */
@@ -368,12 +375,12 @@ class FeatureAggregator(
     /**
      * Which stage of the previous processed frame's cycle explains a gap over the threshold (원래 지시문 D 2번):
      * the longest of wrap / Face (inference + post) / scene / pose copy / enqueue when that cycle took at least the
-     * expected frame interval (threshold ÷ 2), i.e. the analyzer was the bottleneck; otherwise "other" (no sample,
-     * or a cycle short enough that the camera or the system must have stalled). Index into [V0bRawRecord.GAP_CAUSE_ORDER].
+     * expected processing interval ([expectedIntervalNs]), i.e. the analyzer was the bottleneck; otherwise "other" (no
+     * sample, or a cycle short enough that the camera or the system must have stalled). Index into [V0bRawRecord.GAP_CAUSE_ORDER].
      */
     private fun gapCause(prev: PrevCycle?): Int {
         val sample = prev?.sample ?: return GAP_CAUSE_OTHER
-        val expectedIntervalMs = gapThresholdNs / 2.0 / NS_PER_MS
+        val expectedIntervalMs = expectedIntervalNs.toDouble() / NS_PER_MS
         if (sample.totalMs < expectedIntervalMs) return GAP_CAUSE_OTHER
         val stages = doubleArrayOf(sample.wrapMs, prev.faceInferMs + sample.facePostMs, sample.sceneMs ?: 0.0, sample.poseCopyMs ?: 0.0, sample.enqueueMs)
         var best = 0
