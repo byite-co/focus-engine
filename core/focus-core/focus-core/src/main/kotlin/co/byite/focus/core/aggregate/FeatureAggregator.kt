@@ -53,9 +53,10 @@ data class ProcessedFrame(
  * exactly when `sessionStartRawTs ≤ rawSensorTs < stopFenceRawTs` on the **raw** camera clock ([CameraStamp]);
  * earlier ones go to [CounterTotals.inputsBeforeStart], later ones (after [stopInputs]) to
  * [CounterTotals.inputsAfterFence]. An input admitted by its raw timestamp is never rejected again because of its
- * mono position: the bucket index is the mono position clamped to `[first bucket, last partial bucket]`, so a first
- * frame converted with an older offset lands in bucket 0 and a pre-fence frame whose mono value passed the mono
- * fence lands in the last partial bucket and counts as applied. The clamp is not the late rule: a sample whose
+ * mono position: the bucket index is the mono position clamped to `[first bucket, last bucket]`
+ * ([lastPartialBucketIndex] = `(fence − start − 1) ÷ period`), so a first frame converted with an older offset lands in
+ * bucket 0 and a pre-fence frame whose mono value passed the mono fence lands in the last bucket the session holds and
+ * counts as applied. The clamp is not the late rule: a sample whose
  * bucket already closed (end + [closeDelayMs]) is still `frames_sample_late_dropped` / `pose_late_dropped`.
  * Inputs without a camera timestamp (IMU) keep the mono window. Counters that reach the aggregator after their
  * bucket closed are attributed to the oldest open bucket so that the session totals ([totals]) stay conserved;
@@ -67,8 +68,11 @@ data class ProcessedFrame(
  * the totals. Gap thresholds are the formula of [GapThresholds] applied to the preset's expected processing
  * interval, passed in as ns. A session without a fixed AE request and without a slot period ("fps unset", E2 1장)
  * has no expected interval at the start: with [learnThresholdsFromWarmup] the diagnostic interval is the median of
- * the per-second capture-interval medians of the warm-up (the first [FocusSchema.WARMUP_MS], learned when the last
- * warm-up bucket closes); before that no gap is over any threshold, and the summary shows the thresholds as n/a.
+ * the per-second capture-interval medians of the warm-up buckets (the first [FocusSchema.WARMUP_MS]; the statistic the
+ * summary's warm-up row shows, chosen because per-second records carry no arrays). It is learned by capture timestamp,
+ * at the first processed frame stamped at or after the warm-up end (so every frame of second 60 on is counted against
+ * it, whatever the bucket-closing tick does), or when the last warm-up bucket closes if no such frame came; before that
+ * no gap is over any threshold, and the summary shows the thresholds as n/a.
  *
  * V0-B has no calibration and no gates, so the fields that depend on them are left empty:
  * `raw_state`, `final_state`, `invalid_reason`, `candidate_*`, `events`, `torso_*_ratio`,
@@ -111,9 +115,10 @@ class FeatureAggregator(
     private var gapNs: Long? = if (learnThresholdsFromWarmup) null else gapThresholdNs
     private var longGapNs: Long? = if (learnThresholdsFromWarmup) null else longGapThresholdNs
     private var expectedNs: Long? = if (learnThresholdsFromWarmup) null else expectedIntervalNs
-    private val warmupIntervalMedians = ArrayList<Double>()
+    /** Per-second capture-interval medians (ms) of the warm-up buckets already emitted, by bucket index. */
+    private val warmupIntervalMedians = HashMap<Long, Double>()
 
-    /** fps unset: the diagnostic expected interval learned at the close of the last warm-up bucket; null before that or without capture results. */
+    /** fps unset: the diagnostic expected interval learned from the warm-up; null before the warm-up ends or without capture results. */
     var learnedExpectedIntervalNs: Long? = null
         private set
 
@@ -362,6 +367,8 @@ class FeatureAggregator(
         b.processed++
         tProcessed++
         b.faceInferMs.add(frame.faceInferMs)
+        // fps unset: the first frame captured at or after the warm-up end fixes the diagnostic thresholds before its gap is judged
+        if (learnThresholdsFromWarmup && learnedExpectedIntervalNs == null && frame.captureMonoNs >= startNs + WARMUP_BUCKETS * periodNs) learnFromWarmup()
         if (lastProcessedNs != Long.MIN_VALUE) {
             val gap = frame.captureMonoNs - lastProcessedNs
             if (gap <= 0L) {
@@ -510,7 +517,7 @@ class FeatureAggregator(
     /**
      * Accept fence (정정 5 · 명확화; directive E 4·5장): from now on camera inputs with `rawSensorTs ≥ fenceRawNs` and
      * IMU inputs at or after [fenceMonoMs] are not counted. Camera inputs captured before the raw fence that are
-     * still in flight are accepted until [finish], whatever their mono position (clamped to the last partial bucket).
+     * still in flight are accepted until [finish], whatever their mono position (clamped to the last bucket, [lastPartialBucketIndex]).
      * [fenceRawNs] = `fenceMono − offsetSnapshot` with the camera offset frozen at the fence; it defaults to the
      * mono value (REALTIME camera). A raw fence before the raw start (a session shorter than the offset drift on an
      * UNKNOWN camera) is clamped to the start: the window is then empty rather than inverted. The first call wins.
@@ -557,8 +564,8 @@ class FeatureAggregator(
         val captureIntervals = b.captureIntervalsNs.map { it.toDouble() / NS_PER_MS }
         val captureIntervalMedian = Stats.medianOf(captureIntervals)
         if (learnThresholdsFromWarmup && learnedExpectedIntervalNs == null && k < WARMUP_BUCKETS) {
-            captureIntervalMedian?.let { warmupIntervalMedians.add(it) }
-            if (k == WARMUP_BUCKETS - 1) learnFromWarmup()
+            captureIntervalMedian?.let { warmupIntervalMedians[k] = it }
+            if (k == WARMUP_BUCKETS - 1) learnFromWarmup() // no frame at or after the warm-up end was processed: learn as the last warm-up bucket closes
         }
         val lastPose = b.poses.lastOrNull { it.hasShoulders }
         val headPresent = lastPose?.headLandmarkPresent ?: false
@@ -696,11 +703,17 @@ class FeatureAggregator(
 
     /**
      * fps unset: the diagnostic expected interval = median of the per-second capture-interval medians of the warm-up
-     * buckets (the same statistic the summary's warm-up row shows), in force from the close of the last warm-up bucket.
-     * Nothing is learned when the warm-up had no capture results.
+     * buckets 0 … [WARMUP_BUCKETS] − 1 (the same statistic the summary's warm-up row shows): the medians recorded when
+     * a bucket was emitted, and the current median of the warm-up buckets still open. Nothing is learned when the
+     * warm-up had no capture results.
      */
     private fun learnFromWarmup() {
-        val medianMs = Stats.medianOf(warmupIntervalMedians) ?: return
+        val medians = ArrayList<Double>()
+        for (k in 0 until WARMUP_BUCKETS) {
+            val m = warmupIntervalMedians[k] ?: open[k]?.let { b -> Stats.medianOf(b.captureIntervalsNs.map { it.toDouble() / NS_PER_MS }) }
+            if (m != null) medians.add(m)
+        }
+        val medianMs = Stats.medianOf(medians) ?: return
         val learned = (medianMs * NS_PER_MS).roundToLong().coerceAtLeast(1L)
         learnedExpectedIntervalNs = learned
         expectedNs = learned
@@ -721,7 +734,7 @@ class FeatureAggregator(
     /**
      * Bucket index of a camera-origin input (directive E 4장): membership by the raw timestamp
      * (`sessionStartRawTs ≤ raw < stopFenceRawTs`, or null and a counter bump), position by the mono timestamp clamped
-     * to `[bucket 0, last partial bucket]` so that an admitted input is never rejected again because of its mono value.
+     * to `[bucket 0, last bucket]` ([lastPartialBucketIndex]) so that an admitted input is never rejected again because of its mono value.
      */
     private fun cameraBucketIndex(stamp: CameraStamp): Long? {
         if (stamp.rawSensorTs < sessionStartRawNs) {

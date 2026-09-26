@@ -160,6 +160,7 @@ class CaptureService : LifecycleService(), CameraPipeline.Listener {
         records.clear()
         timebaseLines.clear()
         countersBeforeAggregator = 0L
+        warmupIntervalLogged = false
         stopFenceMonoMs = null
         stopFenceRawNs = null
         stopOffsetSnapshotNs = null

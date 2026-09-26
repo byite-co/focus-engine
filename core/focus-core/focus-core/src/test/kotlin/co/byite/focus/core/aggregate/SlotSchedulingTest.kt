@@ -707,7 +707,7 @@ class SlotSchedulingTest {
         assertEquals(emptyList(), rs.mismatches)
         assertFalse(rs.stopIntegrityFailed, "out of order is not a stop-integrity cause")
         val slotLog = SessionLog(fixedHeader("E15", FaceSchedule.SLOT, period15, slot.startMonoMs), rs.records.map { it.second }, sessionEnd = rs.end, v0bRaw = rs.records.map { it.raw })
-        val slotSummary = V0bReport.build(slotLog, stop = StopSummary(checked = true, totals = rs.totals, captureResultDrainComplete = true, aggregationQueueDrained = true))
+        val slotSummary = V0bReport.build(slotLog, stop = StopSummary(checked = true, mismatches = rs.mismatches, totals = rs.totals, captureResultDrainComplete = true, aggregationQueueDrained = true))
         assertEquals(1L, slotSummary.overall.diagnostics.captureResultsOutOfOrder)
         assertEquals(ComparisonState.NOT_COMPARABLE, slotSummary.comparability.state)
         assertEquals(listOf("${V0bReport.REASON_OUT_OF_ORDER} 1건"), slotSummary.comparability.reasons)
@@ -721,22 +721,37 @@ class SlotSchedulingTest {
         assertEquals(1L, every.scheduler.captureResultsOutOfOrder)
         assertEquals(1L, re.end.captureResultsOutOfOrder)
         assertEquals(1L, re.totals.processingSlotsMissed)
+        assertEquals(emptyList(), re.mismatches, "the relations hold with the out-of-order slot expected and missed")
         val everyLog = SessionLog(fixedHeader("A", FaceSchedule.EVERY_FRAME, frame24, every.startMonoMs), re.records.map { it.second }, sessionEnd = re.end, v0bRaw = re.records.map { it.raw })
-        val everySummary = V0bReport.build(everyLog, stop = StopSummary(checked = true, totals = re.totals, captureResultDrainComplete = true, aggregationQueueDrained = true))
+        val everySummary = V0bReport.build(everyLog, stop = StopSummary(checked = true, mismatches = re.mismatches, totals = re.totals, captureResultDrainComplete = true, aggregationQueueDrained = true))
         assertEquals(ComparisonState.COMPARABLE, everySummary.comparability.state, everySummary.comparability.toString())
         assertTrue("out_of_order 1" in everySummary.render())
     }
 
     // ---- (r) E2 1장: fps unset (neither [24,24] nor [30,30]) — no 30 fps assumption; the diagnostic interval is the warm-up's capture-interval median
 
+    /** A continuous raw-timestamp stream whose cadence changes: (fps, seconds) pieces. */
+    private fun piecewise(pieces: List<Pair<Double, Double>>, startRaw: Long = 5_000_000_000L): List<Long> {
+        val out = ArrayList<Long>()
+        var t = startRaw.toDouble()
+        for ((fps, seconds) in pieces) {
+            val n = (fps * seconds).toInt()
+            val interval = 1e9 / fps
+            repeat(n) { out.add(t.roundToLong()); t += interval }
+        }
+        return out
+    }
+
     @Test
     fun r_anUnsetFpsSessionLearnsItsDiagnosticIntervalFromTheWarmupAndIsNeverJudged() {
-        val fps = 27.5 // whatever the HAL default happens to be
-        val all = stream(fps, 75.0)
-        val interval = (1e9 / fps).roundToLong()
+        // whatever the HAL default does: 27.5 fps for 20 s, then 15 fps for the rest of the warm-up, then 27.5 fps again —
+        // so the median of the per-second medians (66.7 ms) is far from their mean (≈ 56.5 ms) and from any assumed 30 fps
+        val all = piecewise(listOf(27.5 to 20.0, 15.0 to 40.0, 27.5 to 16.0))
+        val fast = (1e9 / 27.5).roundToLong()
+        val slow = (1e9 / 15.0).roundToLong()
         fun gapAt(sec: Int) = all.indexOfFirst { it - all[0] >= sec * 1_000_000_000L }
-        val g1 = gapAt(30) // a 3-frame gap inside the warm-up
-        val g2 = gapAt(70) // and one after it
+        val g1 = gapAt(30) // a 3-frame gap inside the warm-up (15 fps: 200 ms)
+        val g2 = gapAt(70) // and one after it (27.5 fps: 109 ms)
         val raws = all.filterIndexed { i, _ -> i != g1 && i != g1 + 1 && i != g2 && i != g2 + 1 }
         val s = Session(raws[0], null, GapThresholds.frameIntervalNs(30), learnFromWarmup = true)
         assertNull(s.agg.currentGapThresholdNs, "no expected interval is assumed at the start")
@@ -746,24 +761,31 @@ class SlotSchedulingTest {
         assertEquals(59, early.size)
         val warmGap = early[30].second
         assertEquals(0, warmGap.gapsOverThreshold, "no threshold in force during the warm-up")
-        assertEquals(1, warmGap.gapsOver80Ms, "the fixed 80 ms diagnostic still counts the 109 ms gap")
-        assertEquals(109L, warmGap.maxFrameGapMs)
-        // the aggregation tick closes bucket 59 at ~60.3 s, before the frames of the 70th second arrive
-        for (r in raws.filter { it - raws[0] >= 59_000_000_000L && it - raws[0] < 61_000_000_000L }) s.both(r)
-        val atSixtyOne = s.closeAll(s.startMonoMs + 61_400)
-        assertEquals(listOf(59L, 60L), atSixtyOne.map { (it.second.tMonoMs - s.startMonoMs) / 1000 })
-        val learned = assertNotNull(s.agg.learnedExpectedIntervalNs, "learned when the last warm-up bucket closed")
-        for (r in raws.filter { it - raws[0] >= 61_000_000_000L }) s.both(r)
-        val rest = atSixtyOne + s.closeAll(s.startMonoMs + 76_000)
-        assertTrue(abs(learned - interval) <= 2L, "learned $learned ns vs the real interval $interval ns")
+        assertEquals(1, warmGap.gapsOver80Ms, "the fixed 80 ms diagnostic still counts the 200 ms gap")
+        assertEquals(200L, warmGap.maxFrameGapMs)
+        // learned by capture timestamp: the first processed frame stamped ≥ 60 s fixes the thresholds, before any bucket-closing tick
+        for (r in raws.filter { it - raws[0] >= 59_000_000_000L && it - raws[0] < 60_000_000_000L }) s.both(r)
+        assertNull(s.agg.learnedExpectedIntervalNs)
+        s.both(raws.first { it - raws[0] >= 60_000_000_000L })
+        val learned = assertNotNull(s.agg.learnedExpectedIntervalNs, "learned at the first frame at or after the warm-up end, not at a tick")
+        for (r in raws.filter { it - raws[0] > 60_000_000_000L }) s.both(r)
+        val rest = s.closeAll(s.startMonoMs + 76_000)
+        val records = early + rest
+        // the statistic: the median of the per-second capture-interval medians of buckets 0..59 — exactly what the records say, and not their mean
+        val warmupMedians = records.take(60).mapNotNull { it.raw.captureIntervalMsMedian }
+        assertEquals(60, warmupMedians.size)
+        assertEquals((Stats.medianOf(warmupMedians)!! * 1_000_000.0).roundToLong(), learned)
+        assertTrue(abs(learned - slow) <= 2L, "learned $learned ns is the 15 fps interval $slow ns (40 of the 60 warm-up seconds)")
+        assertTrue(abs(learned - (Stats.meanOf(warmupMedians)!! * 1_000_000.0).roundToLong()) > 5_000_000L, "a mean would be ≈ 56.5 ms, not the median")
+        assertTrue(abs(learned - GapThresholds.frameIntervalNs(30)) > 20_000_000L, "and it is nowhere near an assumed 30 fps")
         assertEquals(GapThresholds.gapThresholdNs(learned), s.agg.currentGapThresholdNs)
         assertEquals(GapThresholds.longGapThresholdNs(learned), s.agg.currentLongGapThresholdNs)
-        val records = early + rest
         val lateGap = records[70].second
-        assertEquals(1, lateGap.gapsOverThreshold, "after the warm-up a 3-frame gap (109 ms) is over 1.5 × 36.4 ms")
+        assertEquals(1, lateGap.gapsOverThreshold, "after the warm-up a 109 ms gap is over 1.5 × 66.7 ms = 100 ms")
         assertEquals(0, lateGap.gapsOverLongThreshold)
+        assertEquals(0, records.take(60).sumOf { it.second.gapsOverThreshold }, "nothing in the warm-up was counted against a threshold")
         // the summary: thresholds n/a, the learned diagnostic shown, nothing judged, "비교 불가: fps unset(가변)"
-        val fenceRaw = raws.last() + interval
+        val fenceRaw = raws.last() + fast
         val r = s.stop(fenceRaw)
         val header = Synth.header.copy(
             tStartMonoMs = s.startMonoMs, capturePreset = "A", nominalFps = 0, cameraFpsRangesSupported = "[15,30]", faceSchedule = FaceSchedule.EVERY_FRAME,
@@ -787,7 +809,7 @@ class SlotSchedulingTest {
         assertEquals(listOf(V0bReport.REASON_FPS_UNSET), summary.comparability.reasons)
         val text = summary.render()
         assertEquals(V0bReport.NOT_COMPARABLE_PREFIX + V0bReport.REASON_FPS_UNSET, text.lines()[0], text)
-        assertTrue(text.lines().any { it.startsWith(V0bReport.FPS_UNSET_PREFIX) && "진단용 기대 간격 = 워밍업 60초 CaptureResult 간격 중앙값 ${Stats.fmt(learned / 1e6, 1)}ms" in it }, text)
+        assertTrue(text.lines().any { it.startsWith(V0bReport.FPS_UNSET_PREFIX) && "진단용 기대 간격 = 워밍업 60초 CaptureResult 간격 중앙값(초당 중앙값의 중앙값) ${Stats.fmt(learned / 1e6, 1)}ms" in it }, text)
         assertTrue("@ ${SessionHeader.FPS_UNSET_LABEL}(CameraX 실제 선택)" in text, text)
         assertTrue("카메라 ${SessionHeader.FPS_UNSET_LABEL}, 갭 임계 n/a" in text, text)
         assertTrue("합격 판정 안 함(프리셋 A, ${SessionHeader.FPS_UNSET_LABEL})" in text, text)

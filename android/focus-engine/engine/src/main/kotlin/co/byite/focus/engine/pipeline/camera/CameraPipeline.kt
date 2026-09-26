@@ -154,9 +154,11 @@ class CameraPipeline(
     @Volatile private var pendingFenceMonoMs: Long? = null
     @Volatile private var pendingFenceRawNs: Long? = null
     private var fenceApplied = false
-    /** Camera2 capture-result drain (stop): the last capture result's arrival and the camera's CLOSED state. */
+    /** Camera2 capture-result drain (stop): the last capture result's arrival and the camera's CLOSED state after it was open. */
     @Volatile private var lastCaptureResultAtMs = 0L
     private val cameraClosed = CountDownLatch(1)
+    /** Main thread: a non-CLOSED camera state was observed for this bind, so the next CLOSED is the real close. */
+    private var cameraSeenOpen = false
     @Volatile private var frameIntervalMs = 42L
     /** Generation gate of the per-frame work (code review item 2). */
     private val gate = AnalysisGate()
@@ -322,7 +324,9 @@ class CameraPipeline(
         camera.cameraInfo.cameraState.observe(owner) { st ->
             val err = st.error
             listener.onEvent("camera_state ${st.type}${if (err != null) " error=${err.code} ${err.cause?.message ?: ""}" else ""}")
-            if (st.type == androidx.camera.core.CameraState.Type.CLOSED) cameraClosed.countDown()
+            // CameraX delivers its initial CLOSED state on observe(); only a CLOSED that follows a non-CLOSED state is the stop-side close (E2 review)
+            if (st.type != androidx.camera.core.CameraState.Type.CLOSED) cameraSeenOpen = true
+            else if (cameraSeenOpen) cameraClosed.countDown()
         }
         val res = analysis.resolutionInfo?.resolution
         val lensFacing = when (c2.getCameraCharacteristic(CameraCharacteristics.LENS_FACING)) {

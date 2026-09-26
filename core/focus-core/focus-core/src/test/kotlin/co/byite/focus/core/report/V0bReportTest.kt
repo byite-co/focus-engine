@@ -202,9 +202,20 @@ class V0bReportTest {
         // Hvar: the third state, not an error — and a broken Hvar session still shows what is wrong
         val hvar = base.copy(header = base.header.copy(capturePreset = "Hvar", cameraFpsRequestLower = 7, cameraFpsRequestUpper = 15, nominalFps = 15))
         assertEquals(V0bReport.NOT_APPLICABLE_LINE, first(hvar))
-        assertEquals(ComparisonState.NOT_APPLICABLE, V0bReport.build(hvar, stop = cleanStop).comparability.state)
-        assertFalse(V0bReport.build(hvar, stop = cleanStop).comparability.comparable)
-        assertEquals("${V0bReport.NOT_APPLICABLE_LINE} · 이상: ${V0bReport.REASON_COUNTER_MISMATCH} 1건", first(hvar, cleanStop.copy(mismatches = listOf("x"))))
+        val cleanHvar = V0bReport.build(hvar, stop = cleanStop)
+        assertEquals(ComparisonState.NOT_APPLICABLE, cleanHvar.comparability.state)
+        assertFalse(cleanHvar.comparability.comparable)
+        assertNull(cleanHvar.comparability.anomalyLine)
+        assertFalse(cleanHvar.render().lines()[1].startsWith(V0bReport.ANOMALY_PREFIX))
+        // the first line stays the literal third state; the failing conditions come on the line after it
+        val brokenHvar = V0bReport.build(hvar, stop = cleanStop.copy(mismatches = listOf("x"))).render().lines()
+        assertEquals(V0bReport.NOT_APPLICABLE_LINE, brokenHvar[0])
+        assertEquals("${V0bReport.ANOMALY_PREFIX}${V0bReport.REASON_COUNTER_MISMATCH} 1건", brokenHvar[1])
+        assertEquals("계수 불일치: x", brokenHvar[2])
+        // the recorded verdict never hides a cause the live stop knows failed (an end line without the drain fields + a failed live drain)
+        val oldEnd = SessionEnd(Synth.mono(130), Synth.utc(130), SessionEndReason.USER, 0, 0, 0, null, null, null, false)
+        assertEquals("${V0bReport.NOT_COMPARABLE_PREFIX}${StopIntegrity.REASON_DRAIN}(stop_integrity_failed)", first(base.copy(sessionEnd = oldEnd), cleanStop.copy(captureResultDrainComplete = false)))
+        assertEquals(V0bReport.COMPARABLE_LINE, first(base.copy(sessionEnd = oldEnd)), "a recorded false verdict with no failed cause stays false")
     }
 
     @Test

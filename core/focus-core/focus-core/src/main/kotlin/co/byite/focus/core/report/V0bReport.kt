@@ -251,6 +251,9 @@ data class StopDiagnostics(
             val afterClose = end?.captureResultsAfterClose ?: t?.captureResultsAfterClose
             val drain = end?.captureResultDrainComplete ?: stop.captureResultDrainComplete
             val queue = end?.aggregationQueueDrained ?: stop.aggregationQueueDrained
+            // the verdict is the OR of the recorded one and the merged causes: a cause the end line lacks but the live stop knows failed still counts
+            val recorded = end?.stopIntegrityFailed
+            val merged = StopIntegrity(afterClose, drain, queue).failed
             return StopDiagnostics(
                 captureResultsBeforeStart = end?.captureResultsBeforeStart ?: t?.captureResultsBeforeStart,
                 captureResultsAfterFence = end?.captureResultsAfterFence ?: t?.captureResultsAfterFence,
@@ -258,7 +261,11 @@ data class StopDiagnostics(
                 captureResultsOutOfOrder = end?.captureResultsOutOfOrder ?: t?.captureResultsOutOfOrder,
                 captureResultDrainComplete = drain,
                 aggregationQueueDrained = queue,
-                stopIntegrityFailed = end?.stopIntegrityFailed ?: StopIntegrity(afterClose, drain, queue).failed,
+                stopIntegrityFailed = when {
+                    recorded == true || merged == true -> true
+                    recorded == null && merged == null -> null
+                    else -> false
+                },
             )
         }
     }
@@ -278,18 +285,22 @@ enum class ComparisonState {
  * Whether a session may enter a pair comparison (E2 3장):
  * `comparable = counter_consistency_ok AND !stop_integrity_failed AND (cadence_ok OR cadence n/a) AND !(slot mode AND
  * out_of_order > 0) AND fixed_ae_request_available`. Hvar is [ComparisonState.NOT_APPLICABLE] whatever else holds; any
- * failing condition is still listed in [reasons] so a broken Hvar session is not silently clean.
+ * failing condition is still listed in [reasons] (shown on the line after the state line) so a broken Hvar session is
+ * not silently clean.
  */
 data class Comparability(val state: ComparisonState, val reasons: List<String>) {
     val comparable: Boolean get() = state == ComparisonState.COMPARABLE
 
-    /** The summary's first line. */
+    /** The summary's first line: exactly one of the three states. */
     val line: String
         get() = when (state) {
             ComparisonState.COMPARABLE -> V0bReport.COMPARABLE_LINE
             ComparisonState.NOT_COMPARABLE -> V0bReport.NOT_COMPARABLE_PREFIX + reasons.joinToString("; ")
-            ComparisonState.NOT_APPLICABLE -> V0bReport.NOT_APPLICABLE_LINE + if (reasons.isEmpty()) "" else " · 이상: " + reasons.joinToString("; ")
+            ComparisonState.NOT_APPLICABLE -> V0bReport.NOT_APPLICABLE_LINE
         }
+
+    /** Hvar with failing conditions: the second line naming them; null otherwise (the other states carry their reasons in [line]). */
+    val anomalyLine: String? get() = if (state == ComparisonState.NOT_APPLICABLE && reasons.isNotEmpty()) V0bReport.ANOMALY_PREFIX + reasons.joinToString("; ") else null
 }
 
 /** Weighted mean, nearest-rank p95 of the per-second means, and max of the per-second max of one timed stage. */
@@ -539,6 +550,8 @@ object V0bReport {
     const val COMPARABLE_LINE = "비교 가능"
     const val NOT_COMPARABLE_PREFIX = "비교 불가: "
     const val NOT_APPLICABLE_LINE = "짝 비교 판정 비적용: Hvar 가변 cadence"
+    /** Second line of an Hvar summary whose conditions fail (the first line stays the literal third state). */
+    const val ANOMALY_PREFIX = "이상: "
     const val REASON_COUNTER_MISMATCH = "계수 불일치"
     const val REASON_CADENCE = "cadence 불일치"
     const val REASON_OUT_OF_ORDER = "슬롯 모드 순서 역전 CaptureResult"
@@ -987,6 +1000,7 @@ object V0bReport {
         return buildString {
             // E2 3장: the first line is one of three states; the detail lines below name each condition
             appendLine(s.comparability.line)
+            s.comparability.anomalyLine?.let { appendLine(it) }
             if (!s.stop.checked) {
                 appendLine(COUNTER_CHECK_SKIPPED)
             } else if (s.stop.mismatches.isEmpty()) {
@@ -1007,7 +1021,7 @@ object V0bReport {
                 appendLine(
                     FPS_UNSET_PREFIX + "고정 AE range([24,24]/[30,30]) 없음, 기대 간격을 가정하지 않음; 슬롯·갭 합격 판정 없음. " +
                         if (th.learnedFromWarmup) {
-                            th.expectedIntervalMs?.let { "진단용 기대 간격 = 워밍업 60초 CaptureResult 간격 중앙값 ${f(it, 1)}ms (갭 임계 진단값 ${th.gapCountedLabel} / ${th.longGapCountedLabel})" }
+                            th.expectedIntervalMs?.let { "진단용 기대 간격 = 워밍업 60초 CaptureResult 간격 중앙값(초당 중앙값의 중앙값) ${f(it, 1)}ms (갭 임계 진단값 ${th.gapCountedLabel} / ${th.longGapCountedLabel}; 60초부터 적용 — 워밍업 행과 처음 60초 추이의 gaps_over_threshold 는 임계 없이 0)" }
                                 ?: "워밍업 60초 미완료: 진단용 기대 간격 없음(gaps_over_threshold 는 세지 않았다)"
                         } else {
                             "기대 간격 = 슬롯 주기 ${f(th.expectedIntervalMs, 1)}ms (진단값)"
